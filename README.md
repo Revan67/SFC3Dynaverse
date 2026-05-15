@@ -134,6 +134,12 @@ tools/          Analysis utilities (fake_peerchat.py, tcp_proxy.py)
 server/         Replacement server implementation (server.py)
 ```
 
+## Legal
+
+This project is a clean-room interoperability implementation under **17 U.S.C. § 1201(f)** (DMCA interoperability exception). Reverse engineering was performed solely to achieve interoperability with the SFC3 client for the purpose of private server hosting. No game assets, executable code, or proprietary data are distributed. A legitimate purchase of Star Trek: Starfleet Command III is required to run the client.
+
+The original game and server kit are the property of their respective rights holders (Taldren/Activision/current successors). This project is not affiliated with or endorsed by any of them.
+
 ## References
 
 - [SFC Launcher by D4v1ks](https://github.com/D4v1ks/SFC-Launcher) — replaces GameSpy directory/Peerchat; still requires ServerPlatform.exe and does not fix the auth dispatch bug
