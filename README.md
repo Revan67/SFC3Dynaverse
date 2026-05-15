@@ -1,147 +1,140 @@
 # SFC3 Dynaverse Server Revival
 
-Reverse engineering and reimplementation effort to get the Star Trek: Starfleet Command III Dynaverse multiplayer campaign server running on modern hardware for private hosting.
+Reverse engineering and reimplementation effort to restore Star Trek: Starfleet Command III Dynaverse multiplayer on private hardware, without any dependency on the original server software or GameSpy infrastructure.
 
 ## Background
 
-The official Taldren/Activision Dynaverse servers have been offline for ~20 years. This project aims to make private server hosting possible again.
+The official Taldren/Activision Dynaverse servers went offline around 2004–2008. The original `ServerPlatform.exe` server kit was later released, but it cannot be made to work: it requires GameSpy online services (offline since 2014) and contains an unfixable auth dispatch bug. This project builds a clean-room Python replacement that speaks the native SFC3 wire protocol directly.
 
-## Status (2026-05-14)
+## The Core Problem
 
-- [x] Official server kit binaries located and archived (builds 464, 504, 531, 534, 534b)
-- [x] Server binary runs on Windows 11 (XP SP3 compatibility mode required)
+SFC3 multiplayer has two hard dependencies that are both permanently broken:
+
+1. **GameSpy infrastructure** — CD key validation, peerchat, and directory services all ran on `*.gamespy.com`. Those servers shut down in 2014. The server binary phones home at startup; without a substitute, it aborts.
+
+2. **`ServerPlatform.exe` auth dispatch bug** — Even with GameSpy bypassed, the binary has a code bug where `SecurityServer` never claims the `tAccessRelayS` object published by connecting clients. The client gets stuck waiting for `ServerChallengeRequest` and never authenticates. This happens in both single-process and split-process configurations. No config change fixes it; the bug is in compiled code.
+
+The only viable path is a replacement server that owns both layers.
+
+## Status (2026-05-15)
+
+- [x] Official server kit binaries archived (builds 464, 504, 531, 534, 534b)
+- [x] Server binary runs on Windows 11 (XP SP3 compat mode)
 - [x] All 16 sub-servers initialize and reach "made public" state
-- [x] GameSpy Peerchat dependency bypassed with fake IRC server
-- [x] GT2 handshake protocol fully documented
-- [x] Client object publication sequence captured and documented
-- [x] Auth dispatch bug (`tAccessRelayS`) confirmed unfixable in original binary
-- [x] Split-process architecture tested — bug persists regardless of config
-- [ ] Replacement server implementation in progress
+- [x] GameSpy Peerchat dependency bypassed (`fake_peerchat.py`)
+- [x] GT2 ASCII handshake protocol fully documented and implemented
+- [x] GT2 response hash reverse engineered from SFC3.exe (FUN_007e7580) — secret key confirmed
+- [x] Full connection sequence captured with Wireshark; all frame formats confirmed
+- [x] Client binary hello, nSwitch setup, and relay publications all working
+- [x] `ServerChallengeRequest` wire format confirmed; replacement server sends correct packet
+- [ ] Server-side `tAccessRelayS` nSwitch claim — format unknown, blocking `VerifyClientRequest`
+- [ ] `VerifyClientRequest` parsing and CD key allowlist validation
+- [ ] Dynaverse game simulation (economy, AI, missions, hex map, turn system)
+- [ ] In-game chat (GameSpy Peerchat / IRC protocol)
 
-## The Core Problem — Why the Original Binary Can't Be Used
+## Approach
 
-`ServerPlatform.exe` has an unfixable auth dispatch bug:
+A Python asyncio server on ports 26100 (auth) and 27100 (nSwitch) that:
 
-1. Client connects and publishes `tAccessRelayS` to CentralSwitch
-2. CentralSwitch places it in the temp queue (observed at T+0:25–T+0:32)
-3. SecurityServer **never claims the object** — in either single-process or split-process mode
-4. Client never receives `ServerChallengeRequest` — stuck on "starting query process"
+- Speaks the GT2 ASCII negotiation handshake natively
+- Computes the correct GT2 challenge/response hash
+- Handles the nSwitch binary framing used for all post-handshake traffic
+- Validates CD keys against a local allowlist (no GameSpy, no WON accounts)
+- Will eventually serve the full Dynaverse campaign simulation
 
-This is a code bug inside the binary. No config change can fix it. Community research confirmed no public fix exists. The SFC Launcher tool (D4v1ks) replaces GameSpy directory services but still uses `ServerPlatform.exe` and does not fix the auth dispatch.
+## Protocol Reference
 
-## Approach: Replacement Server
+### GT2 ASCII Negotiation (port 26100)
 
-Building a Python replacement server that speaks the GT2 transport and SFC3 protocol directly, without `ServerPlatform.exe`. Key simplifications over the original:
-
-- No CD key validation against GameSpy (see Auth section below)
-- No WON account system
-- Full Dynaverse simulation preserved (economy, AI, missions, hex map, turn system)
-- No in-game chat required (Discord used instead)
-
-## Technical Findings
-
-### GameSpy Peerchat Dependency
-
-The server binary connects to `peerchat.gamespy.com:6667` at startup for CD key validation. GameSpy went offline in 2014. Fix: redirect `chat.gf` to `127.0.0.1` and run `fake_peerchat.py`.
-
-**Key finding:** Despite sending `CRYPT des 1 sfc3dv`, the SFC3 binary does NOT actually encrypt its IRC output. All communication is plaintext. The fake server does not need to implement the RC4 cipher.
-
-### GT2 Protocol
-
-GameSpy GT2 SDK (circa 2002). Two phases on port 26100:
-
-**Phase 1 — Plaintext key-value handshake (server speaks first):**
-```
-Server → Client:  \challenge\<32-char-random>\final\
-Client → Server:  \response\<hash>\challenge\<new-challenge>\port\<port>\data\
-Server → Client:  \accept\1\response\<hash>\port\27100\final\
-```
-
-**Phase 2 — Binary frames** (2-byte big-endian length prefix):
-```
-C→S: 00 0c  fe ff ff ff ff ff ff ff  02 00 00 00                                           (client hello)
-S→C: 00 14  ff ff ff ff 00 00 00 00  00 00 00 00 04 00 00 00 01 00 00 00                   (assign Switch ID)
-S→C: 00 1c  ff ff ff ff 00 00 00 00  01 00 00 00 0c 00 00 00 84 96 00 00 00 00 00 00 01 00 00 00
-S→C: 00 0c  fe ff ff ff ff ff ff ff  03 00 00 00                                           (RegisteredWithCentralSwitch)
-```
-
-### Object Publication Sequence
-
-After the GT2 handshake, the client publishes two objects:
-
-**Relay name** (76-byte frame):
-```
-00 4a  [4b seq] [4b type=1] [4b=0] [4b total=58] [4b strlen=46] [46b name] [4b switchID=1] [4b objectID=2]
-       name = "ClientConnectRelayNameC_XXXXXXXX_<client-ip>"
-```
-
-**Access relay** (60-byte frame — the auth trigger):
-```
-00 3a  [header] ... [4b strlen=25] [25b " *~Server~* tAccessRelayS"]
-```
-
-On receiving `tAccessRelayS`, the SecurityServer should send `ServerChallengeRequest`. In the original binary, it never does — this is the bug.
-
-### Auth Handshake
-
-When the replacement server receives `tAccessRelayS`:
-
-1. Server sends `ServerChallengeRequest` — random challenge string + required client version
-2. Client sends `VerifyClientRequest` — challenge reply, CD key (from registry), WON login name
-3. Server validates CD key against allowlist and authenticates
-
-**Auth without client modification:** The CD key field is read from the Windows registry (`HKLM\SOFTWARE\WOW6432Node\Activision\Star Trek Starfleet Command III\KEY`) and sent verbatim. Players can set it to any string. The replacement server treats it as a pre-shared access token — the admin distributes valid key values and the server checks against a configured allowlist. The WON login name (typed freely at the game's login screen) becomes the player's display name.
-
-### Packet Serialization
-
-`nDataStore::tBuffer` — 4-byte little-endian length prefix followed by payload.
-
-### IPL Packet Types
-
-The game communicates via an Interface Packet Layer (IPL):
-
-| Type | Purpose |
-|------|---------|
-| `IPL_Database` | Logon, scoring, notifications |
-| `IPL_Character` | Character management, faction selection |
-| `IPL_Ship` | Ship assignment, repair, stores |
-| `IPL_Map` | Hex movement, terrain, political tension |
-| `IPL_Goal` | Mission goals |
-| `IPL_Clock` | Turn timing |
-| `IPL_AI` | AI character management |
-
-### Original Server Architecture
-
-- `ServerPlatform.exe` — monolithic Win32 binary spawning 16 sub-servers
-- CentralSwitch pub/sub hub on TCP/UDP 27100
-- Client-facing auth on TCP 26100 (portproxy → 27100)
-- GameSpy GT2 transport for all connections
-- MySQL or flat-file database backend; 16-table schema
-
-## Key Debug Symbols (from ServerPlatform.exe)
+Framing: `0x80  uint16_LE(payload_len_including_null)  <ASCII>  0x00`
 
 ```
-nStoredProcedureArguments::tServerChallengeRequest
-nStoredProcedureArguments::tVerifyClientRequest
-nAsyncSecurityProcedures::tVerifyClient::IsCDKeyValid
-nAsyncSecurityProcedures::tVerifyClient::SetClientAuthenticated
-tVerifyClientRequest::GetChallenge / GetChallengeReply
+S→C:  \challenge\<32 random chars>\final\
+C→S:  \response\<32-char hash>\challenge\<32 random chars>\port\<port>\data\
+S→C:  \accept\1\response\<32-char hash>\port\27100\final\
 ```
 
-Source paths embedded in binary: `C:\Projects\Taldren\Taldren\Projects\SFCTNG\`
+The 32-char hash is computed with a custom algorithm (FUN_007e7580 in SFC3.exe) using a key embedded in the binary at `DAT_0099d6b8`. Each side hashes the *other* side's challenge. Extract the key from your own SFC3.exe installation.
 
-## Server Kit Builds
+### nSwitch Binary Phase (same TCP connection, after accept)
 
-All archived locally. In order of release: 464, 504, 531, 534, 534b (534b is newest and most stable).
+All frames: `uint16_BE(payload_len)  <payload>`
+
+```
+C→S:  00 0c  fe ff ff ff ff ff ff ff  02 00 00 00          (client hello)
+S→C:  00 14  ff ff ff ff 00 00 00 00  00 00 00 00  04 00 00 00  01 00 00 00   (ASSIGN_SWITCH_ID)
+S→C:  00 1c  ff ff ff ff 00 00 00 00  01 00 00 00  0c 00 00 00  ec 9f 00 00  00 00 00 00  01 00 00 00
+S→C:  00 0c  fe ff ff ff ff ff ff ff  03 00 00 00          (REGISTERED)
+```
+
+### Client Publication Sequence
+
+After nSwitch setup the client publishes two objects:
+
+**Relay name** (GT2-framed nSwitch, chan 0):
+```
+nSwitch(switch=0, obj=1, chan=0, plen=59)
+  uint32_LE(47) + "ClientConnectRelayNameC_<id>_<ip>"  +  [1]  [2]
+```
+
+**tAccessRelayS** (GT2-framed nSwitch, chan 2 — the auth trigger):
+```
+nSwitch(switch=0, obj=1, chan=2, plen=42)
+  01  [1]  [1]  [3]  uint32_LE(25)  " *~Server~* tAccessRelayS"
+```
+
+On receiving `tAccessRelayS`, the server must (a) publish its own nSwitch claim [format TBD — this is the current blocker] and (b) send `ServerChallengeRequest`.
+
+### ServerChallengeRequest
+
+Raw bytes, no GT2 or nSwitch wrapper:
+```
+uint32_LE(40)         ← total content length
+uint32_LE(timestamp)  ← Unix time
+uint32_LE(32)         ← challenge string length
+[32 bytes]            ← random challenge
+```
+
+### Auth Exchange
+
+```
+S→C:  ServerChallengeRequest  (above)
+C→S:  VerifyClientRequest     (challenge reply + CD key from registry + WON login name)
+S→C:  auth accept / reject
+```
+
+The CD key is read from `HKLM\SOFTWARE\WOW6432Node\Activision\Star Trek Starfleet Command III\KEY`. The replacement server checks it against a configured allowlist. The WON login name (typed at the game's login screen) becomes the player's display name.
+
+## Key Ghidra Symbols (SFC3.exe)
+
+| Address | Symbol |
+|---------|--------|
+| `007e7580` | `FUN_007e7580` — GT2 response hash function |
+| `007e54b0` | GT2 challenge handler (client side) |
+| `00948c7c` | `tAccessRelayS` string literal |
+| `009865e0` | `tServerChallengeRequest` RTTI |
+| `00986580` | `tServerChallengeResponse` RTTI |
+| `00986620` | `tVerifyClientRequest` RTTI |
+| `0099d6b8` | GT2 secret key (32-byte string — extract from binary) |
+
+## Key Ghidra Symbols (ServerPlatform.exe build 534b)
+
+| Address | Symbol |
+|---------|--------|
+| `0052327d` | `tChallengeClient::OnChallengeClient` — fires on tAccessRelayS publish |
+| `005b16fe` | `tServerChallengeResponse::StreamOut` |
+| `00521b93` | `tSecurityRelayS::AllocChallengeClient` |
+| `0056c60e` | `tInterfacePacket::StreamOut` |
 
 ## Repository Structure
 
 ```
 docs/           Protocol documentation and findings
 tools/          Analysis utilities (fake_peerchat.py, tcp_proxy.py)
-server/         Replacement server implementation (in progress)
+server/         Replacement server implementation (server.py)
 ```
 
 ## References
 
-- [SFC Launcher by D4v1ks](https://github.com/D4v1ks/SFC-Launcher) — replaces GameSpy directory/Peerchat, still requires ServerPlatform.exe, does not fix auth dispatch
+- [SFC Launcher by D4v1ks](https://github.com/D4v1ks/SFC-Launcher) — replaces GameSpy directory/Peerchat; still requires ServerPlatform.exe and does not fix the auth dispatch bug
+- GameSpy GT2 SDK (circa 2002) — protocol basis for all SFC3 multiplayer transport
