@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 .env
 Saves/
+*.pcapng
+*.pcap
+LiveSFC3.exe
+SFCLauncher FadedSpark Custom.exe
+.claude/
