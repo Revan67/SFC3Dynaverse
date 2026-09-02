@@ -16,31 +16,36 @@ SFC3 multiplayer has two hard dependencies that are both permanently broken:
 
 The only viable path is a replacement server that owns both layers.
 
-## Status (2026-05-15)
+## Status (reviewed 2026-09-02)
 
 - [x] Official server kit binaries archived (builds 464, 504, 531, 534, 534b)
 - [x] Server binary runs on Windows 11 (XP SP3 compat mode)
 - [x] All 16 sub-servers initialize and reach "made public" state
-- [x] GameSpy Peerchat dependency bypassed (`fake_peerchat.py`)
+- [x] GameSpy account/profile request formats captured
 - [x] GT2 ASCII handshake protocol fully documented and implemented
 - [x] GT2 response hash reverse engineered from SFC3.exe (FUN_007e7580) — secret key confirmed
 - [x] Full connection sequence captured with Wireshark; all frame formats confirmed
 - [x] Client binary hello, nSwitch setup, and relay publications all working
-- [x] `ServerChallengeRequest` wire format confirmed; replacement server sends correct packet
-- [ ] Server-side `tAccessRelayS` nSwitch claim — format unknown, blocking `VerifyClientRequest`
+- [x] Server-side `tAccessRelayS` claim and factory trigger confirmed
+- [x] Live directory flow observed through a dynamically assigned game port
+- [ ] Capture a successful `tSecurityRelayS` challenge/response on the dynamic game port
 - [ ] `VerifyClientRequest` parsing and CD key allowlist validation
 - [ ] Dynaverse game simulation (economy, AI, missions, hex map, turn system)
 - [ ] In-game chat (GameSpy Peerchat / IRC protocol)
 
 ## Approach
 
-A Python asyncio server on ports 26100 (auth) and 27100 (nSwitch) that:
+A Python asyncio replacement that currently prototypes the bootstrap relay on port 26100 and
+the legacy GameSpy account services. The live service assigns a separate game port dynamically;
+port 27632 was observed in the existing capture.
 
-- Speaks the GT2 ASCII negotiation handshake natively
-- Computes the correct GT2 challenge/response hash
-- Handles the nSwitch binary framing used for all post-handshake traffic
-- Validates CD keys against a local allowlist (no GameSpy, no WON accounts)
-- Will eventually serve the full Dynaverse campaign simulation
+The implementation will:
+
+- Speak the GT2 ASCII negotiation handshake natively
+- Compute the correct GT2 challenge/response hash
+- Handle the nSwitch binary framing used for all post-handshake traffic
+- Validate CD keys against a local allowlist (no GameSpy or WON dependency)
+- Eventually serve the full Dynaverse campaign simulation
 
 ## Protocol Reference
 
@@ -83,11 +88,12 @@ nSwitch(switch=0, obj=1, chan=2, plen=42)
   01  [1]  [1]  [3]  uint32_LE(25)  " *~Server~* tAccessRelayS"
 ```
 
-On receiving `tAccessRelayS`, the server must (a) publish its own nSwitch claim [format TBD — this is the current blocker] and (b) send `ServerChallengeRequest`.
+The server-side claim format and subsequent factory trigger are confirmed. See
+[`docs/protocol-findings.md`](docs/protocol-findings.md) for the complete bootstrap sequence.
 
-### ServerChallengeRequest
+### Historical ServerChallengeRequest hypothesis
 
-Raw bytes, no GT2 or nSwitch wrapper:
+Static analysis originally suggested this raw serialization:
 ```
 uint32_LE(40)         ← total content length
 uint32_LE(timestamp)  ← Unix time
@@ -95,10 +101,14 @@ uint32_LE(32)         ← challenge string length
 [32 bytes]            ← random challenge
 ```
 
-### Auth Exchange
+The live capture instead shows a security exchange on a dynamically assigned game port,
+including `tSecurityRelayS` publication and a 55-byte nSwitch-framed challenge. Its exact
+semantic layout and successful client response remain under investigation.
+
+### Intended Auth Exchange
 
 ```
-S→C:  ServerChallengeRequest  (above)
+S→C:  ServerChallengeRequest
 C→S:  VerifyClientRequest     (challenge reply + CD key from registry + WON login name)
 S→C:  auth accept / reject
 ```
@@ -130,9 +140,16 @@ The CD key is read from `HKLM\SOFTWARE\WOW6432Node\Activision\Star Trek Starflee
 
 ```
 docs/           Protocol documentation and findings
-tools/          Analysis utilities (fake_peerchat.py, tcp_proxy.py)
-server/         Replacement server implementation (server.py)
+server/         Experimental replacement server and multi-port probe
 ```
+
+Current status and capture procedure:
+
+- [`docs/project-status.md`](docs/project-status.md)
+- [`docs/capture-plan.md`](docs/capture-plan.md)
+- [`docs/gamespy-protocol.md`](docs/gamespy-protocol.md)
+- [`docs/reverse-engineering.md`](docs/reverse-engineering.md)
+- [`docs/architecture-plan.md`](docs/architecture-plan.md)
 
 ## Legal
 
