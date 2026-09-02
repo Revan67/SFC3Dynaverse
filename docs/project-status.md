@@ -32,6 +32,13 @@ Reviewed 2026-09-02 after migrating the repository and Claude research notes to 
 Capture a successful game-port authentication exchange after the server challenge. We need the
 client verification packet, server accept/reject packet, and first authenticated IPL messages.
 
+## Research artifacts not yet migrated
+
+The recovered notes reference an original server-kit archive, Ghidra C exports, a fake Peerchat
+service, a TCP proxy, and PE-analysis helpers. None exists at the recorded paths on this machine.
+Recovering them would preserve useful independent evidence, but is not required for the next live
+capture.
+
 ## Superseded conclusions
 
 - `tAccessRelayS` claim format is no longer unknown.
