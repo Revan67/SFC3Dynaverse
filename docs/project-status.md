@@ -31,6 +31,8 @@ Reviewed 2026-09-02 after migrating the repository and Claude research notes to 
 
 Capture a successful game-port authentication exchange after the server challenge. We need the
 client verification packet, server accept/reject packet, and first authenticated IPL messages.
+Static analysis found legacy username/email, password, nickname, and new-account fields, but their
+relationship to GPCM versus the dynamic-port security request remains unverified.
 
 ## Research artifacts not yet migrated
 

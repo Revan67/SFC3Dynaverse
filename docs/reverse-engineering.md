@@ -35,6 +35,13 @@ Verify this against the specific binary before applying it to another build.
 | `0x00986580` | `tServerChallengeResponse` RTTI |
 | `0x00986620` | `tVerifyClientRequest` RTTI |
 
+Early client-side Ghidra work also identified fields named `WonUsername`, `WonPassword`,
+`WonNick`, and `MetaNewAccount`. UI observation associated the username field with the email
+input and the nickname with the display name. This establishes that the legacy account model
+contains distinct login, password, nickname, and account-creation state; it does **not** yet prove
+which of those fields appear in the dynamic game-port `VerifyClientRequest`. The controlled live
+capture must resolve that boundary.
+
 ## Security factory pattern
 
 The client security factory is a chain, not a single callback:
