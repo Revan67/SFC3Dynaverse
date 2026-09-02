@@ -150,6 +150,7 @@ Current status and capture procedure:
 - [`docs/gamespy-protocol.md`](docs/gamespy-protocol.md)
 - [`docs/reverse-engineering.md`](docs/reverse-engineering.md)
 - [`docs/architecture-plan.md`](docs/architecture-plan.md)
+- [`docs/original-server-findings.md`](docs/original-server-findings.md)
 
 ## Legal
 
