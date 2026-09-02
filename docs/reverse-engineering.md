@@ -78,6 +78,20 @@ not work.
 | `0x00521b93` | `tSecurityRelayS::AllocChallengeClient` |
 | `0x0056c60e` | `tInterfacePacket::StreamOut` |
 
+The server-side `tSecurityRelayS::SetupHandlers` analysis identified separate asynchronous
+procedure factories by channel:
+
+| Channel | Factory |
+| ---: | --- |
+| 0 | `AllocInitialize` |
+| 2 | `AllocVerifyClient` |
+| 3 | `AllocChallengeClient` |
+| 4 | `AllocDisconnectAuthenticatedClient` |
+
+`tRelay::SendInitialize` calls nSwitch `SendData` with the registered return address, channel 0,
+and a null buffer. This corroborates the empty-data factory-trigger pattern, although the live
+capture remains authoritative for its actual destination and ordering.
+
 Static analysis suggested a raw challenge-request serialization and a three-channel security
 child. The live dynamic-port trace must be used to reconcile those routines with the observed
 nSwitch frames before implementation.
