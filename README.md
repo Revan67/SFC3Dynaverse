@@ -16,7 +16,7 @@ SFC3 multiplayer has two hard dependencies that are both permanently broken:
 
 The only viable path is a replacement server that owns both layers.
 
-## Status (reviewed 2026-09-02)
+## Status (reviewed 2026-09-03)
 
 - [x] Official server kit binaries archived (builds 464, 504, 531, 534, 534b)
 - [x] Server binary runs on Windows 11 (XP SP3 compat mode)
@@ -29,7 +29,8 @@ The only viable path is a replacement server that owns both layers.
 - [x] Server-side `tAccessRelayS` claim and factory trigger confirmed
 - [x] Live directory flow observed through a dynamically assigned game port
 - [x] TCP 28900 compact directory and UDP 27633 status services implemented
-- [x] Unmodified client verified end to end through the first character-login request
+- [x] Unmodified client verified from local account login through Dynaverse campaign UI entry
+- [x] Character lookup, creation, local persistence, and restart/re-login verified end to end
 - [x] Capture and decode a successful `tSecurityRelayS` challenge/response on the dynamic game port
 - [x] Implement the minimal dynamic-port security exchange through `tCharacterRelayS`
 - [ ] Decode the private `VerifyClientRequest` body and implement CD-key allowlist validation
@@ -38,9 +39,11 @@ The only viable path is a replacement server that owns both layers.
 
 ## Approach
 
-A Python asyncio replacement that prototypes the bootstrap relay on port 26100 and the security
-relay on the observed game port 27632. Legacy GameSpy account responders and diagnostic listeners
-remain in `server/probe.py`; directory discovery and character login are not implemented yet.
+A Python asyncio replacement that implements the bootstrap relay on port 26100, GameSpy directory
+and status discovery, and the security/character flow on game port 27632. GameSpy account/profile
+compatibility remains in `server/probe.py`. The unmodified client can create a local account and
+character, rejoin after a restart, and enter the campaign UI; campaign data and simulation services
+are the next major boundary.
 
 The implementation will:
 
@@ -156,11 +159,19 @@ $env:SFC3_GT2_KEY = "<your extracted key>"
 python server/server.py
 ```
 
+It can also be extracted to the ignored `server/.env` file without displaying it:
+
+```powershell
+python server/extract_gt2_key.py "D:\Games\GOG\Star Trek SFC3\SFC3.exe" server/.env
+```
+
 The server listens on TCP 26100 for bootstrap traffic, TCP 28900 for GameSpy directory discovery,
 UDP 27633 for server status, and TCP 27632 for the captured dynamic-port security flow. Set
 `SFC3_ADVERTISE_HOST` to the IPv4 address the client should query; it defaults to
 `SFC3_SERVER_HOST`, then to `127.0.0.1`. The security handler currently accepts a structurally
-valid verification request without validating its private body.
+valid verification request without validating its private body. Listeners bind to the
+comma-separated `SFC3_BIND_HOSTS` value, which defaults to `SFC3_SERVER_HOST`; the loopback default
+keeps the prototype inaccessible from the LAN.
 
 Run the focused protocol tests with:
 

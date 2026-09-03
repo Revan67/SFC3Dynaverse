@@ -10,13 +10,12 @@ GAME_NAME = "sfc3"
 GAME_VERSION = "2"
 GAME_KEY = b"Gi7C8s"
 
-# The surviving service used a stable enctype-2 header and stream for its
-# seven-byte compact record (IPv4 + network-order port + separator). Reusing
-# that captured stream lets us advertise a configurable endpoint without
-# retaining any account or authentication material. A general-purpose
-# enctype-2 encoder is deliberately outside this focused compatibility shim.
+# The surviving service's 21-byte reply consists of the enctype-2 key header
+# (one encoded length byte plus a seven-byte key) and 13 encrypted bytes: one
+# compact endpoint followed by ``\final\``. Reusing that captured key header
+# and stream lets us substitute an endpoint without retaining account data.
 _COMPACT_HEADER = bytes.fromhex("ebf91fc06862ebea")
-_COMPACT_KEYSTREAM = bytes.fromhex("ab536c9fb4a1419073a77bd107")
+_COMPACT_KEYSTREAM = bytes.fromhex("ab536c9fb4a141f61ac91abd5b")
 
 
 def compact_server_list(host: str, port: int) -> bytes:
@@ -26,7 +25,7 @@ def compact_server_list(host: str, port: int) -> bytes:
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
 
-    plaintext = address.packed + struct.pack(">H", port) + b"\\" + (b"\0" * 6)
+    plaintext = address.packed + struct.pack(">H", port) + b"\\final\\"
     encrypted = bytes(a ^ b for a, b in zip(plaintext, _COMPACT_KEYSTREAM))
     return _COMPACT_HEADER + encrypted
 

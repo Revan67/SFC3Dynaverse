@@ -22,6 +22,8 @@ Output prefix: [PORT:XXXXX] so you can grep per port if needed.
 """
 
 import asyncio
+import hashlib
+import json
 import random
 import string
 import struct
@@ -37,6 +39,26 @@ logging.basicConfig(
 log = logging.getLogger("probe")
 
 SERVER_HOST = os.environ.get("SFC3_SERVER_HOST", "127.0.0.1")
+ACCOUNT_STORE = os.path.join(os.path.dirname(__file__), "accounts.local.json")
+
+
+def _load_accounts() -> dict[str, dict[str, str | int]]:
+    try:
+        with open(ACCOUNT_STORE, encoding="utf-8") as stream:
+            return json.load(stream)
+    except FileNotFoundError:
+        return {}
+
+
+def _save_accounts(accounts: dict[str, dict[str, str | int]]) -> None:
+    temporary = ACCOUNT_STORE + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(accounts, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(temporary, ACCOUNT_STORE)
+
+
+ACCOUNTS = _load_accounts()
 
 # ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -144,6 +166,20 @@ def _gs_build(**kv) -> bytes:
     return out.encode("ascii")
 
 
+def _gp_proof(
+    password_hash: str,
+    user: str,
+    first: str,
+    second: str,
+    *,
+    spaces: int = 48,
+    include_user: bool = True,
+) -> str:
+    identity = user if include_user else ""
+    material = password_hash + (" " * spaces) + identity + first + second + password_hash
+    return hashlib.md5(material.encode("ascii")).hexdigest()
+
+
 # ── GPCM handler (port 29900 — GameSpy Connection Manager) ───────────────────
 
 class GPCMProbe:
@@ -164,6 +200,99 @@ class GPCMProbe:
         finally:
             self.writer.close()
             log.info("%s CLOSED", self.TAG)
+
+    async def _respond_login(self, kv: dict[str, str], challenge: str) -> bool:
+        user = kv.get("user", "")
+        nick, _, email = user.partition("@")
+        account = ACCOUNTS.get(email.casefold())
+        log.info("%s *** LOGIN request received ***", self.TAG)
+        if account is None or account["nick"] != nick:
+            self.writer.write(_gs_build(
+                error="", err="260", fatal="",
+                errmsg="The profile requested was not found.", id="1",
+            ))
+            await self.writer.drain()
+            log.info("%s -> login rejected (account not found)", self.TAG)
+            return False
+
+        password_hash = str(account["password_hash"])
+        client_challenge = kv.get("challenge", "")
+        identities = {
+            "user": user,
+            "nick": nick,
+            "email": email,
+            "none": "",
+        }
+        variant = next(
+            (
+                (spaces, identity_name, identity, first_is_server)
+                for spaces in (48, 40)
+                for identity_name, identity in identities.items()
+                for first_is_server in (True, False)
+                if kv.get("response", "") == _gp_proof(
+                    password_hash,
+                    identity,
+                    challenge if first_is_server else client_challenge,
+                    client_challenge if first_is_server else challenge,
+                    spaces=spaces,
+                    include_user=bool(identity),
+                )
+            ),
+            None,
+        )
+        if variant is None:
+            self.writer.write(_gs_build(
+                error="", err="260", fatal="",
+                errmsg="The password provided is incorrect.", id="1",
+            ))
+            await self.writer.drain()
+            log.info("%s -> login rejected (proof mismatch)", self.TAG)
+            return False
+
+        spaces, identity_name, identity, first_is_server = variant
+        log.info(
+            "%s client proof matched spaces=%d identity=%s server_challenge_first=%s",
+            self.TAG, spaces, identity_name, first_is_server,
+        )
+        proof = _gp_proof(
+            password_hash,
+            identity,
+            client_challenge if first_is_server else challenge,
+            challenge if first_is_server else client_challenge,
+            spaces=spaces,
+            include_user=bool(identity),
+        )
+        sesskey = random.randint(1, 0x7FFFFFFF)
+        self.writer.write(_gs_build(
+            lc="2", sesskey=str(sesskey), proof=proof,
+            userid=str(account["userid"]), profileid=str(account["profileid"]),
+            uniquenick=nick, id="1",
+        ))
+        await self.writer.drain()
+        log.info(
+            "%s -> login success (sesskey=%d uid=%d pid=%d)",
+            self.TAG, sesskey, account["userid"], account["profileid"],
+        )
+        return True
+
+    async def _presence_loop(self, sensitive: set[str]) -> None:
+        """Keep the GPCM session alive after login and answer keepalives."""
+        while True:
+            try:
+                data = await asyncio.wait_for(self.reader.read(4096), timeout=120.0)
+            except asyncio.TimeoutError:
+                log.info("%s presence session idle timeout", self.TAG)
+                return
+            if not data:
+                log.info("%s presence session ended by client", self.TAG)
+                return
+            kv = _gs_parse(data)
+            safe = {k: ("***" if k in sensitive else v) for k, v in kv.items()}
+            log.info("%s <- presence %d bytes: %s", self.TAG, len(data), safe)
+            if "ka" in kv:
+                self.writer.write(_gs_build(ka=""))
+                await self.writer.drain()
+                log.info("%s -> keepalive", self.TAG)
 
     async def _handle(self):
         challenge = _random_str(10)
@@ -191,35 +320,38 @@ class GPCMProbe:
             log.info("%s no response after challenge", self.TAG)
             return
 
-        log.info("%s <- %d bytes: %s", self.TAG, len(buf), buf.hex())
+        log.info("%s <- %d-byte account request (raw data redacted)", self.TAG, len(buf))
         kv = _gs_parse(buf)
         # Account identifiers and proof material are sensitive even in a test probe.
         sensitive = {"password", "email", "user", "response", "challenge"}
         safe = {k: ("***" if k in sensitive else v) for k, v in kv.items()}
         log.info("%s parsed: %s", self.TAG, safe)
 
-        sesskey = random.randint(1, 0x7fffffff)
         uid     = 1
         pid     = 1
 
         if "newuser" in kv:
             log.info("%s *** CREATE ACCOUNT — nick=%r ***",
                      self.TAG, kv.get("nick", ""))
-            resp = _gs_build(lc="2", sesskey=str(sesskey),
-                             userid=str(uid), profileid=str(pid), id="1")
+            email = kv.get("email", "").casefold()
+            ACCOUNTS[email] = {
+                "nick": kv.get("nick", ""),
+                "password_hash": hashlib.md5(
+                    kv.get("password", "").encode("ascii")
+                ).hexdigest(),
+                "userid": uid,
+                "profileid": pid,
+            }
+            _save_accounts(ACCOUNTS)
+            resp = _gs_build(nur="", userid=str(uid), profileid=str(pid), id="1")
             self.writer.write(resp)
             await self.writer.drain()
-            log.info("%s -> newuser success (sesskey=%d uid=%d pid=%d)", self.TAG, sesskey, uid, pid)
+            log.info("%s -> newuser success (uid=%d pid=%d)", self.TAG, uid, pid)
 
         elif "login" in kv:
-            nick = kv.get("user", "").split("@")[0]
-            log.info("%s *** LOGIN request received ***", self.TAG)
-            resp = _gs_build(lc="2", sesskey=str(sesskey),
-                             userid=str(uid), profileid=str(pid),
-                             uniquenick=nick, id="1")
-            self.writer.write(resp)
-            await self.writer.drain()
-            log.info("%s -> login success (sesskey=%d uid=%d pid=%d)", self.TAG, sesskey, uid, pid)
+            if await self._respond_login(kv, challenge):
+                await self._presence_loop(sensitive)
+            return
 
         else:
             log.info("%s unknown GPCM command", self.TAG)
@@ -237,10 +369,15 @@ class GPCMProbe:
             if not chunk:
                 break
             buf2 += chunk
-            log.info("%s <- post-auth %d bytes: %s", self.TAG, len(chunk), chunk.hex())
+            log.info("%s <- post-auth %d bytes (raw data redacted)", self.TAG, len(chunk))
             kv2 = _gs_parse(chunk)
             if kv2:
-                log.info("%s    parsed: %s", self.TAG, kv2)
+                safe2 = {k: ("***" if k in sensitive else v) for k, v in kv2.items()}
+                log.info("%s    parsed: %s", self.TAG, safe2)
+                if "login" in kv2:
+                    if await self._respond_login(kv2, challenge):
+                        await self._presence_loop(sensitive)
+                    return
 
 
 # ── GPSP handler (port 29901 — GameSpy Profile Search) ───────────────────────
@@ -283,18 +420,19 @@ class GPSPProbe:
             log.info("%s no data", self.TAG)
             return
 
-        log.info("%s <- %d bytes: %s", self.TAG, len(buf), buf.hex())
+        log.info("%s <- %d-byte profile request (raw data redacted)", self.TAG, len(buf))
         kv = _gs_parse(buf)
-        log.info("%s parsed: %s", self.TAG, kv)
+        safe = {k: ("***" if k == "email" else v) for k, v in kv.items()}
+        log.info("%s parsed: %s", self.TAG, safe)
 
         if "valid" in kv:
             email = kv.get("email", "")
             log.info("%s *** \\valid\\ account-existence check ***", self.TAG)
-            # Respond: account exists → client will proceed to GPCM login
-            resp = b"\\vr\\1\\final\\"
+            exists = email.casefold() in ACCOUNTS
+            resp = _gs_build(vr="1" if exists else "0")
             self.writer.write(resp)
             await self.writer.drain()
-            log.info("%s -> \\vr\\1\\final\\ (account exists)", self.TAG)
+            log.info("%s -> account %s", self.TAG, "exists" if exists else "available")
         elif "search" in kv or "nick" in kv:
             log.info("%s *** profile search ***", self.TAG)
         else:
@@ -586,7 +724,7 @@ async def main(ports: list[int]):
             )
 
     for port in ports:
-        srv = await asyncio.start_server(_make_handler(port), "0.0.0.0", port)
+        srv = await asyncio.start_server(_make_handler(port), SERVER_HOST, port)
         servers.append(srv)
         log.info("[PROBE] Listening on port %d (%s)",
                  port, _handler_names.get(port, "RawCapture"))

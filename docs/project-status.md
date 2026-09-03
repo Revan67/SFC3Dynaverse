@@ -1,6 +1,6 @@
 # Project Status
 
-Reviewed 2026-09-02 after migrating the repository and Claude research notes to Codex.
+Reviewed 2026-09-03 after the first complete local campaign-UI entry.
 
 ## Evidence levels
 
@@ -19,8 +19,14 @@ Reviewed 2026-09-02 after migrating the repository and Claude research notes to 
 - The game-port security exchange is captured through success and the subsequent
   `tCharacterRelayS` publication.
 - TCP 28900 compact directory discovery and UDP 27633 status response are decoded and implemented.
-- An unmodified local client reached the first `tCharacterRelayS` login request through the full
-  replacement discovery and security route.
+- An unmodified local client completed account login, Ethernet directory discovery, GT2 security,
+  character lookup and creation, and entered the Dynaverse campaign UI.
+- Character records persist in ignored `server/characters.local.json`; a server restart and direct
+  re-login with the stored character were verified.
+- Channel 6 on `tCharacterRelayS` is `tCreateClientCharacterReq`. Its test request and successful
+  client-character response are decoded and generated without replaying private data.
+- `CharacterLogOnRelayNameC` publishes the client callback address. The replacement sends its
+  character-logon response there and claims `tNotifyRelayS` as object 30.
 - Peerchat starts with plaintext `CRYPT des 1 sfc3`, then switches to encrypted traffic after 705.
 
 ## Prototype-only
@@ -28,7 +34,8 @@ Reviewed 2026-09-02 after migrating the repository and Claude research notes to 
 - `server/server.py` is a focused bootstrap implementation.
 - `server/probe.py` combines the bootstrap implementation, permissive GPCM/GPSP responders,
   and raw listeners for suspected ports.
-- The account responders do not persist accounts or verify credentials.
+- The account responder persists local accounts and verifies the legacy GameSpy login proof; the
+  storage format and permissive protocol handling remain prototype quality.
 - The dynamic security wire helpers have focused unit tests; packaging metadata is still absent.
 
 ## Current milestone
@@ -37,11 +44,12 @@ The 2026-09-02 Ethernet capture resolved the dynamic-port authentication blocker
 client verification request, the server's successful security response, character authentication,
 initial service-relay setup, mission-matching traffic, and encrypted Peerchat startup.
 
-`server/server.py` now implements discovery through the minimal TCP 27632 security path and the
-client's `tCharacterRelayS` publication. The controlled unmodified-client test passed through the
-first 47-byte character request. The 233-byte live response has been decoded as a character record
-plus a find-result code, and the server now generates a sanitized "not found" response. See
-`docs/dynamic-security-protocol.md` for the sanitized wire structure.
+`server/server.py` now carries the unmodified client through discovery, dynamic-port security,
+character lookup/creation, persistence, character logon, and entry into the Dynaverse campaign UI.
+The campaign opens with intentionally empty map and service data. The next milestone is to map and
+implement the post-logon relay publications and minimum viable map/economy/ship state. See
+`docs/dynamic-security-protocol.md` and `docs/character-login-protocol.md` for the sanitized wire
+structures.
 
 ## Recovered research artifacts
 

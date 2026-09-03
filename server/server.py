@@ -25,11 +25,14 @@ Confirmed 18-step protocol (live Wireshark stream 42, 70.27.77.102:26100, 2026-0
 """
 
 import asyncio
+import contextlib
+import json
 import random
 import string
 import struct
 import logging
 import os
+from pathlib import Path
 
 from gamespy import compact_server_list, status_response
 
@@ -43,10 +46,24 @@ log = logging.getLogger("sfc3")
 PORT          = int(os.environ.get("SFC3_RELAY_PORT", "26100"))
 GAME_PORT     = int(os.environ.get("SFC3_GAME_PORT", "27632"))
 SERVER_HOST   = os.environ.get("SFC3_SERVER_HOST", "127.0.0.1")
+BIND_HOSTS = tuple(
+    dict.fromkeys(
+        host.strip()
+        for host in os.environ.get("SFC3_BIND_HOSTS", SERVER_HOST).split(",")
+        if host.strip()
+    )
+)
 DIRECTORY_PORT = int(os.environ.get("SFC3_DIRECTORY_PORT", "28900"))
 STATUS_PORT    = int(os.environ.get("SFC3_STATUS_PORT", "27633"))
 ADVERTISE_HOST = os.environ.get("SFC3_ADVERTISE_HOST", SERVER_HOST)
 SERVER_NAME    = os.environ.get("SFC3_SERVER_NAME", "Local SFC3 Dynaverse")
+PRIVATE_CAPTURE_PATH = os.environ.get("SFC3_PRIVATE_CAPTURE_PATH", "")
+CHARACTER_STORE_PATH = Path(
+    os.environ.get(
+        "SFC3_CHARACTER_STORE",
+        str(Path(__file__).with_name("characters.local.json")),
+    )
+)
 
 # ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -176,16 +193,23 @@ def _parse_character_initialize(payload: bytes) -> tuple[tuple[int, int, int], s
     return return_address, account, client_address
 
 
-def _default_client_character_payload() -> bytes:
-    """Serialize a default tClientCharacter for a character-not-found reply."""
-    empty = _pack_str("")
-    payload = bytearray(empty + empty)
-    payload += struct.pack("<I", 0)  # database ID adjustment
-    payload += empty
+def _default_client_character_payload(
+    *,
+    client_address: str = "",
+    account: str = "",
+    character_name: str = "",
+    race: int = 0,
+    database_id: int = 0,
+    rank: int = 0xFFFFFFFF,
+) -> bytes:
+    """Serialize the wire-visible fields of a minimal tClientCharacter."""
+    payload = bytearray(_pack_str(client_address) + _pack_str(account))
+    payload += struct.pack("<I", database_id)
+    payload += _pack_str(character_name)
     payload += struct.pack(
         "<IIIIIIII",
-        0,           # race
-        0xFFFFFFFF,  # rank
+        race,
+        rank,
         1500,        # rating
         0, 0, 0, 0, # prestige/disrepute totals
         0xFFFFFFFF,  # mission slot
@@ -205,6 +229,102 @@ def _default_client_character_payload() -> bytes:
 def _character_not_found_payload() -> bytes:
     """Build IPL_Character::tConnectPlayerReq::tRep for a new account."""
     return b"\x01" + _default_client_character_payload() + struct.pack("<I", 1)
+
+
+def _parse_create_client_character(
+    payload: bytes,
+) -> tuple[tuple[int, int, int], str, str, int, str, str, int]:
+    """Parse IPL_Character::tCreateClientCharacterReq (handler channel 6)."""
+    if len(payload) < 12:
+        raise ValueError("truncated create-client-character request")
+    return_address = struct.unpack_from("<III", payload, 0)
+    first, offset = _unpack_string(payload, 12)
+    account, offset = _unpack_string(payload, offset)
+    if offset + 4 > len(payload):
+        raise ValueError("truncated create-client-character race")
+    race = struct.unpack_from("<I", payload, offset)[0]
+    character_name, offset = _unpack_string(payload, offset + 4)
+    client_address, offset = _unpack_string(payload, offset)
+    if offset + 4 != len(payload):
+        raise ValueError("unexpected create-client-character trailing data")
+    language = struct.unpack_from("<I", payload, offset)[0]
+    return return_address, first, account, race, character_name, client_address, language
+
+
+def _character_created_payload(
+    account: str, character_name: str, client_address: str, race: int
+) -> bytes:
+    """Build a minimal successful tCreateClientCharacterReq::tRep."""
+    character = _default_client_character_payload(
+        client_address=client_address,
+        account=account,
+        character_name=character_name,
+        race=race,
+        database_id=1,
+        rank=0,
+    )
+    return b"\x01" + character + struct.pack("<I", 0)
+
+
+def _parse_relay_publication(payload: bytes) -> tuple[bytes, tuple[int, int]]:
+    """Parse a client unique-name publication and its local callback address."""
+    if len(payload) < 12:
+        raise ValueError("truncated relay publication")
+    name_length = struct.unpack_from("<I", payload, 0)[0]
+    if 4 + name_length + 8 != len(payload):
+        raise ValueError("invalid relay publication length")
+    name = payload[4 : 4 + name_length]
+    address = struct.unpack_from("<II", payload, 4 + name_length)
+    return name, address
+
+
+def _character_logon_payload(
+    account: str, character_name: str, client_address: str, race: int
+) -> bytes:
+    """Build tCharacterRequest::tCharacterResponse for channel 2."""
+    return struct.pack("<I", 0) + _default_client_character_payload(
+        client_address=client_address,
+        account=account,
+        character_name=character_name,
+        race=race,
+        database_id=1,
+        rank=0,
+    )
+
+
+def _load_characters() -> dict[str, dict]:
+    if not CHARACTER_STORE_PATH.exists():
+        return {}
+    data = json.loads(CHARACTER_STORE_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("character store must contain an object")
+    return data
+
+
+def _save_character(
+    account: str, character_name: str, client_address: str, race: int
+) -> None:
+    characters = _load_characters()
+    characters[account] = {
+        "character_name": character_name,
+        "client_address": client_address,
+        "race": race,
+    }
+    CHARACTER_STORE_PATH.write_text(
+        json.dumps(characters, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _stored_character_payload(account: str, record: dict) -> bytes:
+    return b"\x01" + _default_client_character_payload(
+        client_address=str(record["client_address"]),
+        account=account,
+        character_name=str(record["character_name"]),
+        race=int(record["race"]),
+        database_id=1,
+        rank=0,
+    ) + struct.pack("<I", 0)
 
 
 # ── Client handler ────────────────────────────────────────────────────────────
@@ -420,12 +540,14 @@ class DynamicSecurityClient:
 
     SECURITY_RELAY = b" *~Server~* .?AVtSecurityRelayS@@"
     CHARACTER_RELAY = b" *~Server~* tCharacterRelayS"
+    NOTIFY_RELAY = b" *~Server~* .?AVtNotifyRelayS@@"
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.reader = reader
         self.writer = writer
         self.addr = writer.get_extra_info("peername")
         self.sw_id = random.randint(1, 0xFFFFFFFE)
+        self.current_character = None
 
     def _log(self, level, msg, *args):
         getattr(log, level)(f"[game:{GAME_PORT}] {self.addr[0]}:{self.addr[1]} {msg}", *args)
@@ -555,20 +677,101 @@ class DynamicSecurityClient:
             len(client_address),
         )
 
+        stored_character = _load_characters().get(account)
+        if stored_character is None:
+            character_reply = _character_not_found_payload()
+        else:
+            character_reply = _stored_character_payload(account, stored_character)
+            self.current_character = (
+                account,
+                str(stored_character["character_name"]),
+                str(stored_character["client_address"]),
+                int(stored_character["race"]),
+            )
         self.writer.write(_nswitch_frame(
             return_address[0],
             return_address[1],
             return_address[2],
-            _character_not_found_payload(),
+            character_reply,
         ))
         await self.writer.drain()
-        self._log("info", "-> character not found; client may begin character creation")
+        if stored_character is None:
+            self._log("info", "-> character not found; client may begin character creation")
+        else:
+            self._log("info", "-> stored character found (private values not logged)")
 
         # Keep the connection available for the next implementation phase. Log only
         # structural metadata because authenticated payloads contain private fields.
         while True:
             sw, obj, ch, payload = await self._read_nswitch_frame(timeout=120.0)
             self._log("info", "<- frame sw=%d obj=%d ch=%d plen=%d", sw, obj, ch, len(payload))
+            if (sw, obj, ch) == (0, 1, 0) and b"CharacterLogOnRelayNameC" in payload:
+                if self.current_character is None:
+                    raise ValueError("character logon publication preceded character creation")
+                _relay_name, callback = _parse_relay_publication(payload)
+                self.writer.write(_nswitch_frame(
+                    callback[0],
+                    callback[1],
+                    2,
+                    _character_logon_payload(*self.current_character),
+                ))
+                self.writer.write(_nswitch_frame(
+                    self.sw_id,
+                    1,
+                    3,
+                    _relay_claim_payload(self.NOTIFY_RELAY, 30),
+                ))
+                await self.writer.drain()
+                self._log(
+                    "info",
+                    "-> character logon response and tNotifyRelayS claim",
+                )
+                continue
+            if (sw, obj, ch) == (0, 6, 6):
+                (
+                    return_address,
+                    _first,
+                    create_account,
+                    race,
+                    character_name,
+                    create_address,
+                    _language,
+                ) = _parse_create_client_character(payload)
+                self.writer.write(_nswitch_frame(
+                    return_address[0],
+                    return_address[1],
+                    return_address[2],
+                    _character_created_payload(
+                        create_account, character_name, create_address, race
+                    ),
+                ))
+                await self.writer.drain()
+                self.current_character = (
+                    create_account,
+                    character_name,
+                    create_address,
+                    race,
+                )
+                _save_character(
+                    create_account,
+                    character_name,
+                    create_address,
+                    race,
+                )
+                self._log(
+                    "info",
+                    "-> character created race=%d name_len=%d (private values not logged)",
+                    race,
+                    len(character_name),
+                )
+                continue
+            if PRIVATE_CAPTURE_PATH:
+                # Opt-in diagnostic capture. The payload may contain account and
+                # character values, so the configured destination must stay ignored.
+                with open(PRIVATE_CAPTURE_PATH, "ab") as capture:
+                    capture.write(struct.pack("<IIII", sw, obj, ch, len(payload)))
+                    capture.write(payload)
+                self._log("info", "saved private frame for offline protocol analysis")
 
     async def _gt2_handshake(self) -> bool:
         challenge = _random_str(32)
@@ -699,16 +902,26 @@ async def main():
     relay_handler = lambda r, w: asyncio.ensure_future(SFC3Client(r, w).run())
     game_handler = lambda r, w: asyncio.ensure_future(DynamicSecurityClient(r, w).run())
     directory_handler = lambda r, w: asyncio.ensure_future(MasterDirectoryClient(r, w).run())
-    relay_server = await asyncio.start_server(relay_handler, "0.0.0.0", PORT)
-    game_server = await asyncio.start_server(game_handler, "0.0.0.0", GAME_PORT)
-    directory_server = await asyncio.start_server(directory_handler, "0.0.0.0", DIRECTORY_PORT)
+    relay_servers = [
+        await asyncio.start_server(relay_handler, host, PORT) for host in BIND_HOSTS
+    ]
+    game_servers = [
+        await asyncio.start_server(game_handler, host, GAME_PORT) for host in BIND_HOSTS
+    ]
+    directory_servers = [
+        await asyncio.start_server(directory_handler, host, DIRECTORY_PORT) for host in BIND_HOSTS
+    ]
     loop = asyncio.get_running_loop()
-    status_transport, _ = await loop.create_datagram_endpoint(
-        StatusProtocol,
-        local_addr=("0.0.0.0", STATUS_PORT),
-    )
+    status_transports = []
+    for host in BIND_HOSTS:
+        transport, _ = await loop.create_datagram_endpoint(
+            StatusProtocol,
+            local_addr=(host, STATUS_PORT),
+        )
+        status_transports.append(transport)
     log.info(
-        "Listening on TCP %d/%d/%d and UDP %d; advertising %s:%d",
+        "Listening on %s TCP %d/%d/%d and UDP %d; advertising %s:%d",
+        ",".join(BIND_HOSTS),
         PORT,
         GAME_PORT,
         DIRECTORY_PORT,
@@ -716,15 +929,15 @@ async def main():
         ADVERTISE_HOST,
         STATUS_PORT,
     )
-    async with relay_server, game_server, directory_server:
+    servers = relay_servers + game_servers + directory_servers
+    async with contextlib.AsyncExitStack() as stack:
+        for listening_server in servers:
+            await stack.enter_async_context(listening_server)
         try:
-            await asyncio.gather(
-                relay_server.serve_forever(),
-                game_server.serve_forever(),
-                directory_server.serve_forever(),
-            )
+            await asyncio.gather(*(server.serve_forever() for server in servers))
         finally:
-            status_transport.close()
+            for transport in status_transports:
+                transport.close()
 
 
 if __name__ == "__main__":

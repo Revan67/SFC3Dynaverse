@@ -9,7 +9,7 @@ The client checks whether an email is registered before beginning login:
 
 ```text
 C -> S: \valid\\email\<email>\final\
-S -> C: \vr\1\final\       account exists
+S -> C: \vr\1\final\       account exists / identity is valid
 S -> C: \vr\0\final\       account does not exist
 ```
 
@@ -25,28 +25,48 @@ Account creation:
 
 ```text
 C -> S: \newuser\\email\<email>\nick\<nick>\password\<plaintext>\productid\10132\id\1\final\
-S -> C: \lc\2\sesskey\<n>\userid\<uid>\profileid\<pid>\id\1\final\
+S -> C: \nur\\userid\<uid>\profileid\<pid>\id\1\final\
 ```
 
 Login:
 
 ```text
 C -> S: \login\\challenge\<client challenge>\user\<nick>@<email>\response\<proof>\firewall\1\port\0\id\1\final\
-S -> C: \lc\2\sesskey\<n>\userid\<uid>\profileid\<pid>\uniquenick\<nick>\id\1\final\
+S -> C: \lc\2\sesskey\<n>\proof\<server proof>\userid\<uid>\profileid\<pid>\uniquenick\<nick>\id\1\final\
 ```
 
-The captured login proof is lowercase hexadecimal MD5:
+The login proofs are lowercase hexadecimal MD5. The SFC3 client uses 48 spaces and the full
+`nick@email` identity. In the account-creation follow-up observed locally, its proof places the
+client challenge first; the server proof reverses that order:
 
 ```text
 password_digest = MD5(password).hexdigest()
 proof = MD5(
     password_digest
-    + 40 spaces
+    + 48 spaces
+    + user
+    + client_challenge
+    + server_challenge
+    + password_digest
+).hexdigest()
+
+server_proof = MD5(
+    password_digest
+    + 48 spaces
+    + user
     + server_challenge
     + client_challenge
     + password_digest
 ).hexdigest()
 ```
+
+After login success, TCP 29900 remains open as the GameSpy presence connection. Closing it
+immediately causes SFC3 to report login failure. The replacement responds to `\ka\` keepalives and
+keeps the session open while the client proceeds to server discovery.
+
+The prototype persists local accounts in ignored `server/accounts.local.json`. It stores the
+nickname, numeric IDs, and MD5 password digest required by the legacy proof exchange, never the
+plaintext password.
 
 This legacy protocol requires the server to reproduce the password digest. A production account
 design must clearly isolate this compatibility constraint and never log passwords or proof data.

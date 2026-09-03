@@ -1,6 +1,8 @@
 import asyncio
 import struct
+import tempfile
 import unittest
+from pathlib import Path
 
 import gamespy
 import server
@@ -71,6 +73,73 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual(payload[-10:-8], b"\x00\x00")
         self.assertEqual(struct.unpack_from("<I", payload, len(payload) - 4)[0], 1)
 
+    def test_create_client_character_request_shape(self):
+        request = (
+            struct.pack("<III", 23, 6, 0)
+            + server._pack_str("")
+            + server._pack_str("user@example")
+            + struct.pack("<I", 2)
+            + server._pack_str("Captain Test")
+            + server._pack_str("192.0.2.10")
+            + struct.pack("<I", 1)
+        )
+        self.assertEqual(
+            server._parse_create_client_character(request),
+            (
+                (23, 6, 0),
+                "",
+                "user@example",
+                2,
+                "Captain Test",
+                "192.0.2.10",
+                1,
+            ),
+        )
+
+    def test_character_created_response_shape(self):
+        payload = server._character_created_payload(
+            "user@example", "Captain Test", "192.0.2.10", 2
+        )
+        self.assertEqual(payload[0], 1)
+        address, offset = server._unpack_string(payload, 1)
+        account, offset = server._unpack_string(payload, offset)
+        self.assertEqual((address, account), ("192.0.2.10", "user@example"))
+        self.assertEqual(struct.unpack_from("<I", payload, offset)[0], 1)
+        name, offset = server._unpack_string(payload, offset + 4)
+        self.assertEqual(name, "Captain Test")
+        self.assertEqual(struct.unpack_from("<I", payload, offset)[0], 2)
+        self.assertEqual(struct.unpack_from("<I", payload, len(payload) - 4)[0], 0)
+
+    def test_relay_publication_shape(self):
+        name = b"accountCharacterLogOnRelayNameC"
+        payload = struct.pack("<I", len(name)) + name + struct.pack("<II", 77, 4)
+        self.assertEqual(server._parse_relay_publication(payload), (name, (77, 4)))
+
+    def test_character_logon_response_shape(self):
+        payload = server._character_logon_payload(
+            "user@example", "Captain Test", "192.0.2.10", 2
+        )
+        self.assertEqual(struct.unpack_from("<I", payload)[0], 0)
+        address, offset = server._unpack_string(payload, 4)
+        account, offset = server._unpack_string(payload, offset)
+        self.assertEqual((address, account), ("192.0.2.10", "user@example"))
+        self.assertEqual(struct.unpack_from("<I", payload, offset)[0], 1)
+
+    def test_character_store_round_trip(self):
+        old_path = server.CHARACTER_STORE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.CHARACTER_STORE_PATH = Path(directory) / "characters.json"
+                server._save_character(
+                    "user@example", "Captain Test", "192.0.2.10", 2
+                )
+                record = server._load_characters()["user@example"]
+                self.assertEqual(record["character_name"], "Captain Test")
+                payload = server._stored_character_payload("user@example", record)
+                self.assertEqual(struct.unpack_from("<I", payload, len(payload) - 4)[0], 0)
+        finally:
+            server.CHARACTER_STORE_PATH = old_path
+
 
 class DynamicSecurityReaderTests(unittest.IsolatedAsyncioTestCase):
     async def test_reader_skips_keepalive_and_reassembles_frame(self):
@@ -110,6 +179,13 @@ class GameSpyDiscoveryTests(unittest.TestCase):
     def test_compact_list_rejects_ipv6(self):
         with self.assertRaisesRegex(ValueError, "IPv4"):
             gamespy.compact_server_list("::1", 27633)
+
+    def test_compact_list_substitutes_only_encrypted_endpoint(self):
+        response = gamespy.compact_server_list("127.0.0.1", 27633)
+
+        self.assertEqual(len(response), 21)
+        self.assertEqual(response[:8], bytes.fromhex("ebf91fc06862ebea"))
+        self.assertEqual(response[8:].hex(), "d4536c9edf501d9073a77bd107")
 
     def test_status_response_advertises_game_port(self):
         response = gamespy.status_response("Test Dynaverse", 27632, "17.1")
