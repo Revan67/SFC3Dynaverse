@@ -176,6 +176,37 @@ def _parse_character_initialize(payload: bytes) -> tuple[tuple[int, int, int], s
     return return_address, account, client_address
 
 
+def _default_client_character_payload() -> bytes:
+    """Serialize a default tClientCharacter for a character-not-found reply."""
+    empty = _pack_str("")
+    payload = bytearray(empty + empty)
+    payload += struct.pack("<I", 0)  # database ID adjustment
+    payload += empty
+    payload += struct.pack(
+        "<IIIIIIII",
+        0,           # race
+        0xFFFFFFFF,  # rank
+        1500,        # rating
+        0, 0, 0, 0, # prestige/disrepute totals
+        0xFFFFFFFF,  # mission slot
+    )
+    payload += struct.pack("<ii", -1, -1) * 3  # current, home, destination hexes
+    payload += struct.pack("<I", 0)  # empty ship-cache vector
+
+    # Default tMetaMapHex: database ID/refcount, (0,0), two 0x09 flags,
+    # seven integer fields, and two doubles.
+    payload += struct.pack("<IIiiBB", 0, 0, 0, 0, 9, 9)
+    payload += struct.pack("<IIIIIII", *([0] * 7))
+    payload += struct.pack("<dd", 0.0, 0.0)
+    payload += struct.pack("<IBB", 0, 0, 0)  # medals, AI, fleet
+    return bytes(payload)
+
+
+def _character_not_found_payload() -> bytes:
+    """Build IPL_Character::tConnectPlayerReq::tRep for a new account."""
+    return b"\x01" + _default_client_character_payload() + struct.pack("<I", 1)
+
+
 # ── Client handler ────────────────────────────────────────────────────────────
 
 class SFC3Client:
@@ -523,6 +554,15 @@ class DynamicSecurityClient:
             len(account),
             len(client_address),
         )
+
+        self.writer.write(_nswitch_frame(
+            return_address[0],
+            return_address[1],
+            return_address[2],
+            _character_not_found_payload(),
+        ))
+        await self.writer.drain()
+        self._log("info", "-> character not found; client may begin character creation")
 
         # Keep the connection available for the next implementation phase. Log only
         # structural metadata because authenticated payloads contain private fields.

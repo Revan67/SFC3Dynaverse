@@ -57,6 +57,20 @@ class DynamicSecurityWireTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "trailing"):
             server._parse_character_initialize(payload)
 
+    def test_character_not_found_response_shape(self):
+        payload = server._character_not_found_payload()
+
+        self.assertEqual(len(payload), 149)
+        self.assertEqual(payload[0], 1)
+        self.assertEqual(struct.unpack_from("<I", payload, 1)[0], 0)
+        self.assertEqual(struct.unpack_from("<I", payload, 5)[0], 0)
+        self.assertEqual(struct.unpack_from("<I", payload, 9)[0], 0)
+        self.assertEqual(struct.unpack_from("<I", payload, 17)[0], 0)
+        self.assertEqual(struct.unpack_from("<I", payload, 21)[0], 0xFFFFFFFF)
+        self.assertEqual(struct.unpack_from("<I", payload, 25)[0], 1500)
+        self.assertEqual(payload[-10:-8], b"\x00\x00")
+        self.assertEqual(struct.unpack_from("<I", payload, len(payload) - 4)[0], 1)
+
 
 class DynamicSecurityReaderTests(unittest.IsolatedAsyncioTestCase):
     async def test_reader_skips_keepalive_and_reassembles_frame(self):
