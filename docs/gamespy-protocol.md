@@ -53,9 +53,26 @@ design must clearly isolate this compatibility constraint and never log password
 
 ## Directory: TCP 28900
 
-The client identifies the game as `sfc3` and requests a compact server list. The existing live
-response is binary/encoded and ultimately leads to a dynamic game-port connection. Decoding that
-record is still required.
+The live exchange repeats consistently:
+
+```text
+S -> C: \basic\\secure\<6-character challenge>
+C -> S: \gamename\sfc3\gamever\2\location\0\validate\<proof>\enctype\2\final\\queryid\1.1\
+C -> S: \list\cmp\gamename\sfc3\final\
+S -> C: <21-byte enctype-2 compact endpoint record>
+```
+
+The compact record decodes to an IPv4 address and UDP query port. The 2026-09-02 trace advertised
+the live host's UDP 27633 endpoint. Its captured seven-byte record and stable enctype-2 stream are
+implemented in `server/gamespy.py`; the server can substitute a configured IPv4 address without
+retaining the original endpoint. The local directory accepts the legacy validation field for
+compatibility but does not use it as an authorization boundary.
+
+## Status: UDP 27633
+
+The client sends exactly `\status\`. The server returns plaintext GameSpy key/value metadata,
+including `gamename=sfc3`, `gamever=2`, display name, population fields, and `hostport=27632`.
+That `hostport` causes the subsequent GT2/nSwitch security connection.
 
 ## Security
 

@@ -31,6 +31,8 @@ import struct
 import logging
 import os
 
+from gamespy import compact_server_list, status_response
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
@@ -41,6 +43,10 @@ log = logging.getLogger("sfc3")
 PORT          = int(os.environ.get("SFC3_RELAY_PORT", "26100"))
 GAME_PORT     = int(os.environ.get("SFC3_GAME_PORT", "27632"))
 SERVER_HOST   = os.environ.get("SFC3_SERVER_HOST", "127.0.0.1")
+DIRECTORY_PORT = int(os.environ.get("SFC3_DIRECTORY_PORT", "28900"))
+STATUS_PORT    = int(os.environ.get("SFC3_STATUS_PORT", "27633"))
+ADVERTISE_HOST = os.environ.get("SFC3_ADVERTISE_HOST", SERVER_HOST)
+SERVER_NAME    = os.environ.get("SFC3_SERVER_NAME", "Local SFC3 Dynaverse")
 
 # ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -418,7 +424,7 @@ class DynamicSecurityClient:
         self._log("info", "-> tSecurityRelayS claim")
 
         _, _, _, initialize = await self._wait_for(
-            lambda sw, obj, ch, payload: sw == 0 and obj == 32 and ch == 3,
+            lambda sw, obj, ch, payload: sw == 0 and obj in (2, 32) and ch == 3,
             "security initialize request",
         )
         challenge_return = _parse_async_return(initialize)
@@ -436,7 +442,7 @@ class DynamicSecurityClient:
         self._log("info", "-> security challenge (value redacted)")
 
         _, _, _, verification = await self._wait_for(
-            lambda sw, obj, ch, payload: sw == 0 and obj == 32 and ch == 2,
+            lambda sw, obj, ch, payload: sw == 0 and obj in (2, 32) and ch == 2,
             "client verification request",
         )
         verify_return = _parse_async_return(verification)
@@ -541,19 +547,102 @@ class DynamicSecurityClient:
             )
 
 
+class MasterDirectoryClient:
+    """Minimal GameSpy v1 compact-list service on TCP 28900."""
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.reader = reader
+        self.writer = writer
+        self.addr = writer.get_extra_info("peername")
+
+    async def run(self):
+        log.info("[directory:%d] CONNECT from %s:%d", DIRECTORY_PORT, *self.addr)
+        try:
+            challenge = _random_str(6)
+            self.writer.write(f"\\basic\\\\secure\\{challenge}".encode("ascii"))
+            await self.writer.drain()
+
+            request = b""
+            while b"\\list\\cmp\\gamename\\sfc3\\final\\" not in request:
+                chunk = await asyncio.wait_for(self.reader.read(4096), timeout=15.0)
+                if not chunk:
+                    return
+                request += chunk
+                if len(request) > 8192:
+                    raise ValueError("directory request exceeds limit")
+
+            if b"\\gamename\\sfc3\\" not in request or b"\\enctype\\2\\" not in request:
+                raise ValueError("unsupported directory request")
+
+            response = compact_server_list(ADVERTISE_HOST, STATUS_PORT)
+            self.writer.write(response)
+            await self.writer.drain()
+            log.info(
+                "[directory:%d] advertised %s:%d (%d encoded bytes)",
+                DIRECTORY_PORT,
+                ADVERTISE_HOST,
+                STATUS_PORT,
+                len(response),
+            )
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        except Exception as exc:
+            log.error("[directory:%d] error: %s", DIRECTORY_PORT, exc, exc_info=True)
+        finally:
+            self.writer.close()
+            try:
+                await self.writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+
+class StatusProtocol(asyncio.DatagramProtocol):
+    """Answer the client's legacy UDP ``\\status\\`` query."""
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr):
+        if data.strip(b"\0") != b"\\status\\":
+            log.debug("[status:%d] ignored %d bytes from %s:%d", STATUS_PORT, len(data), *addr)
+            return
+        response = status_response(SERVER_NAME, GAME_PORT)
+        self.transport.sendto(response, addr)
+        log.info("[status:%d] replied to %s:%d (%d bytes)", STATUS_PORT, *addr, len(response))
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
     relay_handler = lambda r, w: asyncio.ensure_future(SFC3Client(r, w).run())
     game_handler = lambda r, w: asyncio.ensure_future(DynamicSecurityClient(r, w).run())
+    directory_handler = lambda r, w: asyncio.ensure_future(MasterDirectoryClient(r, w).run())
     relay_server = await asyncio.start_server(relay_handler, "0.0.0.0", PORT)
     game_server = await asyncio.start_server(game_handler, "0.0.0.0", GAME_PORT)
-    log.info("Listening on relay port %d and dynamic game port %d", PORT, GAME_PORT)
-    async with relay_server, game_server:
-        await asyncio.gather(
-            relay_server.serve_forever(),
-            game_server.serve_forever(),
-        )
+    directory_server = await asyncio.start_server(directory_handler, "0.0.0.0", DIRECTORY_PORT)
+    loop = asyncio.get_running_loop()
+    status_transport, _ = await loop.create_datagram_endpoint(
+        StatusProtocol,
+        local_addr=("0.0.0.0", STATUS_PORT),
+    )
+    log.info(
+        "Listening on TCP %d/%d/%d and UDP %d; advertising %s:%d",
+        PORT,
+        GAME_PORT,
+        DIRECTORY_PORT,
+        STATUS_PORT,
+        ADVERTISE_HOST,
+        STATUS_PORT,
+    )
+    async with relay_server, game_server, directory_server:
+        try:
+            await asyncio.gather(
+                relay_server.serve_forever(),
+                game_server.serve_forever(),
+                directory_server.serve_forever(),
+            )
+        finally:
+            status_transport.close()
 
 
 if __name__ == "__main__":

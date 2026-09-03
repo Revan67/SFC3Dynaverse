@@ -18,6 +18,9 @@ Reviewed 2026-09-02 after migrating the repository and Claude research notes to 
   port 27632 was observed.
 - The game-port security exchange is captured through success and the subsequent
   `tCharacterRelayS` publication.
+- TCP 28900 compact directory discovery and UDP 27633 status response are decoded and implemented.
+- An unmodified local client reached the first `tCharacterRelayS` login request through the full
+  replacement discovery and security route.
 - Peerchat starts with plaintext `CRYPT des 1 sfc3`, then switches to encrypted traffic after 705.
 
 ## Prototype-only
@@ -34,8 +37,9 @@ The 2026-09-02 Ethernet capture resolved the dynamic-port authentication blocker
 client verification request, the server's successful security response, character authentication,
 initial service-relay setup, mission-matching traffic, and encrypted Peerchat startup.
 
-`server/server.py` now implements the minimal TCP 27632 security path through the client's
-`tCharacterRelayS` publication. Character login and authenticated IPL decoding are next. See
+`server/server.py` now implements discovery through the minimal TCP 27632 security path and the
+client's `tCharacterRelayS` publication. The controlled unmodified-client test passed through the
+first 47-byte character request; decoding its 233-byte live response is the current task. See
 `docs/dynamic-security-protocol.md` for the sanitized wire structure.
 
 ## Recovered research artifacts

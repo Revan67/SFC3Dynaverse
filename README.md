@@ -28,6 +28,8 @@ The only viable path is a replacement server that owns both layers.
 - [x] Client binary hello, nSwitch setup, and relay publications all working
 - [x] Server-side `tAccessRelayS` claim and factory trigger confirmed
 - [x] Live directory flow observed through a dynamically assigned game port
+- [x] TCP 28900 compact directory and UDP 27633 status services implemented
+- [x] Unmodified client verified end to end through the first character-login request
 - [x] Capture and decode a successful `tSecurityRelayS` challenge/response on the dynamic game port
 - [x] Implement the minimal dynamic-port security exchange through `tCharacterRelayS`
 - [ ] Decode the private `VerifyClientRequest` body and implement CD-key allowlist validation
@@ -154,10 +156,11 @@ $env:SFC3_GT2_KEY = "<your extracted key>"
 python server/server.py
 ```
 
-The server listens on TCP 26100 for bootstrap traffic and TCP 27632 for the captured dynamic-port
-security flow. The latter currently accepts a structurally valid verification request without
-validating its private body. A clean client also still needs the local TCP 28900 directory and UDP
-27633 status services before it can discover this game port end to end.
+The server listens on TCP 26100 for bootstrap traffic, TCP 28900 for GameSpy directory discovery,
+UDP 27633 for server status, and TCP 27632 for the captured dynamic-port security flow. Set
+`SFC3_ADVERTISE_HOST` to the IPv4 address the client should query; it defaults to
+`SFC3_SERVER_HOST`, then to `127.0.0.1`. The security handler currently accepts a structurally
+valid verification request without validating its private body.
 
 Run the focused protocol tests with:
 
