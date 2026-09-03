@@ -63,6 +63,18 @@ PRIVATE_CAPTURE_PATH = os.environ.get("SFC3_PRIVATE_CAPTURE_PATH", "")
 SESSION_IDLE_TIMEOUT = 15 * 60
 CAMPAIGN_MAP_WIDTH = 35
 CAMPAIGN_MAP_HEIGHT = 29
+RACE_FEDERATION = 0
+RACE_KLINGON = 1
+RACE_ROMULAN = 2
+RACE_BORG = 3
+RACE_NEUTRAL = 9
+TERRAIN_OPEN_SPACE = 0x04000000
+CAMPAIGN_STARTS = {
+    RACE_FEDERATION: (7, 7),
+    RACE_KLINGON: (27, 7),
+    RACE_ROMULAN: (7, 21),
+    RACE_BORG: (27, 21),
+}
 CHARACTER_STORE_PATH = Path(
     os.environ.get(
         "SFC3_CHARACTER_STORE",
@@ -186,16 +198,126 @@ def _map_size_payload() -> bytes:
     return b"\x01" + struct.pack("<II", CAMPAIGN_MAP_WIDTH, CAMPAIGN_MAP_HEIGHT)
 
 
+def _client_hex_payload(
+    race: int,
+    *,
+    planet_race: int | None = None,
+    terrain: int = TERRAIN_OPEN_SPACE,
+    has_planet: bool = False,
+    has_starbase: bool = False,
+    victory_points: int = 20,
+    economy_points: int = 10,
+    speed_percent: int = 100,
+) -> bytes:
+    """Serialize the compact 11-byte tClientHex record."""
+    if planet_race is None:
+        planet_race = race
+    byte_fields = (
+        race,
+        planet_race,
+        int(has_planet),
+        int(has_starbase),
+        victory_points,
+        economy_points,
+        speed_percent,
+    )
+    if any(not 0 <= value <= 0xFF for value in byte_fields):
+        raise ValueError("tClientHex byte field outside 0..255")
+    return struct.pack(
+        "<BBIBBBBB",
+        race,
+        planet_race,
+        terrain,
+        int(has_planet),
+        int(has_starbase),
+        victory_points,
+        economy_points,
+        speed_percent,
+    )
+
+
+def _meta_map_hex_payload(
+    x: int,
+    y: int,
+    race: int,
+    *,
+    database_id: int = 1,
+    has_planet: bool = False,
+    has_starbase: bool = False,
+    victory_points: int = 20,
+    economy_points: int = 20,
+) -> bytes:
+    """Serialize the 62-byte tMetaMapHex used in character position state."""
+    return (
+        struct.pack("<IIiiBB", database_id, 0, x, y, race, race)
+        + struct.pack(
+            "<IIIIIII",
+            TERRAIN_OPEN_SPACE,
+            int(has_planet),
+            int(has_starbase),
+            victory_points,
+            economy_points,
+            0,
+            0,
+        )
+        + struct.pack("<dd", 1.0, 1.0)
+    )
+
+
+def _campaign_start_for_race(race: int) -> tuple[int, int]:
+    return CAMPAIGN_STARTS.get(
+        race, (CAMPAIGN_MAP_WIDTH // 2, CAMPAIGN_MAP_HEIGHT // 2)
+    )
+
+
+def _character_position_payload(race: int) -> bytes:
+    """Build IPL_Character::tGetCharacterPositionReq::tRep."""
+    start_x, start_y = _campaign_start_for_race(race)
+    return (
+        b"\x01"
+        + _meta_map_hex_payload(
+            start_x,
+            start_y,
+            race,
+            has_planet=True,
+            victory_points=50,
+            economy_points=100,
+        )
+        + struct.pack("<ii", -1, -1)
+    )
+
+
 def _map_snapshot_payload() -> bytes:
-    """Build a neutral full-map reply using the live capture's fixed hex schema."""
+    """Build a full map with a small Federation starting enclave."""
     count = CAMPAIGN_MAP_WIDTH * CAMPAIGN_MAP_HEIGHT
-    # Two neutral empire identifiers followed by the captured default values for
-    # an ordinary neutral hex. Each serialized tMapHex summary is 11 bytes.
-    neutral_hex = bytes.fromhex("0909000000040000140a64")
+    hexes = bytearray()
+    for y in range(CAMPAIGN_MAP_HEIGHT):
+        for x in range(CAMPAIGN_MAP_WIDTH):
+            owning_race = next(
+                (
+                    race
+                    for race, (start_x, start_y) in CAMPAIGN_STARTS.items()
+                    if abs(x - start_x) <= 3 and abs(y - start_y) <= 3
+                ),
+                RACE_NEUTRAL,
+            )
+            start_x, start_y = _campaign_start_for_race(owning_race)
+            is_homeworld = (x, y) == (start_x, start_y)
+            is_starbase = (x, y) == (start_x + 1, start_y)
+            if owning_race != RACE_NEUTRAL:
+                hexes += _client_hex_payload(
+                    owning_race,
+                    has_planet=is_homeworld,
+                    has_starbase=is_starbase,
+                    victory_points=50 if is_homeworld else 20,
+                    economy_points=100 if is_homeworld else 20,
+                )
+            else:
+                hexes += _client_hex_payload(RACE_NEUTRAL)
     return (
         b"\x01"
         + struct.pack("<iiI", -1, -1, count)
-        + neutral_hex * count
+        + hexes
         + struct.pack("<II", CAMPAIGN_MAP_WIDTH, CAMPAIGN_MAP_HEIGHT)
     )
 
@@ -251,14 +373,19 @@ def _default_client_character_payload(
         0, 0, 0, 0, # prestige/disrepute totals
         0xFFFFFFFF,  # mission slot
     )
-    payload += struct.pack("<ii", -1, -1) * 3  # current, home, destination hexes
+    start_x, start_y = _campaign_start_for_race(race)
+    start_hex = struct.pack("<ii", start_x, start_y)
+    payload += start_hex * 3  # current, home, destination hexes
     payload += struct.pack("<I", 0)  # empty ship-cache vector
 
-    # Default tMetaMapHex: database ID/refcount, (0,0), two 0x09 flags,
-    # seven integer fields, and two doubles.
-    payload += struct.pack("<IIiiBB", 0, 0, 0, 0, 9, 9)
-    payload += struct.pack("<IIIIIII", *([0] * 7))
-    payload += struct.pack("<dd", 0.0, 0.0)
+    payload += _meta_map_hex_payload(
+        start_x,
+        start_y,
+        race,
+        has_planet=True,
+        victory_points=50,
+        economy_points=100,
+    )
     payload += struct.pack("<IBB", 0, 0, 0)  # medals, AI, fleet
     return bytes(payload)
 
@@ -825,7 +952,16 @@ class DynamicSecurityClient:
                     callback[0], callback[1], callback[2], _map_snapshot_payload()
                 ))
                 await self.writer.drain()
-                self._log("info", "-> neutral campaign map snapshot")
+                self._log("info", "-> campaign map snapshot with Federation enclave")
+                continue
+            if (sw, obj, ch) == (0, 6, 12):
+                callback = _parse_callback(payload)
+                race = self.current_character[3] if self.current_character else RACE_NEUTRAL
+                self.writer.write(_nswitch_frame(
+                    callback[0], callback[1], callback[2], _character_position_payload(race)
+                ))
+                await self.writer.drain()
+                self._log("info", "-> character position at campaign start hex")
                 continue
             if (sw, obj, ch) == (0, 6, 6):
                 (
