@@ -118,6 +118,30 @@ class DynamicSecurityWireTests(unittest.TestCase):
         payload = struct.pack("<I", len(name)) + name + struct.pack("<II", 77, 4)
         self.assertEqual(server._parse_relay_publication(payload), (name, (77, 4)))
 
+    def test_relay_request_shape(self):
+        name = b" *~Server~* tMapRelayS"
+        payload = b"\x01" + struct.pack("<III", 77, 1, 3) + server._pack_str(
+            name.decode("ascii")
+        )
+        self.assertEqual(
+            server._parse_relay_request(payload), ((77, 1, 3), name)
+        )
+
+    def test_post_logon_relay_object_assignments_match_live_capture(self):
+        self.assertEqual(
+            server.DynamicSecurityClient.RELAY_OBJECTS,
+            {
+                b" *~Server~* .?AVtNotifyRelayS@@": 30,
+                b" *~Server~* .?AVtEconomyRelayS@@": 19,
+                b" *~Server~* tShipRelayS": 22,
+                b" *~Server~* tClockRelayS": 4,
+                b" *~Server~* .?AVtChatRelayS@@": 29,
+                b" *~Server~* tMapRelayS": 40,
+                b" *~Server~* .?AVtNewsRelayS@@": 27,
+                b" *~Server~* tMissionMatcherRelayS": 24,
+            },
+        )
+
     def test_character_logon_response_shape(self):
         payload = server._character_logon_payload(
             "user@example", "Captain Test", "192.0.2.10", 2
