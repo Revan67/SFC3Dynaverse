@@ -36,13 +36,58 @@ class DynamicSecurityWireTests(unittest.TestCase):
         payload = server._map_size_payload()
         self.assertEqual(payload, b"\x01" + struct.pack("<II", 35, 29))
 
-    def test_neutral_map_snapshot_shape(self):
+    def test_client_hex_field_layout_matches_live_capture(self):
+        self.assertEqual(
+            server._client_hex_payload(server.RACE_NEUTRAL),
+            bytes.fromhex("0909000000040000140a64"),
+        )
+        self.assertEqual(
+            server._client_hex_payload(
+                server.RACE_FEDERATION,
+                has_planet=True,
+                victory_points=50,
+                economy_points=100,
+            ),
+            bytes.fromhex("0000000000040100326464"),
+        )
+
+    def test_campaign_map_snapshot_shape_and_starting_region(self):
         payload = server._map_snapshot_payload()
         count = 35 * 29
         self.assertEqual(len(payload), 1 + 12 + count * 11 + 8)
         self.assertEqual(struct.unpack_from("<iiI", payload, 1), (-1, -1, count))
         self.assertEqual(payload[13:24], bytes.fromhex("0909000000040000140a64"))
         self.assertEqual(struct.unpack_from("<II", payload, len(payload) - 8), (35, 29))
+
+        start_x, start_y = server.CAMPAIGN_STARTS[server.RACE_FEDERATION]
+        start_index = start_y * 35 + start_x
+        start_offset = 13 + start_index * 11
+        self.assertEqual(
+            payload[start_offset : start_offset + 11],
+            bytes.fromhex("0000000000040100326464"),
+        )
+
+    def test_meta_map_hex_and_character_position_shapes(self):
+        meta_hex = server._meta_map_hex_payload(17, 14, server.RACE_FEDERATION)
+        self.assertEqual(len(meta_hex), 62)
+        self.assertEqual(struct.unpack_from("<ii", meta_hex, 8), (17, 14))
+        self.assertEqual(meta_hex[16:18], b"\x00\x00")
+        self.assertEqual(struct.unpack_from("<I", meta_hex, 18)[0], 0x04000000)
+
+        response = server._character_position_payload(server.RACE_FEDERATION)
+        self.assertEqual(len(response), 71)
+        self.assertEqual(response[0], 1)
+        self.assertEqual(
+            struct.unpack_from("<ii", response, 9),
+            server.CAMPAIGN_STARTS[server.RACE_FEDERATION],
+        )
+        self.assertEqual(struct.unpack_from("<ii", response, 63), (-1, -1))
+
+    def test_each_playable_race_has_a_distinct_start(self):
+        self.assertEqual(len(set(server.CAMPAIGN_STARTS.values())), 4)
+        for race, expected in server.CAMPAIGN_STARTS.items():
+            response = server._character_position_payload(race)
+            self.assertEqual(struct.unpack_from("<ii", response, 9), expected)
 
     def test_security_challenge_shape(self):
         challenge = "a" * 29

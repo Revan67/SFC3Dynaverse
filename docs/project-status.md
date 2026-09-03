@@ -28,8 +28,11 @@ Reviewed 2026-09-03 after the first complete local campaign-UI entry.
 - `CharacterLogOnRelayNameC` publishes the client callback address. The replacement sends its
   character-logon response there and claims `tNotifyRelayS` as object 30.
 - The eight captured post-logon service relays are claimed with deterministic object IDs.
-- The clock registration, 35x29 map-size, and 1,015-record full-map replies are implemented. The
-  unmodified client renders the generated neutral hex grid.
+- The clock registration, 35x29 map-size, and 1,015-record full-map replies are implemented.
+- The compact 11-byte `tClientHex` is decoded as race, planet race, terrain mask, planet flag,
+  starbase flag, victory points, economy points, and speed percentage.
+- The unmodified client renders four generated faction regions and centers a persisted Federation
+  character on its race-specific start. Current region geometry is a deterministic placeholder.
 - Peerchat starts with plaintext `CRYPT des 1 sfc3`, then switches to encrypted traffic after 705.
 
 ## Prototype-only
@@ -49,8 +52,9 @@ initial service-relay setup, mission-matching traffic, and encrypted Peerchat st
 
 `server/server.py` now carries the unmodified client through discovery, dynamic-port security,
 character lookup/creation, persistence, character logon, and entry into the Dynaverse campaign UI.
-The client accepts clock initialization and renders a generated neutral 35x29 map. The next milestone
-is meaningful political ownership, terrain, economy, ship-location, and turn state. See
+The client accepts clock initialization and renders a generated four-faction 35x29 map. The next
+milestone is the `PlayerRelayC`/notification path needed for the visible player indicator, followed
+by named map objects, terrain, economy, ship location, and turn state. See
 `docs/dynamic-security-protocol.md` and `docs/character-login-protocol.md` for the sanitized wire
 structures.
 
