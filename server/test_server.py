@@ -20,6 +20,30 @@ class DynamicSecurityWireTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             server._parse_async_return(b"\x00" + struct.pack("<III", 6, 2, 1))
 
+    def test_campaign_callback_shape(self):
+        payload = struct.pack("<III", 6, 6, 4) + b"request fields"
+        self.assertEqual(server._parse_callback(payload), (6, 6, 4))
+
+    def test_clock_snapshot_shape(self):
+        payload = server._clock_snapshot_payload()
+        self.assertEqual(len(payload), 21)
+        self.assertEqual(
+            struct.unpack_from("<IIIII", payload, 1),
+            (0, 8, 10_000, 120_000, 2159),
+        )
+
+    def test_map_size_shape_matches_live_capture(self):
+        payload = server._map_size_payload()
+        self.assertEqual(payload, b"\x01" + struct.pack("<II", 35, 29))
+
+    def test_neutral_map_snapshot_shape(self):
+        payload = server._map_snapshot_payload()
+        count = 35 * 29
+        self.assertEqual(len(payload), 1 + 12 + count * 11 + 8)
+        self.assertEqual(struct.unpack_from("<iiI", payload, 1), (-1, -1, count))
+        self.assertEqual(payload[13:24], bytes.fromhex("0909000000040000140a64"))
+        self.assertEqual(struct.unpack_from("<II", payload, len(payload) - 8), (35, 29))
+
     def test_security_challenge_shape(self):
         challenge = "a" * 29
         payload = server._security_challenge_payload(challenge)

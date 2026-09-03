@@ -61,6 +61,8 @@ PRIVATE_CAPTURE_PATH = os.environ.get("SFC3_PRIVATE_CAPTURE_PATH", "")
 # Temporary fixed default. Expose this as a user-configurable setting when the
 # server UI/configuration layer is built.
 SESSION_IDLE_TIMEOUT = 15 * 60
+CAMPAIGN_MAP_WIDTH = 35
+CAMPAIGN_MAP_HEIGHT = 29
 CHARACTER_STORE_PATH = Path(
     os.environ.get(
         "SFC3_CHARACTER_STORE",
@@ -157,6 +159,13 @@ def _parse_async_return(payload: bytes) -> tuple[int, int, int]:
     return struct.unpack_from("<III", payload, 1)
 
 
+def _parse_callback(payload: bytes) -> tuple[int, int, int]:
+    """Read the unmarked callback address used by campaign relay requests."""
+    if len(payload) < 12:
+        raise ValueError("truncated callback address")
+    return struct.unpack_from("<III", payload)
+
+
 def _security_challenge_payload(challenge: str) -> bytes:
     return struct.pack("<I", 1) + _pack_str(challenge)
 
@@ -164,6 +173,31 @@ def _security_challenge_payload(challenge: str) -> bytes:
 def _security_success_payload() -> bytes:
     message = b"Successful security check"
     return struct.pack("<II", 1, 0) + struct.pack("<I", len(message)) + message
+
+
+def _clock_snapshot_payload() -> bytes:
+    """Build the captured tCurrentTime response used during campaign startup."""
+    # success, turn, adjustment, milliseconds/turn, epoch length, base year
+    return b"\x01" + struct.pack("<IIIII", 0, 8, 10_000, 120_000, 2159)
+
+
+def _map_size_payload() -> bytes:
+    """Build IPL_Map::tRequestMapSizeReq::tRep."""
+    return b"\x01" + struct.pack("<II", CAMPAIGN_MAP_WIDTH, CAMPAIGN_MAP_HEIGHT)
+
+
+def _map_snapshot_payload() -> bytes:
+    """Build a neutral full-map reply using the live capture's fixed hex schema."""
+    count = CAMPAIGN_MAP_WIDTH * CAMPAIGN_MAP_HEIGHT
+    # Two neutral empire identifiers followed by the captured default values for
+    # an ordinary neutral hex. Each serialized tMapHex summary is 11 bytes.
+    neutral_hex = bytes.fromhex("0909000000040000140a64")
+    return (
+        b"\x01"
+        + struct.pack("<iiI", -1, -1, count)
+        + neutral_hex * count
+        + struct.pack("<II", CAMPAIGN_MAP_WIDTH, CAMPAIGN_MAP_HEIGHT)
+    )
 
 
 def _relay_claim_payload(name: bytes, object_id: int) -> bytes:
@@ -764,6 +798,35 @@ class DynamicSecurityClient:
                     )
                     continue
                 self._log("warning", "unknown relay request name_len=%d", len(relay_name))
+            if (sw, obj, ch) == (0, 4, 2):
+                callback = _parse_callback(payload)
+                self.writer.write(_nswitch_frame(
+                    callback[0], callback[1], callback[2], _clock_snapshot_payload()
+                ))
+                await self.writer.drain()
+                self._log("info", "-> initial campaign clock snapshot")
+                continue
+            if (sw, obj, ch) == (0, 40, 46):
+                callback = _parse_callback(payload)
+                self.writer.write(_nswitch_frame(
+                    callback[0], callback[1], callback[2], _map_size_payload()
+                ))
+                await self.writer.drain()
+                self._log(
+                    "info",
+                    "-> campaign map size %dx%d",
+                    CAMPAIGN_MAP_WIDTH,
+                    CAMPAIGN_MAP_HEIGHT,
+                )
+                continue
+            if (sw, obj, ch) == (0, 40, 45):
+                callback = _parse_callback(payload)
+                self.writer.write(_nswitch_frame(
+                    callback[0], callback[1], callback[2], _map_snapshot_payload()
+                ))
+                await self.writer.drain()
+                self._log("info", "-> neutral campaign map snapshot")
+                continue
             if (sw, obj, ch) == (0, 6, 6):
                 (
                     return_address,

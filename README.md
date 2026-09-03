@@ -33,6 +33,7 @@ The only viable path is a replacement server that owns both layers.
 - [x] Character lookup, creation, local persistence, and restart/re-login verified end to end
 - [x] Capture and decode a successful `tSecurityRelayS` challenge/response on the dynamic game port
 - [x] Implement the minimal dynamic-port security exchange through `tCharacterRelayS`
+- [x] Implement clock registration plus a generated 35x29 neutral map; hex grid verified in client
 - [ ] Decode the private `VerifyClientRequest` body and implement CD-key allowlist validation
 - [ ] Dynaverse game simulation (economy, AI, missions, hex map, turn system)
 - [ ] In-game chat (GameSpy Peerchat / IRC protocol)
@@ -263,7 +264,8 @@ planned server UI.
 
 The security handler currently verifies the captured exchange shape but does not yet validate the
 private CD-key body against an allowlist. Campaign relay registration, account persistence, character
-persistence, and entry into the campaign UI are working; the actual map/economy simulation is not.
+persistence, campaign UI entry, clock initialization, and a generated neutral hex grid are working.
+Political ownership, terrain variation, economy, movement, missions, and turn simulation are not.
 
 ## Development
 
