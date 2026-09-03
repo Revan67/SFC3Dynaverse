@@ -27,6 +27,9 @@ Reviewed 2026-09-03 after the first complete local campaign-UI entry.
   client-character response are decoded and generated without replaying private data.
 - `CharacterLogOnRelayNameC` publishes the client callback address. The replacement sends its
   character-logon response there and claims `tNotifyRelayS` as object 30.
+- The eight captured post-logon service relays are claimed with deterministic object IDs.
+- The clock registration, 35x29 map-size, and 1,015-record full-map replies are implemented. The
+  unmodified client renders the generated neutral hex grid.
 - Peerchat starts with plaintext `CRYPT des 1 sfc3`, then switches to encrypted traffic after 705.
 
 ## Prototype-only
@@ -46,8 +49,8 @@ initial service-relay setup, mission-matching traffic, and encrypted Peerchat st
 
 `server/server.py` now carries the unmodified client through discovery, dynamic-port security,
 character lookup/creation, persistence, character logon, and entry into the Dynaverse campaign UI.
-The campaign opens with intentionally empty map and service data. The next milestone is to map and
-implement the post-logon relay publications and minimum viable map/economy/ship state. See
+The client accepts clock initialization and renders a generated neutral 35x29 map. The next milestone
+is meaningful political ownership, terrain, economy, ship-location, and turn state. See
 `docs/dynamic-security-protocol.md` and `docs/character-login-protocol.md` for the sanitized wire
 structures.
 
