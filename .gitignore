@@ -2,11 +2,23 @@
 *.bin
 __pycache__/
 *.pyc
+# Local configuration and credentials
 .env
-Saves/
+.env.*
+!.env.example
+!server/.env.example
+*.reg
+
+# Private captures and imported research-session records
 *.pcapng
 *.pcap
+*.jsonl
+captures/
+memory/
+.claude/
+reference/private/
+reference/ghidra/
+
+Saves/
 LiveSFC3.exe
 SFCLauncher FadedSpark Custom.exe
-.claude/
-reference/ghidra/
