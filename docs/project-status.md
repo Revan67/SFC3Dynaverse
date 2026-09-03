@@ -39,7 +39,8 @@ initial service-relay setup, mission-matching traffic, and encrypted Peerchat st
 
 `server/server.py` now implements discovery through the minimal TCP 27632 security path and the
 client's `tCharacterRelayS` publication. The controlled unmodified-client test passed through the
-first 47-byte character request; decoding its 233-byte live response is the current task. See
+first 47-byte character request. The 233-byte live response has been decoded as a character record
+plus a find-result code, and the server now generates a sanitized "not found" response. See
 `docs/dynamic-security-protocol.md` for the sanitized wire structure.
 
 ## Recovered research artifacts

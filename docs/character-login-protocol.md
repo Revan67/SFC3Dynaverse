@@ -22,13 +22,14 @@ byte[address_length] client_ipv4_text
 Unlike the security procedure envelope, this request has no leading one-byte marker. The parser
 must not log either string.
 
-## Live initialization response
+## Initialization response
 
-The live server replies to the callback address supplied above, using channel 0. The observed
-payload is 233 bytes and begins with a one-byte marker followed by packed strings. It echoes the
-client IPv4 text and account identifier, then contains three additional strings of observed
-lengths 12, 6, and 11 plus binary session/service state.
+The response is `IPL_Character::tConnectPlayerReq::tRep` and its nSwitch destination is the
+callback address supplied above. It contains a one-byte interface-response marker, a serialized
+`tClientCharacter`, and a four-byte `eFindCharacterResponses` value. The live response was 233
+bytes because it contained an existing character and one cached ship. It echoes private account
+data and must not be replayed verbatim.
 
-Those remaining fields are not yet named. Replaying account-specific captured bytes would be
-incorrect; the response must be decoded and generated from local session state. This is the
-current implementation boundary.
+Confirmed result values are `0` (found), `1` (not found), `2` (already logged on), `5` (logons
+denied), and `6` (banned). The replacement server emits a sanitized 149-byte response containing
+a default character and result `1`, allowing a new account to proceed toward character creation.
