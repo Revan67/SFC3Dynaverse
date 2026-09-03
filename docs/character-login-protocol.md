@@ -33,3 +33,18 @@ data and must not be replayed verbatim.
 Confirmed result values are `0` (found), `1` (not found), `2` (already logged on), `5` (logons
 denied), and `6` (banned). The replacement server emits a sanitized 149-byte response containing
 a default character and result `1`, allowing a new account to proceed toward character creation.
+
+## Character creation and persistence
+
+The client sends `IPL_Character::tCreateClientCharacterReq` to `(0, 6, 6)`. The request contains a
+12-byte callback address, two packed identity strings, race, character name, client address, and
+language. The replacement generates a successful response from those fields and does not replay a
+captured account record.
+
+After creation, the client publishes its account-specific `CharacterLogOnRelayNameC` callback.
+The trailing address identifies the client object that receives the character-logon response on
+channel 2. The server then claims `tNotifyRelayS` as object 30. This sequence was sufficient for an
+unmodified client to enter the campaign UI.
+
+Local character records are stored in ignored `server/characters.local.json`. Creation followed by
+a server restart and direct re-login was verified end to end on 2026-09-03.

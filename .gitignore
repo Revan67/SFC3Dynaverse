@@ -8,6 +8,8 @@ __pycache__/
 !.env.example
 !server/.env.example
 *.reg
+accounts.local.json
+characters.local.json
 
 # Private captures and imported research-session records
 *.pcapng
