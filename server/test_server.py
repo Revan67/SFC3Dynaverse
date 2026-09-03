@@ -36,6 +36,27 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual(payload[4:37], name)
         self.assertEqual(struct.unpack_from("<II", payload, 37), (0, 2))
 
+    def test_character_initialize_shape(self):
+        account = b"user@example"
+        address = b"192.0.2.10"
+        payload = (
+            struct.pack("<III", 6, 6, 0)
+            + struct.pack("<I", len(account))
+            + account
+            + struct.pack("<I", len(address))
+            + address
+        )
+        self.assertEqual(
+            server._parse_character_initialize(payload),
+            ((6, 6, 0), "user@example", "192.0.2.10"),
+        )
+
+    def test_character_initialize_rejects_trailing_data(self):
+        payload = struct.pack("<III", 6, 6, 0) + struct.pack("<I", 1) + b"a"
+        payload += struct.pack("<I", 1) + b"b" + b"extra"
+        with self.assertRaisesRegex(ValueError, "trailing"):
+            server._parse_character_initialize(payload)
+
 
 class DynamicSecurityReaderTests(unittest.IsolatedAsyncioTestCase):
     async def test_reader_skips_keepalive_and_reassembles_frame(self):

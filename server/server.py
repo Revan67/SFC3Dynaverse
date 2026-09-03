@@ -150,6 +150,32 @@ def _relay_claim_payload(name: bytes, object_id: int) -> bytes:
     return struct.pack("<I", len(name)) + name + struct.pack("<II", 0, object_id)
 
 
+def _unpack_string(payload: bytes, offset: int) -> tuple[str, int]:
+    if offset + 4 > len(payload):
+        raise ValueError("truncated packed string length")
+    length = struct.unpack_from("<I", payload, offset)[0]
+    offset += 4
+    if length > len(payload) - offset:
+        raise ValueError("truncated packed string")
+    try:
+        value = payload[offset : offset + length].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("packed string is not ASCII") from exc
+    return value, offset + length
+
+
+def _parse_character_initialize(payload: bytes) -> tuple[tuple[int, int, int], str, str]:
+    """Parse the login envelope while allowing callers to keep values private."""
+    if len(payload) < 20:
+        raise ValueError("truncated character initialize request")
+    return_address = struct.unpack_from("<III", payload, 0)
+    account, offset = _unpack_string(payload, 12)
+    client_address, offset = _unpack_string(payload, offset)
+    if offset != len(payload):
+        raise ValueError("unexpected character initialize trailing data")
+    return return_address, account, client_address
+
+
 # ── Client handler ────────────────────────────────────────────────────────────
 
 class SFC3Client:
@@ -481,6 +507,22 @@ class DynamicSecurityClient:
         ))
         await self.writer.drain()
         self._log("info", "-> tCharacterRelayS claim; security milestone complete")
+
+        character_init = await self._read_nswitch_frame(timeout=30.0)
+        if character_init[:3] != (0, 6, 3):
+            raise ValueError(
+                "unexpected first character frame "
+                f"{character_init[0:3]!r}"
+            )
+        return_address, account, client_address = _parse_character_initialize(character_init[3])
+        self._log(
+            "info",
+            "<- character initialize return=%r account_len=%d address_len=%d "
+            "(private values not logged)",
+            return_address,
+            len(account),
+            len(client_address),
+        )
 
         # Keep the connection available for the next implementation phase. Log only
         # structural metadata because authenticated payloads contain private fields.
