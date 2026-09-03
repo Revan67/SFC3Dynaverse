@@ -149,29 +149,123 @@ docs/           Protocol documentation and findings
 server/         Experimental replacement server and multi-port probe
 ```
 
+## Requirements and Current Setup
+
+The current prototype has been tested on Windows 11 with an unmodified SFC3 client. It requires:
+
+- Python 3.10 or newer. There are no third-party Python dependencies; the server uses only the
+  standard library.
+- A legitimately owned and working Star Trek: Starfleet Command III installation containing
+  `SFC3.exe`. The game, its assets, a serial/CD key, and any launcher or modern-Windows client fixes
+  are not distributed by this repository.
+- The GT2 protocol key extracted from that `SFC3.exe`. This is distinct from the game's serial/CD
+  key and must remain private.
+- Administrator access once to edit the Windows hosts file. Administrator access is also required
+  to add firewall rules when clients connect from another machine.
+- Two terminal windows while the prototype remains split into separate account and Dynaverse
+  processes.
+
+The client must resolve the retired service names to the replacement server. For a client and
+server on the same PC, add these entries to
+`C:\Windows\System32\drivers\etc\hosts` from an elevated editor or PowerShell session:
+
+```text
+127.0.0.1 access1.sfc3.activision.com
+127.0.0.1 gpcm.gamespy.com
+127.0.0.1 gpsp.gamespy.com
+127.0.0.1 master.gamespy.com
+```
+
+For a client on another computer, replace `127.0.0.1` in that client's hosts file with the server's
+stable Ethernet IPv4 address. Avoid a VPN, virtual adapter, or changing Wi-Fi address unless that is
+also the address bound and advertised below.
+
+### Private GT2 key
+
+Extract the key into the ignored `server/.env` file without printing it. Substitute the path to
+your own installation:
+
+```powershell
+python .\server\extract_gt2_key.py "D:\Games\GOG\Star Trek SFC3\SFC3.exe" .\server\.env
+```
+
+`server/.env` is intentionally untracked. `server/server.py` does not load it automatically yet,
+so import it into the current PowerShell process before starting the Dynaverse service:
+
+```powershell
+$keyLine = Get-Content .\server\.env | Where-Object { $_ -like 'SFC3_GT2_KEY=*' } | Select-Object -First 1
+$env:SFC3_GT2_KEY = $keyLine.Substring('SFC3_GT2_KEY='.Length)
+```
+
+Never commit or publish `server/.env`, the extracted GT2 key, account data, character data, private
+protocol bodies, packet captures, or server logs. The repository's `.gitignore` covers the known
+local files.
+
+### Run on one PC
+
+From the repository root, start the local GameSpy-compatible account and profile services in the
+first PowerShell window:
+
+```powershell
+$env:SFC3_SERVER_HOST = '127.0.0.1'
+python .\server\probe.py 29900 29901
+```
+
+In a second PowerShell window, load the private key as shown above and start the Dynaverse service:
+
+```powershell
+$env:SFC3_SERVER_HOST = '127.0.0.1'
+$env:SFC3_BIND_HOSTS = '127.0.0.1'
+$env:SFC3_ADVERTISE_HOST = '127.0.0.1'
+python .\server\server.py
+```
+
+Leave both processes running, launch SFC3, and use its Online Campaign login. Account and character
+records are created locally in the ignored `server/accounts.local.json` and
+`server/characters.local.json` files.
+
+### Run for LAN clients
+
+Replace `<server-ip>` with the server computer's stable physical-Ethernet IPv4 address. The account
+service accepts only one bind address, while the Dynaverse service accepts a comma-separated list:
+
+```powershell
+# Account/profile terminal
+$env:SFC3_SERVER_HOST = '<server-ip>'
+python .\server\probe.py 29900 29901
+```
+
+```powershell
+# Dynaverse terminal, after loading SFC3_GT2_KEY
+$env:SFC3_SERVER_HOST = '<server-ip>'
+$env:SFC3_BIND_HOSTS = '127.0.0.1,<server-ip>'
+$env:SFC3_ADVERTISE_HOST = '<server-ip>'
+python .\server\server.py
+```
+
+Permit these inbound ports through Windows Firewall for LAN use:
+
+| Protocol | Port | Current role |
+|---|---:|---|
+| TCP | 29900 | GameSpy account creation and login (GPCM) |
+| TCP | 29901 | GameSpy profile lookup (GPSP) |
+| TCP | 28900 | GameSpy-compatible server directory |
+| UDP | 27633 | Server-browser status query |
+| TCP | 26100 | SFC3 bootstrap relay |
+| TCP | 27632 | Advertised game, security, character, and campaign session |
+
+The default configuration binds only to loopback and is therefore not reachable from the LAN.
+Port numbers can be changed with `SFC3_RELAY_PORT`, `SFC3_GAME_PORT`, `SFC3_DIRECTORY_PORT`, and
+`SFC3_STATUS_PORT`; client redirection and discovery must agree with any changes. `SFC3_SERVER_NAME`
+changes the browser name, and `SFC3_CHARACTER_STORE` changes the character database path. The
+post-login idle timeout is currently fixed at 15 minutes and will become configurable with the
+planned server UI.
+
+The security handler currently verifies the captured exchange shape but does not yet validate the
+private CD-key body against an allowlist. Campaign relay registration, account persistence, character
+persistence, and entry into the campaign UI are working; the actual map/economy simulation is not.
+
 ## Development
-
-Python 3.10 or newer is sufficient; the prototype currently uses only the standard library.
-Provide the GT2 key extracted from a legitimately owned SFC3 client at runtime—never commit it:
-
-```powershell
-$env:SFC3_GT2_KEY = "<your extracted key>"
-python server/server.py
-```
-
-It can also be extracted to the ignored `server/.env` file without displaying it:
-
-```powershell
-python server/extract_gt2_key.py "D:\Games\GOG\Star Trek SFC3\SFC3.exe" server/.env
-```
-
-The server listens on TCP 26100 for bootstrap traffic, TCP 28900 for GameSpy directory discovery,
-UDP 27633 for server status, and TCP 27632 for the captured dynamic-port security flow. Set
-`SFC3_ADVERTISE_HOST` to the IPv4 address the client should query; it defaults to
-`SFC3_SERVER_HOST`, then to `127.0.0.1`. The security handler currently accepts a structurally
-valid verification request without validating its private body. Listeners bind to the
-comma-separated `SFC3_BIND_HOSTS` value, which defaults to `SFC3_SERVER_HOST`; the loopback default
-keeps the prototype inaccessible from the LAN.
 
 Run the focused protocol tests with:
 

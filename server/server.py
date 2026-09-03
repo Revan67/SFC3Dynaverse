@@ -281,6 +281,17 @@ def _parse_relay_publication(payload: bytes) -> tuple[bytes, tuple[int, int]]:
     return name, address
 
 
+def _parse_relay_request(payload: bytes) -> tuple[tuple[int, int, int], bytes]:
+    """Parse an interface request asking the server to claim a named relay."""
+    if len(payload) < 17 or payload[0] != 1:
+        raise ValueError("invalid relay request")
+    return_address = struct.unpack_from("<III", payload, 1)
+    name_length = struct.unpack_from("<I", payload, 13)[0]
+    if 17 + name_length != len(payload):
+        raise ValueError("invalid relay request name length")
+    return return_address, payload[17:]
+
+
 def _character_logon_payload(
     account: str, character_name: str, client_address: str, race: int
 ) -> bytes:
@@ -543,7 +554,16 @@ class DynamicSecurityClient:
 
     SECURITY_RELAY = b" *~Server~* .?AVtSecurityRelayS@@"
     CHARACTER_RELAY = b" *~Server~* tCharacterRelayS"
-    NOTIFY_RELAY = b" *~Server~* .?AVtNotifyRelayS@@"
+    RELAY_OBJECTS = {
+        b" *~Server~* .?AVtNotifyRelayS@@": 30,
+        b" *~Server~* .?AVtEconomyRelayS@@": 19,
+        b" *~Server~* tShipRelayS": 22,
+        b" *~Server~* tClockRelayS": 4,
+        b" *~Server~* .?AVtChatRelayS@@": 29,
+        b" *~Server~* tMapRelayS": 40,
+        b" *~Server~* .?AVtNewsRelayS@@": 27,
+        b" *~Server~* tMissionMatcherRelayS": 24,
+    }
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.reader = reader
@@ -720,18 +740,30 @@ class DynamicSecurityClient:
                     2,
                     _character_logon_payload(*self.current_character),
                 ))
-                self.writer.write(_nswitch_frame(
-                    self.sw_id,
-                    1,
-                    3,
-                    _relay_claim_payload(self.NOTIFY_RELAY, 30),
-                ))
                 await self.writer.drain()
                 self._log(
                     "info",
-                    "-> character logon response and tNotifyRelayS claim",
+                    "-> character logon response",
                 )
                 continue
+            if (sw, obj, ch) == (0, 1, 2):
+                relay_return, relay_name = _parse_relay_request(payload)
+                relay_object = self.RELAY_OBJECTS.get(relay_name)
+                if relay_object is not None:
+                    self.writer.write(_nswitch_frame(
+                        relay_return[0],
+                        relay_return[1],
+                        relay_return[2],
+                        _relay_claim_payload(relay_name, relay_object),
+                    ))
+                    await self.writer.drain()
+                    self._log(
+                        "info",
+                        "-> claimed requested relay object=%d",
+                        relay_object,
+                    )
+                    continue
+                self._log("warning", "unknown relay request name_len=%d", len(relay_name))
             if (sw, obj, ch) == (0, 6, 6):
                 (
                     return_address,
