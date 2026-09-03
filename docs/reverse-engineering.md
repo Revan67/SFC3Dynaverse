@@ -38,9 +38,9 @@ Verify this against the specific binary before applying it to another build.
 Early client-side Ghidra work also identified fields named `WonUsername`, `WonPassword`,
 `WonNick`, and `MetaNewAccount`. UI observation associated the username field with the email
 input and the nickname with the display name. This establishes that the legacy account model
-contains distinct login, password, nickname, and account-creation state; it does **not** yet prove
-which of those fields appear in the dynamic game-port `VerifyClientRequest`. The controlled live
-capture must resolve that boundary.
+contains distinct login, password, nickname, and account-creation state. The 2026-09-02 live trace
+captured the dynamic-port `VerifyClientRequest`, but only its return envelope and 106-entry file/CRC
+manifest prefix have been decoded; the private identity boundary remains intentionally unparsed.
 
 ## Security factory pattern
 
@@ -100,8 +100,8 @@ and a null buffer. This corroborates the empty-data factory-trigger pattern, alt
 capture remains authoritative for its actual destination and ordering.
 
 Static analysis suggested a raw challenge-request serialization and a three-channel security
-child. The live dynamic-port trace must be used to reconcile those routines with the observed
-nSwitch frames before implementation.
+child. The 2026-09-02 trace reconciled the request/return channels and successful response shape;
+the sanitized result is recorded in `dynamic-security-protocol.md`.
 
 ## Reference tooling
 

@@ -28,16 +28,17 @@ The only viable path is a replacement server that owns both layers.
 - [x] Client binary hello, nSwitch setup, and relay publications all working
 - [x] Server-side `tAccessRelayS` claim and factory trigger confirmed
 - [x] Live directory flow observed through a dynamically assigned game port
-- [ ] Capture a successful `tSecurityRelayS` challenge/response on the dynamic game port
-- [ ] `VerifyClientRequest` parsing and CD key allowlist validation
+- [x] Capture and decode a successful `tSecurityRelayS` challenge/response on the dynamic game port
+- [x] Implement the minimal dynamic-port security exchange through `tCharacterRelayS`
+- [ ] Decode the private `VerifyClientRequest` body and implement CD-key allowlist validation
 - [ ] Dynaverse game simulation (economy, AI, missions, hex map, turn system)
 - [ ] In-game chat (GameSpy Peerchat / IRC protocol)
 
 ## Approach
 
-A Python asyncio replacement that currently prototypes the bootstrap relay on port 26100 and
-the legacy GameSpy account services. The live service assigns a separate game port dynamically;
-port 27632 was observed in the existing capture.
+A Python asyncio replacement that prototypes the bootstrap relay on port 26100 and the security
+relay on the observed game port 27632. Legacy GameSpy account responders and diagnostic listeners
+remain in `server/probe.py`; directory discovery and character login are not implemented yet.
 
 The implementation will:
 
@@ -101,9 +102,9 @@ uint32_LE(32)         ← challenge string length
 [32 bytes]            ← random challenge
 ```
 
-The live capture instead shows a security exchange on a dynamically assigned game port,
-including `tSecurityRelayS` publication and a 55-byte nSwitch-framed challenge. Its exact
-semantic layout and successful client response remain under investigation.
+The 2026-09-02 live capture supersedes that hypothesis. It establishes the asynchronous return
+envelope, 29-byte challenge, verification-request prefix, successful response, and transition to
+`tCharacterRelayS`. See [`docs/dynamic-security-protocol.md`](docs/dynamic-security-protocol.md).
 
 ### Intended Auth Exchange
 
@@ -141,6 +142,27 @@ The CD key is read from `HKLM\SOFTWARE\WOW6432Node\Activision\Star Trek Starflee
 ```
 docs/           Protocol documentation and findings
 server/         Experimental replacement server and multi-port probe
+```
+
+## Development
+
+Python 3.10 or newer is sufficient; the prototype currently uses only the standard library.
+Provide the GT2 key extracted from a legitimately owned SFC3 client at runtime—never commit it:
+
+```powershell
+$env:SFC3_GT2_KEY = "<your extracted key>"
+python server/server.py
+```
+
+The server listens on TCP 26100 for bootstrap traffic and TCP 27632 for the captured dynamic-port
+security flow. The latter currently accepts a structurally valid verification request without
+validating its private body. A clean client also still needs the local TCP 28900 directory and UDP
+27633 status services before it can discover this game port end to end.
+
+Run the focused protocol tests with:
+
+```powershell
+python -m unittest discover -s server -p "test_*.py" -v
 ```
 
 Current status and capture procedure:
