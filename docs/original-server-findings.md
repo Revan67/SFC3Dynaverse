@@ -1,8 +1,8 @@
 # Original Server Kit Findings
 
 These are sanitized historical findings from experiments with `ServerPlatform.exe` build 534b.
-The binaries, profiles, and helper tools referenced by the original session have not yet been
-migrated to this machine, so treat details not corroborated by current captures as historical.
+The binaries, profiles, and helper tools referenced by the original session have now been
+recovered. Details not corroborated by current captures should still be treated as historical.
 
 ## Why the replacement path was chosen
 
@@ -29,9 +29,8 @@ dynamic game port observed in the surviving live capture.
 The original server attempted to connect to GameSpy Peerchat on TCP 6667 during startup. Pointing
 its chat profile at a local substitute allowed blocked relays to initialize and become public.
 
-The captured server traffic reportedly issued a `CRYPT des 1 sfc3dv` negotiation while subsequent
-IRC traffic remained plaintext. This should be reconfirmed before implementing Peerchat because the
-helper and its capture were not transferred.
+The new client-side live capture begins with `CRYPT des 1 sfc3`; after numeric 705 the traffic is
+encrypted. This supersedes the earlier assumption that subsequent IRC traffic remained plaintext.
 
 Historical channel patterns included faction, global, and system-broadcast channels under the
 SFC3 Dynaverse namespace. CD-key validation appeared to use Peerchat callbacks in the original
@@ -40,20 +39,19 @@ wire-compatible with the client.
 
 ## Server-kit versions recorded
 
-The former archive reportedly contained builds 464, 504, 531, 534, and 534b, with 534b used for
-the most recent investigation. Build 504 included SQL support and a map editor. The archive path
-recorded by Claude is no longer present.
+The recovered archive at `D:\SFC\sfc3` contains builds 464, 504, 531, 534, and 534b, with 534b used
+for the most recent investigation. Build 504 included SQL support and a map editor.
 
-## Missing tools and evidence
+## Recovered tools and evidence
 
-- Original server kits and active build-534b profile
-- `fake_peerchat.py`
-- `tcp_proxy.py`
-- PE/CD-key analysis helper
-- Client and server Ghidra C exports
-- Original Peerchat and split-process logs/captures
+- Original server kits and active profiles: `D:\SFC\sfc3` and `C:\Utilities\SFC3Server`
+- Compatibility helpers: `C:\Utilities\Dev\sfc3-compat`
+- Extracted build 504: `C:\Utilities\Dev\sfc3-server-504`
+- Client/server Ghidra projects and exports: `reference/ghidra`
+- Current live capture: `live-login-ethernet-20260902.pcapng`
 
-If recovered, store proprietary binaries and raw captures outside Git. Commit only clean-room
+Older raw Peerchat and split-process captures may still exist only on the previous computer. Keep
+proprietary binaries, Ghidra databases/exports, and raw captures out of Git; commit only clean-room
 notes and independently written analysis utilities.
 
 ## Superseded product decisions

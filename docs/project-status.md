@@ -16,8 +16,9 @@ Reviewed 2026-09-02 after migrating the repository and Claude research notes to 
 - A live login queries the master service on 28900.
 - The master response leads to a second GT2/nSwitch connection on a dynamic game port;
   port 27632 was observed.
-- The game-port client publishes `tSecurityRelayS`; the live server claims it and sends a
-  55-byte challenge frame.
+- The game-port security exchange is captured through success and the subsequent
+  `tCharacterRelayS` publication.
+- Peerchat starts with plaintext `CRYPT des 1 sfc3`, then switches to encrypted traffic after 705.
 
 ## Prototype-only
 
@@ -25,29 +26,37 @@ Reviewed 2026-09-02 after migrating the repository and Claude research notes to 
 - `server/probe.py` combines the bootstrap implementation, permissive GPCM/GPSP responders,
   and raw listeners for suspected ports.
 - The account responders do not persist accounts or verify credentials.
-- The source has no automated tests or packaging metadata yet.
+- The dynamic security wire helpers have focused unit tests; packaging metadata is still absent.
 
-## Current blocker
+## Current milestone
 
-Capture a successful game-port authentication exchange after the server challenge. We need the
-client verification packet, server accept/reject packet, and first authenticated IPL messages.
-Static analysis found legacy username/email, password, nickname, and new-account fields, but their
-relationship to GPCM versus the dynamic-port security request remains unverified.
+The 2026-09-02 Ethernet capture resolved the dynamic-port authentication blocker. It contains the
+client verification request, the server's successful security response, character authentication,
+initial service-relay setup, mission-matching traffic, and encrypted Peerchat startup.
 
-## Research artifacts not yet migrated
+`server/server.py` now implements the minimal TCP 27632 security path through the client's
+`tCharacterRelayS` publication. Character login and authenticated IPL decoding are next. See
+`docs/dynamic-security-protocol.md` for the sanitized wire structure.
 
-The recovered notes reference an original server-kit archive, Ghidra C exports, a fake Peerchat
-service, a TCP proxy, and PE-analysis helpers. None exists at the recorded paths on this machine.
-Recovering them would preserve useful independent evidence, but is not required for the next live
-capture.
+## Recovered research artifacts
+
+- Original server kits: `D:\SFC\sfc3`
+- Installed server and profiles: `C:\Utilities\SFC3Server`
+- Compatibility tools and helpers: `C:\Utilities\Dev\sfc3-compat`
+- Extracted build 504: `C:\Utilities\Dev\sfc3-server-504`
+- Ghidra projects/exports: `reference/ghidra` (local evidence; keep out of commits)
+- Successful live capture: `live-login-ethernet-20260902.pcapng` (ignored by Git)
+
+Some older raw captures remain on the previous computer. They are useful historical evidence but
+do not block the current character-login work.
 
 ## Superseded conclusions
 
 - `tAccessRelayS` claim format is no longer unknown.
 - Port 26100 is bootstrap, not the complete CD-key authentication service.
 - Port 27100 is not established as a fixed simulation port.
-- The raw 44-byte challenge inferred from static analysis is not yet reconciled with the
-  nSwitch-framed challenge observed on the dynamic port.
+- The raw 44-byte challenge inferred from static analysis is superseded by the observed
+  nSwitch-framed dynamic-port exchange.
 
 ## Intended product scope
 

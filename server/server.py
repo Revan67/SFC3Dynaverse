@@ -38,8 +38,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("sfc3")
 
-PORT        = int(os.environ.get("SFC3_RELAY_PORT", "26100"))
-SERVER_HOST = os.environ.get("SFC3_SERVER_HOST", "127.0.0.1")
+PORT          = int(os.environ.get("SFC3_RELAY_PORT", "26100"))
+GAME_PORT     = int(os.environ.get("SFC3_GAME_PORT", "27632"))
+SERVER_HOST   = os.environ.get("SFC3_SERVER_HOST", "127.0.0.1")
 
 # ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -121,6 +122,26 @@ def _parse_nswitch_frames(buf: bytes) -> list:
 def _build_motd() -> bytes:
     msg = "=" * 79 + "\r\nGame Message:\r\n"
     return struct.pack("<I", 2) + _pack_str(msg) + _pack_str(msg)
+
+
+def _parse_async_return(payload: bytes) -> tuple[int, int, int]:
+    """Read the dynamic-port request envelope without touching its private body."""
+    if len(payload) < 13 or payload[0] != 1:
+        raise ValueError("invalid async return envelope")
+    return struct.unpack_from("<III", payload, 1)
+
+
+def _security_challenge_payload(challenge: str) -> bytes:
+    return struct.pack("<I", 1) + _pack_str(challenge)
+
+
+def _security_success_payload() -> bytes:
+    message = b"Successful security check"
+    return struct.pack("<II", 1, 0) + struct.pack("<I", len(message)) + message
+
+
+def _relay_claim_payload(name: bytes, object_id: int) -> bytes:
+    return struct.pack("<I", len(name)) + name + struct.pack("<II", 0, object_id)
 
 
 # ── Client handler ────────────────────────────────────────────────────────────
@@ -331,14 +352,208 @@ class SFC3Client:
         self._log("info", "60 s post-factory listen complete")
 
 
+class DynamicSecurityClient:
+    """Minimal live-capture-compatible security service for the dynamic game port."""
+
+    SECURITY_RELAY = b" *~Server~* .?AVtSecurityRelayS@@"
+    CHARACTER_RELAY = b" *~Server~* tCharacterRelayS"
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.reader = reader
+        self.writer = writer
+        self.addr = writer.get_extra_info("peername")
+        self.sw_id = random.randint(1, 0xFFFFFFFE)
+
+    def _log(self, level, msg, *args):
+        getattr(log, level)(f"[game:{GAME_PORT}] {self.addr[0]}:{self.addr[1]} {msg}", *args)
+
+    async def run(self):
+        self._log("info", "CONNECT sw_id=0x%08x", self.sw_id)
+        try:
+            await self._handle()
+        except asyncio.IncompleteReadError:
+            self._log("info", "DISCONNECTED")
+        except asyncio.TimeoutError:
+            self._log("warning", "TIMED OUT")
+        except Exception as exc:
+            self._log("error", "error: %s", exc, exc_info=True)
+        finally:
+            self.writer.close()
+            try:
+                await self.writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+    async def _handle(self):
+        if not await self._gt2_handshake():
+            return
+
+        hello = await asyncio.wait_for(self.reader.readexactly(14), timeout=10.0)
+        if hello != _nswitch_ctrl(0xFFFFFFFE, 0xFFFFFFFF, 2):
+            raise ValueError(f"unexpected binary hello ({len(hello)} bytes)")
+
+        self.writer.write(_nswitch_frame(0xFFFFFFFF, 0, 0, struct.pack("<I", self.sw_id)))
+        # The first word is opaque and varied between live sessions. Use the
+        # neutral value already proven by the bootstrap path instead of baking
+        # a captured process-specific value into server output.
+        self.writer.write(_nswitch_frame(0xFFFFFFFF, 0, 1, struct.pack("<III", 0x714, 0, 1)))
+        self.writer.write(_nswitch_ctrl(0xFFFFFFFE, 0xFFFFFFFF, 3))
+        await self.writer.drain()
+
+        _, _, _, publication = await self._wait_for(
+            lambda sw, obj, ch, payload: sw == 0 and obj == 1 and ch == 2
+            and b"tSecurityRelayS" in payload,
+            "tSecurityRelayS publication",
+        )
+        self._log("info", "<- tSecurityRelayS publication (%d bytes)", len(publication))
+
+        self.writer.write(b"\x80\x00\x02")
+        self.writer.write(_nswitch_frame(
+            self.sw_id,
+            1,
+            3,
+            _relay_claim_payload(self.SECURITY_RELAY, 2),
+        ))
+        await self.writer.drain()
+        self._log("info", "-> tSecurityRelayS claim")
+
+        _, _, _, initialize = await self._wait_for(
+            lambda sw, obj, ch, payload: sw == 0 and obj == 32 and ch == 3,
+            "security initialize request",
+        )
+        challenge_return = _parse_async_return(initialize)
+        if challenge_return != (self.sw_id, 2, 0x00010001):
+            raise ValueError(f"unexpected challenge return address {challenge_return!r}")
+
+        challenge = _random_str(29, string.ascii_lowercase)
+        self.writer.write(_nswitch_frame(
+            challenge_return[0],
+            challenge_return[1],
+            challenge_return[2],
+            _security_challenge_payload(challenge),
+        ))
+        await self.writer.drain()
+        self._log("info", "-> security challenge (value redacted)")
+
+        _, _, _, verification = await self._wait_for(
+            lambda sw, obj, ch, payload: sw == 0 and obj == 32 and ch == 2,
+            "client verification request",
+        )
+        verify_return = _parse_async_return(verification)
+        if verify_return != (self.sw_id, 2, 0x00010002):
+            raise ValueError(f"unexpected verification return address {verify_return!r}")
+        if len(verification) < 17:
+            raise ValueError("verification request has no manifest count")
+        manifest_count = struct.unpack_from("<I", verification, 13)[0]
+        self._log(
+            "info",
+            "<- verification request plen=%d manifest_count=%d (private body not logged)",
+            len(verification),
+            manifest_count,
+        )
+
+        self.writer.write(_nswitch_frame(
+            verify_return[0],
+            verify_return[1],
+            verify_return[2],
+            _security_success_payload(),
+        ))
+        await self.writer.drain()
+        self._log("info", "-> Successful security check")
+
+        _, _, _, character = await self._wait_for(
+            lambda sw, obj, ch, payload: sw == 0 and obj == 1 and ch == 2
+            and b"tCharacterRelayS" in payload,
+            "tCharacterRelayS publication",
+        )
+        self._log("info", "<- tCharacterRelayS publication (%d bytes)", len(character))
+        self.writer.write(_nswitch_frame(
+            self.sw_id,
+            1,
+            3,
+            _relay_claim_payload(self.CHARACTER_RELAY, 6),
+        ))
+        await self.writer.drain()
+        self._log("info", "-> tCharacterRelayS claim; security milestone complete")
+
+        # Keep the connection available for the next implementation phase. Log only
+        # structural metadata because authenticated payloads contain private fields.
+        while True:
+            sw, obj, ch, payload = await self._read_nswitch_frame(timeout=120.0)
+            self._log("info", "<- frame sw=%d obj=%d ch=%d plen=%d", sw, obj, ch, len(payload))
+
+    async def _gt2_handshake(self) -> bool:
+        challenge = _random_str(32)
+        self.writer.write(_gt2_negotiate(f"\\challenge\\{challenge}\\final\\"))
+        await self.writer.drain()
+
+        header = await asyncio.wait_for(self.reader.readexactly(3), timeout=12.0)
+        if header[0] != 0x80:
+            raise ValueError("invalid GT2 negotiation header")
+        length = struct.unpack_from("<H", header, 1)[0]
+        payload = await asyncio.wait_for(self.reader.readexactly(length), timeout=12.0)
+        client_challenge = _parse_kv(payload, "challenge", fixed_len=32)
+        if len(client_challenge) != 32:
+            raise ValueError("missing client GT2 challenge")
+        accept_hash = _gt2_hash(client_challenge)
+        self.writer.write(_gt2_negotiate(
+            f"\\accept\\1\\response\\{accept_hash}\\port\\{GAME_PORT}\\final\\"
+        ))
+        await self.writer.drain()
+        self._log("info", "GT2 accepted (challenge values redacted)")
+        return True
+
+    async def _read_nswitch_frame(self, timeout: float) -> tuple[int, int, int, bytes]:
+        while True:
+            header = await asyncio.wait_for(self.reader.readexactly(2), timeout=timeout)
+            if header == b"\x80\x00":
+                keepalive = await asyncio.wait_for(self.reader.readexactly(1), timeout=timeout)
+                if keepalive not in (b"\x01", b"\x02"):
+                    raise ValueError("invalid keepalive")
+                continue
+
+            length = struct.unpack(">H", header)[0]
+            if length < 16:
+                # Control frames are valid but not useful to the dynamic security state.
+                await asyncio.wait_for(self.reader.readexactly(length), timeout=timeout)
+                continue
+            body = await asyncio.wait_for(self.reader.readexactly(length), timeout=timeout)
+            sw, obj, ch, payload_length = struct.unpack_from("<IIII", body, 0)
+            if payload_length != length - 16:
+                raise ValueError(
+                    f"nSwitch length mismatch: header={payload_length} actual={length - 16}"
+                )
+            return sw, obj, ch, body[16:]
+
+    async def _wait_for(self, predicate, label: str) -> tuple[int, int, int, bytes]:
+        while True:
+            frame = await self._read_nswitch_frame(timeout=30.0)
+            if predicate(*frame):
+                return frame
+            self._log(
+                "debug",
+                "ignoring frame while waiting for %s: sw=%d obj=%d ch=%d plen=%d",
+                label,
+                frame[0],
+                frame[1],
+                frame[2],
+                len(frame[3]),
+            )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
-    handler = lambda r, w: asyncio.ensure_future(SFC3Client(r, w).run())
-    server = await asyncio.start_server(handler, "0.0.0.0", PORT)
-    log.info("Listening on port %d", PORT)
-    async with server:
-        await server.serve_forever()
+    relay_handler = lambda r, w: asyncio.ensure_future(SFC3Client(r, w).run())
+    game_handler = lambda r, w: asyncio.ensure_future(DynamicSecurityClient(r, w).run())
+    relay_server = await asyncio.start_server(relay_handler, "0.0.0.0", PORT)
+    game_server = await asyncio.start_server(game_handler, "0.0.0.0", GAME_PORT)
+    log.info("Listening on relay port %d and dynamic game port %d", PORT, GAME_PORT)
+    async with relay_server, game_server:
+        await asyncio.gather(
+            relay_server.serve_forever(),
+            game_server.serve_forever(),
+        )
 
 
 if __name__ == "__main__":
