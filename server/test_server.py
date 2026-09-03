@@ -9,6 +9,9 @@ import server
 
 
 class DynamicSecurityWireTests(unittest.TestCase):
+    def test_campaign_idle_timeout_is_fifteen_minutes(self):
+        self.assertEqual(server.SESSION_IDLE_TIMEOUT, 15 * 60)
+
     def test_async_return_envelope(self):
         payload = b"\x01" + struct.pack("<III", 6, 2, 0x00010002) + b"private"
         self.assertEqual(server._parse_async_return(payload), (6, 2, 0x00010002))
