@@ -58,6 +58,9 @@ STATUS_PORT    = int(os.environ.get("SFC3_STATUS_PORT", "27633"))
 ADVERTISE_HOST = os.environ.get("SFC3_ADVERTISE_HOST", SERVER_HOST)
 SERVER_NAME    = os.environ.get("SFC3_SERVER_NAME", "Local SFC3 Dynaverse")
 PRIVATE_CAPTURE_PATH = os.environ.get("SFC3_PRIVATE_CAPTURE_PATH", "")
+# Temporary fixed default. Expose this as a user-configurable setting when the
+# server UI/configuration layer is built.
+SESSION_IDLE_TIMEOUT = 15 * 60
 CHARACTER_STORE_PATH = Path(
     os.environ.get(
         "SFC3_CHARACTER_STORE",
@@ -703,7 +706,9 @@ class DynamicSecurityClient:
         # Keep the connection available for the next implementation phase. Log only
         # structural metadata because authenticated payloads contain private fields.
         while True:
-            sw, obj, ch, payload = await self._read_nswitch_frame(timeout=120.0)
+            sw, obj, ch, payload = await self._read_nswitch_frame(
+                timeout=SESSION_IDLE_TIMEOUT
+            )
             self._log("info", "<- frame sw=%d obj=%d ch=%d plen=%d", sw, obj, ch, len(payload))
             if (sw, obj, ch) == (0, 1, 0) and b"CharacterLogOnRelayNameC" in payload:
                 if self.current_character is None:
