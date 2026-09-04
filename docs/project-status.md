@@ -32,7 +32,16 @@ Reviewed 2026-09-03 after the first complete local campaign-UI entry.
 - The compact 11-byte `tClientHex` is decoded as race, planet race, terrain mask, planet flag,
   starbase flag, victory points, economy points, and speed percentage.
 - The unmodified client renders four generated faction regions and centers a persisted Federation
-  character on its race-specific start. Current region geometry is a deterministic placeholder.
+  character on its race-specific start. The map now uses the exact 35x29 static baseline decoded
+  from the live Generations At War 2.1 session, including political ownership, terrain, planets,
+  starbases, victory values, economy values, and movement speed.
+- The captured live character was located at neutral hex `(28,8)`. New local Federation characters
+  instead start at the Federation homeworld `(32,1)` with destination `(-1,-1)`, allowing the
+  initial viewport and Center action to target faction space.
+- Character channels 24 and 26 are identified as `tGetClientCharacterReq` and `tGetFleetDataReq`;
+  the server generates the local character and a valid empty fleet response. This restores the
+  player marker, initial faction-homeworld camera, and Center action. A channel-12 position handler
+  is implemented from the live schema, although the present local login sequence does not request it.
 - Peerchat starts with plaintext `CRYPT des 1 sfc3`, then switches to encrypted traffic after 705.
 
 ## Prototype-only

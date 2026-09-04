@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import struct
 import tempfile
 import unittest
@@ -6,6 +7,7 @@ from pathlib import Path
 
 import gamespy
 import server
+from campaign_map import CLIENT_HEX_RECORDS, SHA256
 
 
 class DynamicSecurityWireTests(unittest.TestCase):
@@ -51,17 +53,18 @@ class DynamicSecurityWireTests(unittest.TestCase):
             bytes.fromhex("0000000000040100326464"),
         )
 
-    def test_campaign_map_snapshot_shape_and_starting_region(self):
+    def test_campaign_map_snapshot_matches_observed_baseline(self):
         payload = server._map_snapshot_payload()
         count = 35 * 29
         self.assertEqual(len(payload), 1 + 12 + count * 11 + 8)
         self.assertEqual(struct.unpack_from("<iiI", payload, 1), (-1, -1, count))
-        self.assertEqual(payload[13:24], bytes.fromhex("0909000000040000140a64"))
+        self.assertEqual(payload[13:-8], CLIENT_HEX_RECORDS)
+        self.assertEqual(hashlib.sha256(payload[13:-8]).hexdigest(), SHA256)
         self.assertEqual(struct.unpack_from("<II", payload, len(payload) - 8), (35, 29))
 
-        start_x, start_y = server.CAMPAIGN_STARTS[server.RACE_FEDERATION]
-        start_index = start_y * 35 + start_x
-        start_offset = 13 + start_index * 11
+        home_x, home_y = server.CAMPAIGN_HOMEWORLDS[server.RACE_FEDERATION]
+        home_index = home_y * 35 + home_x
+        start_offset = 13 + home_index * 11
         self.assertEqual(
             payload[start_offset : start_offset + 11],
             bytes.fromhex("0000000000040100326464"),
@@ -88,6 +91,32 @@ class DynamicSecurityWireTests(unittest.TestCase):
         for race, expected in server.CAMPAIGN_STARTS.items():
             response = server._character_position_payload(race)
             self.assertEqual(struct.unpack_from("<ii", response, 9), expected)
+
+    def test_federation_character_starts_at_homeworld_with_no_destination(self):
+        payload = server._default_client_character_payload(race=server.RACE_FEDERATION)
+        _, offset = server._unpack_string(payload, 0)
+        _, offset = server._unpack_string(payload, offset)
+        _, offset = server._unpack_string(payload, offset + 4)
+        positions_offset = offset + 8 * 4
+        self.assertEqual(struct.unpack_from("<ii", payload, positions_offset), (32, 1))
+        self.assertEqual(struct.unpack_from("<ii", payload, positions_offset + 8), (32, 1))
+        self.assertEqual(struct.unpack_from("<ii", payload, positions_offset + 16), (-1, -1))
+
+    def test_get_client_character_response_contains_local_character(self):
+        payload = server._get_client_character_payload(
+            "user@example", "Captain Test", "192.0.2.10", server.RACE_FEDERATION
+        )
+        self.assertEqual(payload[0], 1)
+        address, offset = server._unpack_string(payload, 1)
+        account, offset = server._unpack_string(payload, offset)
+        self.assertEqual((address, account), ("192.0.2.10", "user@example"))
+        self.assertEqual(payload[-1], 1)
+
+    def test_empty_fleet_data_response_shape(self):
+        self.assertEqual(
+            server._empty_fleet_data_payload(),
+            b"\x01" + struct.pack("<I", 0) + b"\x00\x00",
+        )
 
     def test_security_challenge_shape(self):
         challenge = "a" * 29
