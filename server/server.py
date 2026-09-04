@@ -34,6 +34,7 @@ import logging
 import os
 from pathlib import Path
 
+from campaign_map import CLIENT_HEX_RECORDS
 from gamespy import compact_server_list, status_response
 
 logging.basicConfig(
@@ -70,10 +71,16 @@ RACE_BORG = 3
 RACE_NEUTRAL = 9
 TERRAIN_OPEN_SPACE = 0x04000000
 CAMPAIGN_STARTS = {
-    RACE_FEDERATION: (7, 7),
-    RACE_KLINGON: (27, 7),
-    RACE_ROMULAN: (7, 21),
-    RACE_BORG: (27, 21),
+    RACE_FEDERATION: (32, 1),
+    RACE_KLINGON: (2, 2),
+    RACE_ROMULAN: (2, 27),
+    RACE_BORG: (32, 27),
+}
+CAMPAIGN_HOMEWORLDS = {
+    RACE_FEDERATION: (32, 1),
+    RACE_KLINGON: (2, 2),
+    RACE_ROMULAN: (2, 27),
+    RACE_BORG: (32, 27),
 }
 CHARACTER_STORE_PATH = Path(
     os.environ.get(
@@ -270,6 +277,10 @@ def _campaign_start_for_race(race: int) -> tuple[int, int]:
     )
 
 
+def _campaign_homeworld_for_race(race: int) -> tuple[int, int]:
+    return CAMPAIGN_HOMEWORLDS.get(race, _campaign_start_for_race(race))
+
+
 def _character_position_payload(race: int) -> bytes:
     """Build IPL_Character::tGetCharacterPositionReq::tRep."""
     start_x, start_y = _campaign_start_for_race(race)
@@ -287,37 +298,37 @@ def _character_position_payload(race: int) -> bytes:
     )
 
 
+def _get_client_character_payload(
+    account: str, character_name: str, client_address: str, race: int
+) -> bytes:
+    """Build IPL_Character::tGetClientCharacterReq::tRep."""
+    return (
+        b"\x01"
+        + _default_client_character_payload(
+            client_address=client_address,
+            account=account,
+            character_name=character_name,
+            race=race,
+            database_id=1,
+            rank=0,
+        )
+        + b"\x01"
+    )
+
+
+def _empty_fleet_data_payload() -> bytes:
+    """Build a successful tGetFleetDataReq::tRep with no fleet icons."""
+    # success, vector<tFleetIconInfo> count, trailing response flags
+    return b"\x01" + struct.pack("<I", 0) + b"\x00\x00"
+
+
 def _map_snapshot_payload() -> bytes:
-    """Build a full map with a small Federation starting enclave."""
+    """Build the observed 35x29 live campaign-map baseline."""
     count = CAMPAIGN_MAP_WIDTH * CAMPAIGN_MAP_HEIGHT
-    hexes = bytearray()
-    for y in range(CAMPAIGN_MAP_HEIGHT):
-        for x in range(CAMPAIGN_MAP_WIDTH):
-            owning_race = next(
-                (
-                    race
-                    for race, (start_x, start_y) in CAMPAIGN_STARTS.items()
-                    if abs(x - start_x) <= 3 and abs(y - start_y) <= 3
-                ),
-                RACE_NEUTRAL,
-            )
-            start_x, start_y = _campaign_start_for_race(owning_race)
-            is_homeworld = (x, y) == (start_x, start_y)
-            is_starbase = (x, y) == (start_x + 1, start_y)
-            if owning_race != RACE_NEUTRAL:
-                hexes += _client_hex_payload(
-                    owning_race,
-                    has_planet=is_homeworld,
-                    has_starbase=is_starbase,
-                    victory_points=50 if is_homeworld else 20,
-                    economy_points=100 if is_homeworld else 20,
-                )
-            else:
-                hexes += _client_hex_payload(RACE_NEUTRAL)
     return (
         b"\x01"
         + struct.pack("<iiI", -1, -1, count)
-        + hexes
+        + CLIENT_HEX_RECORDS
         + struct.pack("<II", CAMPAIGN_MAP_WIDTH, CAMPAIGN_MAP_HEIGHT)
     )
 
@@ -374,8 +385,10 @@ def _default_client_character_payload(
         0xFFFFFFFF,  # mission slot
     )
     start_x, start_y = _campaign_start_for_race(race)
-    start_hex = struct.pack("<ii", start_x, start_y)
-    payload += start_hex * 3  # current, home, destination hexes
+    home_x, home_y = _campaign_homeworld_for_race(race)
+    payload += struct.pack("<ii", start_x, start_y)  # current hex
+    payload += struct.pack("<ii", home_x, home_y)    # homeworld hex
+    payload += struct.pack("<ii", -1, -1)           # no destination
     payload += struct.pack("<I", 0)  # empty ship-cache vector
 
     payload += _meta_map_hex_payload(
@@ -952,7 +965,7 @@ class DynamicSecurityClient:
                     callback[0], callback[1], callback[2], _map_snapshot_payload()
                 ))
                 await self.writer.drain()
-                self._log("info", "-> campaign map snapshot with Federation enclave")
+                self._log("info", "-> observed 35x29 live campaign map baseline")
                 continue
             if (sw, obj, ch) == (0, 6, 12):
                 callback = _parse_callback(payload)
@@ -962,6 +975,27 @@ class DynamicSecurityClient:
                 ))
                 await self.writer.drain()
                 self._log("info", "-> character position at campaign start hex")
+                continue
+            if (sw, obj, ch) == (0, 6, 24):
+                callback = _parse_callback(payload)
+                if self.current_character is None:
+                    raise ValueError("client-character request preceded character logon")
+                self.writer.write(_nswitch_frame(
+                    callback[0],
+                    callback[1],
+                    callback[2],
+                    _get_client_character_payload(*self.current_character),
+                ))
+                await self.writer.drain()
+                self._log("info", "-> current client character")
+                continue
+            if (sw, obj, ch) == (0, 6, 26):
+                callback = _parse_callback(payload)
+                self.writer.write(_nswitch_frame(
+                    callback[0], callback[1], callback[2], _empty_fleet_data_payload()
+                ))
+                await self.writer.drain()
+                self._log("info", "-> empty fleet data")
                 continue
             if (sw, obj, ch) == (0, 6, 6):
                 (

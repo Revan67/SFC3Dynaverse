@@ -33,7 +33,7 @@ The only viable path is a replacement server that owns both layers.
 - [x] Character lookup, creation, local persistence, and restart/re-login verified end to end
 - [x] Capture and decode a successful `tSecurityRelayS` challenge/response on the dynamic game port
 - [x] Implement the minimal dynamic-port security exchange through `tCharacterRelayS`
-- [x] Decode compact hex records and render a 35x29 four-faction map with race-specific starts
+- [x] Decode compact hex records and reproduce the captured 35x29 live campaign baseline with race-specific starts
 - [ ] Decode the private `VerifyClientRequest` body and implement CD-key allowlist validation
 - [ ] Dynaverse game simulation (economy, AI, missions, hex map, turn system)
 - [ ] In-game chat (GameSpy Peerchat / IRC protocol)
@@ -43,8 +43,9 @@ The only viable path is a replacement server that owns both layers.
 A Python asyncio replacement that implements the bootstrap relay on port 26100, GameSpy directory
 and status discovery, and the security/character flow on game port 27632. GameSpy account/profile
 compatibility remains in `server/probe.py`. The unmodified client can create a local account and
-character, rejoin after a restart, and enter the campaign UI; campaign data and simulation services
-are the next major boundary.
+character, rejoin after a restart, and enter the campaign UI. The captured static map baseline and
+the player's faction-homeworld marker render correctly; campaign simulation services are the next
+major boundary.
 
 The implementation will:
 
@@ -264,9 +265,9 @@ planned server UI.
 
 The security handler currently verifies the captured exchange shape but does not yet validate the
 private CD-key body against an allowlist. Campaign relay registration, account persistence, character
-persistence, campaign UI entry, clock initialization, political ownership, and race-specific starting
-regions are working. Named planets, meaningful terrain variation, economy, movement, missions, and
-turn simulation are not.
+persistence, campaign UI entry, clock initialization, the captured static map baseline, and
+race-specific starting regions are working. Dynamic economy, movement, missions, and turn
+simulation are not.
 
 ## Development
 
