@@ -7,7 +7,7 @@ from pathlib import Path
 
 import gamespy
 import server
-from campaign_map import CLIENT_HEX_RECORDS, SHA256
+from campaign_map import CLIENT_HEX_RECORDS, HEIGHT, SHA256, SOURCE_SHA256, WIDTH
 
 
 class DynamicSecurityWireTests(unittest.TestCase):
@@ -34,9 +34,9 @@ class DynamicSecurityWireTests(unittest.TestCase):
             (0, 8, 10_000, 120_000, 2159),
         )
 
-    def test_map_size_shape_matches_live_capture(self):
+    def test_map_size_shape_matches_retail_map(self):
         payload = server._map_size_payload()
-        self.assertEqual(payload, b"\x01" + struct.pack("<II", 35, 29))
+        self.assertEqual(payload, b"\x01" + struct.pack("<II", WIDTH, HEIGHT))
 
     def test_client_hex_field_layout_matches_live_capture(self):
         self.assertEqual(
@@ -53,21 +53,22 @@ class DynamicSecurityWireTests(unittest.TestCase):
             bytes.fromhex("0000000000040100326464"),
         )
 
-    def test_campaign_map_snapshot_matches_observed_baseline(self):
+    def test_campaign_map_snapshot_matches_retail_baseline(self):
         payload = server._map_snapshot_payload()
-        count = 35 * 29
+        count = WIDTH * HEIGHT
         self.assertEqual(len(payload), 1 + 12 + count * 11 + 8)
         self.assertEqual(struct.unpack_from("<iiI", payload, 1), (-1, -1, count))
         self.assertEqual(payload[13:-8], CLIENT_HEX_RECORDS)
         self.assertEqual(hashlib.sha256(payload[13:-8]).hexdigest(), SHA256)
-        self.assertEqual(struct.unpack_from("<II", payload, len(payload) - 8), (35, 29))
+        self.assertEqual(struct.unpack_from("<II", payload, len(payload) - 8), (WIDTH, HEIGHT))
+        self.assertEqual(SOURCE_SHA256, "b1de93eff01c6570a25e36eebead1f09c0c4fd0ab26affaba764b00a351c1f52")
 
         home_x, home_y = server.CAMPAIGN_HOMEWORLDS[server.RACE_FEDERATION]
-        home_index = home_y * 35 + home_x
+        home_index = home_y * WIDTH + home_x
         start_offset = 13 + home_index * 11
         self.assertEqual(
             payload[start_offset : start_offset + 11],
-            bytes.fromhex("0000000000040100326464"),
+            bytes.fromhex("0000000000040101646464"),
         )
 
     def test_meta_map_hex_and_character_position_shapes(self):
@@ -105,8 +106,8 @@ class DynamicSecurityWireTests(unittest.TestCase):
         _, offset = server._unpack_string(payload, offset)
         _, offset = server._unpack_string(payload, offset + 4)
         positions_offset = offset + 8 * 4
-        self.assertEqual(struct.unpack_from("<ii", payload, positions_offset), (32, 1))
-        self.assertEqual(struct.unpack_from("<ii", payload, positions_offset + 8), (32, 1))
+        self.assertEqual(struct.unpack_from("<ii", payload, positions_offset), (24, 19))
+        self.assertEqual(struct.unpack_from("<ii", payload, positions_offset + 8), (24, 19))
         self.assertEqual(struct.unpack_from("<ii", payload, positions_offset + 16), (-1, -1))
 
     def test_get_client_character_response_contains_local_character(self):
@@ -134,7 +135,7 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual(payload[:5], b"\x01\x01\x00\x00\x00")
         self.assertEqual(
             struct.unpack_from("<IIiiIBI", payload, 5),
-            (1, 2, 32, 1, 3, 1, 0),
+            (1, 2, 24, 19, 3, 1, 0),
         )
 
     def test_move_request_and_response_shapes(self):
@@ -194,15 +195,16 @@ class DynamicSecurityWireTests(unittest.TestCase):
             self.assertFalse(server._is_adjacent_hex(current, destination))
 
     def test_federation_start_region_enables_friendly_facilities(self):
-        fields = server._campaign_hex_fields((33, 5))
+        homeworld = server.CAMPAIGN_HOMEWORLDS[server.RACE_FEDERATION]
+        fields = server._campaign_hex_fields(homeworld)
         self.assertEqual(fields[:2], (server.RACE_FEDERATION,) * 2)
         self.assertTrue(fields[3])
-        self.assertFalse(fields[4])
+        self.assertTrue(fields[4])
         self.assertTrue(
-            server._at_friendly_base_or_planet((33, 5), server.RACE_FEDERATION)
+            server._at_friendly_base_or_planet(homeworld, server.RACE_FEDERATION)
         )
         self.assertFalse(
-            server._at_friendly_base_or_planet((33, 5), server.RACE_KLINGON)
+            server._at_friendly_base_or_planet(homeworld, server.RACE_KLINGON)
         )
 
     def test_supply_dock_nested_serializer_shapes(self):
@@ -531,15 +533,29 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 )
                 record = server._load_characters()["user@example"]
                 self.assertEqual(record["character_name"], "Captain Test")
-                self.assertEqual(record["position"], [2, 27])
-                self.assertEqual(record["homeworld"], [2, 27])
+                self.assertEqual(record["position"], [36, 29])
+                self.assertEqual(record["homeworld"], [36, 29])
                 self.assertEqual(record["destination"], [-1, -1])
+                self.assertEqual(record["map_id"], server.CAMPAIGN_MAP_ID)
                 self.assertEqual(record["ship"]["class_name"], "Falcon")
                 self.assertEqual(record["ship"]["id"], 2)
                 payload = server._stored_character_payload("user@example", record)
                 self.assertEqual(struct.unpack_from("<I", payload, len(payload) - 4)[0], 0)
         finally:
             server.CHARACTER_STORE_PATH = old_path
+
+    def test_old_character_coordinates_reset_when_campaign_map_changes(self):
+        record = server._normalize_character_record({
+            "character_name": "Legacy Captain",
+            "race": server.RACE_FEDERATION,
+            "position": [33, 5],
+            "homeworld": [32, 1],
+            "destination": [34, 5],
+        })
+        self.assertEqual(record["position"], [24, 19])
+        self.assertEqual(record["homeworld"], [24, 19])
+        self.assertEqual(record["destination"], [-1, -1])
+        self.assertEqual(record["map_id"], server.CAMPAIGN_MAP_ID)
 
 
 class DynamicSecurityReaderTests(unittest.IsolatedAsyncioTestCase):

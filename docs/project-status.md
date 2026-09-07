@@ -28,15 +28,15 @@ Reviewed 2026-09-07 after persistent character entry and the first local movemen
 - `CharacterLogOnRelayNameC` publishes the client callback address. The replacement sends its
   character-logon response there and claims `tNotifyRelayS` as object 30.
 - The eight captured post-logon service relays are claimed with deterministic object IDs.
-- The clock registration, 35x29 map-size, and 1,015-record full-map replies are implemented.
+- The clock registration, 51x34 map-size, and 1,734-record full-map replies are implemented.
 - The compact 11-byte `tClientHex` is decoded as race, planet race, terrain mask, planet flag,
   starbase flag, victory points, economy points, and speed percentage.
-- The unmodified client renders four generated faction regions and centers a persisted Federation
-  character on its race-specific start. The map now uses the exact 35x29 static baseline decoded
-  from the live Generations At War 2.1 session, including political ownership, terrain, planets,
-  starbases, victory values, economy values, and movement speed.
+- The map now uses the stock 51x34 retail `MetaAssets/Multi.mvm`, converted from its map-editor
+  records to compact client records. Region, terrain, planet/base presence, victory, and economy
+  come from the retail map; its source and generated-record SHA-256 hashes are recorded in
+  `server/campaign_map.py`.
 - The captured live character was located at neutral hex `(28,8)`. New local Federation characters
-  instead start at the Federation homeworld `(32,1)` with destination `(-1,-1)`, allowing the
+  instead start at the retail Federation homeworld `(24,19)` with destination `(-1,-1)`, allowing the
   initial viewport and Center action to target faction space.
 - Character channels 24 and 26 are identified as `tGetClientCharacterReq` and `tGetFleetDataReq`;
   the server generates the local character and a one-ship fleet response. This restores the
@@ -78,7 +78,7 @@ initial service-relay setup, mission-matching traffic, and encrypted Peerchat st
 
 `server/server.py` now carries the unmodified client through discovery, dynamic-port security,
 character lookup/creation, persistence, character logon, and entry into the Dynaverse campaign UI.
-The client accepts clock initialization, renders the captured 35x29 map, displays a race-specific
+The client accepts clock initialization, renders the retail 51x34 map, displays a race-specific
 starter ship and marker, and recenters on the persisted player position. The next milestone is live
 validation of the capture-correct `MetaViewPortHandlerNameC` movement notifications, followed by
 Supply Dock/ship state, missions, economy, and turn simulation. See

@@ -2,6 +2,7 @@
 param(
     [string]$ServerAddress = '192.168.0.55',
     [string]$AssetRoot = 'D:\Games\GOG\Star Trek SFC3\Assets',
+    [string]$ServerAssetRoot = 'C:\Utilities\SFC3Server\Assets',
     [string]$PythonPath = 'C:\Program Files\Python314\python.exe'
 )
 
@@ -38,6 +39,7 @@ $env:SFC3_SERVER_HOST = $ServerAddress
 $env:SFC3_BIND_HOSTS = "127.0.0.1,$ServerAddress"
 $env:SFC3_ADVERTISE_HOST = $ServerAddress
 $env:SFC3_ASSET_ROOT = $AssetRoot
+$env:SFC3_SERVER_ASSET_ROOT = $ServerAssetRoot
 
 $requiredListeners = @(
     @{ Address = '127.0.0.1'; Port = 29900 },
@@ -98,6 +100,7 @@ try {
             SFC3_BIND_HOSTS = "127.0.0.1,$ServerAddress"
             SFC3_ADVERTISE_HOST = $ServerAddress
             SFC3_ASSET_ROOT = $AssetRoot
+            SFC3_SERVER_ASSET_ROOT = $ServerAssetRoot
         }
 
     Start-Sleep -Seconds 1

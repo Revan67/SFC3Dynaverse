@@ -34,7 +34,12 @@ import logging
 import os
 from pathlib import Path
 
-from campaign_map import CLIENT_HEX_RECORDS
+from campaign_map import (
+    CLIENT_HEX_RECORDS,
+    HEIGHT as CAMPAIGN_MAP_HEIGHT,
+    SOURCE_SHA256 as CAMPAIGN_MAP_ID,
+    WIDTH as CAMPAIGN_MAP_WIDTH,
+)
 from gamespy import compact_server_list, status_response
 
 logging.basicConfig(
@@ -62,8 +67,6 @@ PRIVATE_CAPTURE_PATH = os.environ.get("SFC3_PRIVATE_CAPTURE_PATH", "")
 # Temporary fixed default. Expose this as a user-configurable setting when the
 # server UI/configuration layer is built.
 SESSION_IDLE_TIMEOUT = 15 * 60
-CAMPAIGN_MAP_WIDTH = 35
-CAMPAIGN_MAP_HEIGHT = 29
 RACE_FEDERATION = 0
 RACE_KLINGON = 1
 RACE_ROMULAN = 2
@@ -71,16 +74,16 @@ RACE_BORG = 3
 RACE_NEUTRAL = 9
 TERRAIN_OPEN_SPACE = 0x04000000
 CAMPAIGN_STARTS = {
-    RACE_FEDERATION: (32, 1),
-    RACE_KLINGON: (2, 2),
-    RACE_ROMULAN: (2, 27),
-    RACE_BORG: (32, 27),
+    RACE_FEDERATION: (24, 19),
+    RACE_KLINGON: (7, 16),
+    RACE_ROMULAN: (36, 29),
+    RACE_BORG: (38, 0),
 }
 CAMPAIGN_HOMEWORLDS = {
-    RACE_FEDERATION: (32, 1),
-    RACE_KLINGON: (2, 2),
-    RACE_ROMULAN: (2, 27),
-    RACE_BORG: (32, 27),
+    RACE_FEDERATION: (24, 19),
+    RACE_KLINGON: (7, 16),
+    RACE_ROMULAN: (36, 29),
+    RACE_BORG: (38, 0),
 }
 STARTING_SHIPS = {
     RACE_FEDERATION: ("Norway", "USS Venture", 3),
@@ -389,7 +392,7 @@ def _fleet_data_payload(race: int) -> bytes:
 
 
 def _map_snapshot_payload() -> bytes:
-    """Build the observed 35x29 live campaign-map baseline."""
+    """Build the stock retail multiplayer campaign-map snapshot."""
     count = CAMPAIGN_MAP_WIDTH * CAMPAIGN_MAP_HEIGHT
     return (
         b"\x01"
@@ -400,7 +403,7 @@ def _map_snapshot_payload() -> bytes:
 
 
 def _campaign_hex_fields(position: tuple[int, int]) -> tuple[int, int, int, bool, bool, int, int, int]:
-    """Decode one compact tClientHex from the captured campaign baseline."""
+    """Decode one compact tClientHex from the retail campaign baseline."""
     x, y = position
     if not (0 <= x < CAMPAIGN_MAP_WIDTH and 0 <= y < CAMPAIGN_MAP_HEIGHT):
         raise ValueError("campaign position outside map")
@@ -590,9 +593,16 @@ def _normalize_character_record(record: dict) -> dict:
     normalized = dict(record)
     race = int(normalized.get("race", RACE_FEDERATION))
     class_name, ship_name, class_type = _starting_ship_for_race(race)
-    normalized.setdefault("position", list(_campaign_start_for_race(race)))
-    normalized.setdefault("homeworld", list(_campaign_homeworld_for_race(race)))
-    normalized.setdefault("destination", [-1, -1])
+    if normalized.get("map_id") != CAMPAIGN_MAP_ID:
+        # Coordinates from another map have no stable meaning on this topology.
+        normalized["position"] = list(_campaign_start_for_race(race))
+        normalized["homeworld"] = list(_campaign_homeworld_for_race(race))
+        normalized["destination"] = [-1, -1]
+        normalized["map_id"] = CAMPAIGN_MAP_ID
+    else:
+        normalized.setdefault("position", list(_campaign_start_for_race(race)))
+        normalized.setdefault("homeworld", list(_campaign_homeworld_for_race(race)))
+        normalized.setdefault("destination", [-1, -1])
     normalized.setdefault(
         "ship",
         {
@@ -1613,7 +1623,12 @@ class DynamicSecurityClient:
                     callback[0], callback[1], callback[2], _map_snapshot_payload()
                 ))
                 await self.writer.drain()
-                self._log("info", "-> observed 35x29 live campaign map baseline")
+                self._log(
+                    "info",
+                    "-> stock retail multiplayer campaign map %dx%d",
+                    CAMPAIGN_MAP_WIDTH,
+                    CAMPAIGN_MAP_HEIGHT,
+                )
                 continue
             if (sw, obj, ch) == (0, 22, 7):
                 callback = _parse_callback(payload)

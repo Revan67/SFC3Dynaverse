@@ -1,24 +1,33 @@
-"""Observed static campaign-map baseline from a live SFC3 Dynaverse session.
-
-The wire capture contained 1,015 compact 11-byte ``tClientHex`` records for the
-35x29 Generations At War 2.1 map.  This fixture preserves only that decoded map
-snapshot; it contains no account, character, address, or session data.
-"""
+"""Stock retail ``MetaAssets/Multi.mvm`` converted to client wire records."""
 
 import base64
 import hashlib
 import zlib
 
-
-WIDTH = 35
-HEIGHT = 29
+WIDTH = 51
+HEIGHT = 34
 RECORD_SIZE = 11
-SHA256 = "f3029105444106949eaf4a5a0f792dd1f3596196df2b3e998d0956866f8e5370"
+SOURCE_NAME = "Multi.mvm"
+SOURCE_SHA256 = "b1de93eff01c6570a25e36eebead1f09c0c4fd0ab26affaba764b00a351c1f52"
+SHA256 = "4f5dbf1c8c7fe0d92fa65c378748cb37733dc1cec6afda9befd2828e9b41afb5"
 
 _COMPRESSED_BASE85 = (
-    "c-pmETW;Gh5F`~hww2f-SfX%?KoHU*KShH=C(vPh5FNdiD885EQd0jW#G15c_Qho=C4?LZ5#mmFfe)0oy@9LW+xz(}VN+{(F;E!DB|H&l)v`SYwiCS8cS0m=g@z)46@gawfz1TR`LC_4Q}XwYr~19M4HPA>HN^VNnf#LT>L9<b2LoB;4$~pz*{r@8$Uw0UHAGa~CYhw9zx%5vg15DZVkE|I@AJ!|y3wyOu>hikA<Fk^$*&~<Otpp&C+HI);tAl2_4FhmaSRkYuq-#EuhUozQCC=i$+y;9J-Dn>3A^c(UuK84^?qij=|eFY!ob&g!46H_VDvR+pzW&z6=&4Icg-Yy)2!25MgR$mQ_!TFf}JR2Qhpt7V6hgqgp~&wcv@DslGQ6H?5mT{0IEOQe6&1BrC2T2_%9D!d6fVXJ_kg3!m@Syikuca7a|w1&fgH_fYQMY1|aeK0`Oci7X@|GO6Gl!r=+9?@Z4#~M7;Ssu-p+`3qUdT0^7sTk2b^373EQRSu8baY3bnqDFR>vON-iB4g09L7CYyilEP{W(B-tK2uZjcrgX?=4@WiiP7}Fa8Q#oPhNVi+#+DXui5_M>43k2v96%kDgdCKGIa(Z#%dcox`7igWrlomOer$}3bq34VlM^B+-`TOXT-BE-s=1h8wbU%N8o+KbKy;+YaAJPtwOAkHJX~;n^<Y*9Xfumy7?$+l8P=nu$}(dFkXoq02Vi@Vu+s+AlO@|qGznQol<fgrwXXI}ob{r(uwYJ22risWSB;ba^WbBKmF9PL&!nv!z9@JSQ09Uo;MtT8o^$Xf=ZGwKF<${s7%ezn08L*7LYGOoI!{La3TTI`fW&fz1z4}qZL=cP51bb;@n>&!D?9UDJ_fJ@2Sa00d~JNam%d(QDucc6Ad{FA(x|})C7(T1#^L6Pn~(kJH~6}L#Hrr5IkoC$)YmOIGbIg1s~k`RO~FoR!Nu0njJuEqDQH<8NEz!ZuSS?F!SSeX<LMgkd3RUG=*KAe3Dy7xrl9QieL+oJ;QMCKL}HsV3XN~}6d*`Je%=`qvhbXN+xmnC^jiyM<<Qp|Su?#IygoI>I)h22Yv*SxONXy<wBsK$tV6P(dS$l$_2ElySagYLTvgip6co7R$o33|uCQgbUD*npAg|*hwkfzk*THH>5aY3We*T%?P#$lg>Lti!{Q;HBEvwTA$x^70)Du`bs`%s-`3zQ(jV}u2mv|nC)kQC2XY<nbqt);*v94oNts1IP5L0Gg0X7frQsc2r7srwzs&)Mx<1Ope2yiu2bBFbm0CQgr2ynwS4TXs*SuX~R)5fxL>W-cru;DcJZ&doJQ}O!*us-vPjsU(T1+jRtxuPzaaFAtliQO0u9xTo~_RJ>z3S;e{_<d_V0lIh!;t4I7sSM0363Axykf{N-STHPkT!1TN2TrL5{1HKuWBp&nOsceH28vkTaRu-yZ&;dP=ojpgK58ccklodmf2Pn803`GG781ax+FzZBT3LiAcp^yyeVP>_3VyVEKd<F)9Ub`S=3ht~(5q*D<q!IXaAg3(mAA=tK|EKFSK2Oc8HBBmmSV`j|GSb@&p~!E?%ARFrR4V=Z`<FoT@V_2<sh4*@)c)$oyWYRs~`W-qUd8Lfv{x?2)lAA?Br(u07P7eD*"
+    "c-rloy;9>a5XX0enSrfRxN(!o42>Ha8XAhwP*c;;@F01-d#rO5AChfZTCG-&14p%^k>%L?(|<o??(YGh0-)Qk`>QjLaQd5_aC4Jn"
+    "V!v2uF2ZhSM~Q7>Lz2s^iSY4}x5Ds&Qbq@+o(pTqWe9D%FlW>EfORrlS!UE(BwHc>#^3t_UtWp>bKR!@m1Ge$t47u>&(G|2u?azd"
+    "RvZzEV!xnU>Xib6@bGYD8g*Mlf}&4>^^a8zgicdeq+Bdt<WVwM!KOZ4$dBG4s<a}Lf};qXy#59?Qhm%s<jOeKn1^8bAljznGaHIb"
+    "i0}FE3PTThp{?nECblRrTMf7pH7dbuD0hV)<>L)p{5LEGOhYoFg!D0U+9RxVA1j!5FnABIuh+0IsE{zt-NN+p1}1hfYc$$Z(wnFB"
+    "z;~H%)N3NPyO{}zz-)9<i9U=wz}&%=6e}hAa%kP{m_0iYa{>&52aZXpmz~(TRGG@IA)Vk8h(oowgh4#-x5o!}`=3Y0D|kj{&Cy#&"
+    "i2Dt_z+`I)hZ14~6I3I%x!L573PWA*Zflx1={R<3&P|}C73P>c04OK{!sBCx5`=gl9kI!v<n;O+2!bYSZpv>6IyTKDg~fvJH!2Eq"
+    "T0-T64@uZzMW>06P00TqB`*ZTCTbq8!oZx4W+j(p$BVSsLWQ#x<4sku;Y&rB9douQz$nHJ;!_(_4c_PxKtWc@<*AfO$!UuW=k9GZ"
+    "J)5KljD|@W!0fFz_dLgjDM9%B)C)fAz=$#<PReET(Wwk2loY5uz&LrT-_*=uoG2nLR*C@A$?H=p8h5-ToyvzKue%$KBxeW=tFV#j"
+    "&TMAGE;UTcc2$9@_}w(bh7uHpl5&^=rIGnWC^}bErcPe<0W@Ug>uXV97`ihA=3h3*teVXxlgF%m-(Bp@MG9z2Fmt2RAoomY)O1wm"
+    "CN5d5522kGQU@5m*svpx`9hEzhh(N{G3&*wIzJW8uY9cEx@QX?Aice5w(|lLj`kQ~USY&}2_v%+B`%cRm!k-MZL3*3*)S9Fyu1ja"
+    "<(fL2{5K^T8PBc8AQCrmF~X$UvgP+|&gRx8BU|7EDp_l_(Nd$z{>Tav#YQ#Ljdkm0BTo3Tr*@<;2c>kTc-`%$9lM>{?&efq-jmE}"
+    "##DhQv)O|D0EsmFauin>=Oc~9C^6ArC}Ni{iY3A{1U#fATaY`JVjUNaT6!9t#C@2Qe1|g6ojieR14@U+ie2GSr$&@*uI%8Nl+qbz"
+    "!akIw`+&JsE0~hY-z7V6q<O+LJ_LvZQ$bo;-L}~+nRNR0Ad(>7Q8G^-wzkmaeU&EqLIv^ty)+t`3gZA%!Aic8$*t#EG1jjHDd)!y"
+    "Fj;3lh~2;4i)2OVsEB9&0oN>$^bX7Q1*2ZljU6A4*b#ogw(PeDp%qLgGCy1K1G5-L8YNekN~rdYMlbaUKC>t#>k2*`G_DpS&F=<l"
+    "A0>rk#r)II#VOH7<5$DAtT#(jB6s0mT8ftg"
 )
-
 
 def _load_records() -> bytes:
     records = zlib.decompress(base64.b85decode(_COMPRESSED_BASE85))
@@ -28,6 +37,5 @@ def _load_records() -> bytes:
     if hashlib.sha256(records).hexdigest() != SHA256:
         raise RuntimeError("campaign map checksum mismatch")
     return records
-
 
 CLIENT_HEX_RECORDS = _load_records()

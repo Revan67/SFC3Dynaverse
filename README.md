@@ -33,7 +33,7 @@ The only viable path is a replacement server that owns both layers.
 - [x] Character lookup, creation, local persistence, and restart/re-login verified end to end
 - [x] Capture and decode a successful `tSecurityRelayS` challenge/response on the dynamic game port
 - [x] Implement the minimal dynamic-port security exchange through `tCharacterRelayS`
-- [x] Decode compact hex records and reproduce the captured 35x29 live campaign baseline with race-specific starts
+- [x] Decode compact hex records and convert the stock 51x34 `Multi.mvm` map with race-specific starts
 - [x] Persist adjacent-hex movement and publish completion/position updates without reconnecting
 - [x] Initialize friendly-base facilities immediately at login and after movement
 - [x] Generate the starter ship from installed specs for Supply Dock and Refit
@@ -48,7 +48,7 @@ The only viable path is a replacement server that owns both layers.
 A Python asyncio replacement that implements the bootstrap relay on port 26100, GameSpy directory
 and status discovery, and the security/character flow on game port 27632. GameSpy account/profile
 compatibility remains in `server/probe.py`. The unmodified client can create a local account and
-character, rejoin after a restart, and enter the campaign UI. The captured map, persistent movement,
+character, rejoin after a restart, and enter the campaign UI. The retail map, persistent movement,
 player marker, immediate homeworld facilities, Supply Dock, Refit editor, and empty Shipyard auction
 panel are now verified against the client. Officers, news, missions, auctions, and dynamic campaign
 simulation are the next major boundary.
@@ -226,6 +226,7 @@ $env:SFC3_SERVER_HOST = '127.0.0.1'
 $env:SFC3_BIND_HOSTS = '127.0.0.1'
 $env:SFC3_ADVERTISE_HOST = '127.0.0.1'
 $env:SFC3_ASSET_ROOT = 'D:\Games\GOG\Star Trek SFC3\Assets'
+$env:SFC3_SERVER_ASSET_ROOT = 'C:\Utilities\SFC3Server\Assets'
 python .\server\server.py
 ```
 
@@ -250,6 +251,7 @@ $env:SFC3_SERVER_HOST = '<server-ip>'
 $env:SFC3_BIND_HOSTS = '127.0.0.1,<server-ip>'
 $env:SFC3_ADVERTISE_HOST = '<server-ip>'
 $env:SFC3_ASSET_ROOT = 'D:\Games\GOG\Star Trek SFC3\Assets'
+$env:SFC3_SERVER_ASSET_ROOT = 'C:\Utilities\SFC3Server\Assets'
 python .\server\server.py
 ```
 
@@ -284,6 +286,7 @@ when necessary:
 ```powershell
 .\Start-SFC3Server.ps1 -ServerAddress '192.168.0.55' `
     -AssetRoot 'D:\Games\GOG\Star Trek SFC3\Assets' `
+    -ServerAssetRoot 'C:\Utilities\SFC3Server\Assets' `
     -PythonPath 'C:\Program Files\Python314\python.exe'
 ```
 
@@ -295,12 +298,15 @@ changes the browser name, and `SFC3_CHARACTER_STORE` changes the character datab
 `SFC3_ASSET_ROOT` path must contain the installed `Specs\DefaultCore.txt` and
 `Specs\DefaultLoadOut.txt` files (the dedicated-server kit's singular `Spec` directory is also
 accepted). These locally installed files supply ship defaults and are never copied into the repo.
+`SFC3_SERVER_ASSET_ROOT` identifies the dedicated-server kit's `Assets` directory. Structured
+server-kit settings take precedence over matching retail data; retail files are the fallback,
+and packet captures are used only for wire formats or behavior absent from the distributed files.
 The post-login idle timeout is currently fixed at 15 minutes and will become configurable with the
 planned server UI.
 
 The security handler currently verifies the captured exchange shape but does not yet validate the
 private CD-key body against an allowlist. Campaign relay registration, account persistence, character
-persistence, campaign UI entry, clock initialization, the captured static map baseline,
+persistence, campaign UI entry, clock initialization, the retail multiplayer map baseline,
 race-specific starting regions, starter-ship display, and persistent adjacent-hex movement are
 working. The capture-correct movement completion path still needs one live validation. A generated
 starter-ship Supply Dock response is implemented but not yet client-validated. Dynamic economy,
