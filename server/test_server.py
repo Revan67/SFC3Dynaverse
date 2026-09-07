@@ -357,7 +357,7 @@ class DynamicSecurityWireTests(unittest.TestCase):
             self.assertEqual(generated[0], 1)
             self.assertEqual(generated[-len(maps):], maps)
 
-    def test_character_ship_config_and_empty_officer_review_payloads(self):
+    def test_character_ship_config_and_server_kit_officer_review_payloads(self):
         assets = Path(r"D:\Games\GOG\Star Trek SFC3\Assets")
         if not assets.is_dir():
             self.skipTest("local SFC3 asset install is unavailable")
@@ -384,12 +384,38 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual(config[5:-8], expected_tng)
         self.assertEqual(struct.unpack("<fI", config[-8:]), (1.0, 1500))
 
-        officers = server._officers_to_review_payload(
-            server.RACE_FEDERATION, assets, prestige=1500
+        old_kit_root = server.SERVER_ASSET_ROOT
+        server.SERVER_ASSET_ROOT = Path(r"C:\Utilities\SFC3Server\Assets")
+        try:
+            names = server._officer_names(server.RACE_FEDERATION)[:8]
+            officers = server._officers_to_review_payload(
+                server.RACE_FEDERATION, assets, prestige=1500
+            )
+        finally:
+            server.SERVER_ASSET_ROOT = old_kit_root
+        self.assertEqual(officers[:5], b"\x01" + struct.pack("<I", 8))
+        first_name_offset = 5 + 8 + 1 + 16
+        first_name, _ = server._unpack_string(officers, first_name_offset)
+        self.assertEqual(first_name, "KLEIMAN")
+        officer_size = 8 + 1 + 16 + 4 + len("KLEIMAN") + 80 + 20
+        officer_bytes = sum(
+            8 + 1 + 16 + 4 + len(name) + 80 + 20
+            for name in names
         )
-        self.assertEqual(officers[:5], b"\x01" + struct.pack("<I", 0))
-        self.assertEqual(officers[5:-8], expected_tng)
+        self.assertGreater(officer_size, 0)
+        self.assertEqual(officers[5 + officer_bytes:-8], expected_tng)
         self.assertEqual(struct.unpack("<If", officers[-8:]), (1500, 1.0))
+
+    def test_generated_officer_item_uses_recovered_field_order(self):
+        payload = server._officer_item_payload("KLEIMAN", server.RACE_FEDERATION, 0x60)
+        self.assertEqual(payload[0], 0)
+        self.assertEqual(struct.unpack_from("<4I", payload, 1), (10, 20, 10, 2))
+        name, offset = server._unpack_string(payload, 17)
+        self.assertEqual(name, "KLEIMAN")
+        fields = struct.unpack_from("<20I", payload, offset)
+        self.assertEqual(fields[0], 0x60)
+        self.assertEqual(fields[1:4], (1, 1, 1))
+        self.assertEqual(fields[-1], server.RACE_FEDERATION)
 
     def test_security_challenge_shape(self):
         challenge = "a" * 29

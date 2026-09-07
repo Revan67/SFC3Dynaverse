@@ -34,6 +34,7 @@ import logging
 import os
 from pathlib import Path
 
+from asset_sources import find_structured_asset, parse_gf
 from campaign_map import (
     CLIENT_HEX_RECORDS,
     HEIGHT as CAMPAIGN_MAP_HEIGHT,
@@ -117,6 +118,9 @@ CHARACTER_STORE_PATH = Path(
 )
 ASSET_ROOT = Path(os.environ.get("SFC3_ASSET_ROOT", "")) if os.environ.get(
     "SFC3_ASSET_ROOT"
+) else None
+SERVER_ASSET_ROOT = Path(os.environ.get("SFC3_SERVER_ASSET_ROOT", "")) if os.environ.get(
+    "SFC3_SERVER_ASSET_ROOT"
 ) else None
 
 # ── Wire helpers ──────────────────────────────────────────────────────────────
@@ -1029,13 +1033,78 @@ def _officers_to_review_payload(
     prestige: int = 0,
     economic_scalar: float = 1.0,
 ) -> bytes:
-    """Build a valid empty tGetOfficersToReviewReq::tRep with current ship config."""
+    """Build tGetOfficersToReviewReq::tRep from server-kit officer rules."""
     defaults = _starter_ship_defaults(race, asset_root)
     tng_ship = _tng_ship_payload(
         _default_ship_core_payload(defaults), defaults["loadout_fields"]
     )
-    return b"\x01" + struct.pack("<I", 0) + tng_ship + struct.pack(
+    officers = _generated_officers(race)
+    return b"\x01" + struct.pack("<I", len(officers)) + b"".join(officers) + tng_ship + struct.pack(
         "<If", prestige, economic_scalar
+    )
+
+
+OFFICER_NAME_SECTIONS = {
+    RACE_FEDERATION: "Federation",
+    RACE_KLINGON: "Klingon",
+    RACE_ROMULAN: "Romulan",
+}
+OFFICER_STATIONS = tuple(range(0x60, 0x66))
+
+
+def _officer_names(race: int) -> tuple[str, ...]:
+    source = find_structured_asset(
+        "CommonSettings/OfficerNames.gf",
+        server_asset_root=SERVER_ASSET_ROOT,
+        retail_asset_root=ASSET_ROOT,
+    )
+    section = OFFICER_NAME_SECTIONS.get(race)
+    if section is None:
+        # The original executable generates Borg designations rather than loading a list.
+        return tuple(f"{index + 2} OF 8" for index in range(32))
+    values = parse_gf(source.path).get(section, {})
+    return tuple(str(values[key]) for key in sorted(values, key=lambda key: int(key)))
+
+
+def _officer_review_limit() -> int:
+    source = find_structured_asset(
+        "ServerProfiles/AI.gf",
+        server_asset_root=SERVER_ASSET_ROOT,
+        retail_asset_root=ASSET_ROOT,
+    )
+    value = parse_gf(source.path).get("Officers", {}).get("MaxInReviewByClient", 8)
+    return max(0, min(32, int(value)))
+
+
+def _officer_item_payload(name: str, race: int, station: int) -> bytes:
+    """Serialize tOfficerItem through its adjusted tStreamable base."""
+    skills = [0] * 18
+    station_index = station - OFFICER_STATIONS[0]
+    for index in range(station_index * 3, station_index * 3 + 3):
+        skills[index] = 1
+    return (
+        b"\x00"
+        + struct.pack("<4I", 10, 20, 10, 2)
+        + _pack_str(name)
+        + struct.pack("<20I", station, *skills, race)
+    )
+
+
+def _officer_payload(database_id: int, name: str, race: int, station: int) -> bytes:
+    """Serialize tOfficer in its recovered database-field order."""
+    return (
+        struct.pack("<II", database_id, 0)
+        + _officer_item_payload(name, race, station)
+        + struct.pack("<IIIII", 0, CHARACTER_DATABASE_ID, 0xFFFFFFFF, race, race)
+    )
+
+
+def _generated_officers(race: int) -> tuple[bytes, ...]:
+    names = _officer_names(race)
+    limit = min(_officer_review_limit(), len(names))
+    return tuple(
+        _officer_payload(1000 + index, names[index], race, OFFICER_STATIONS[index % 6])
+        for index in range(limit)
     )
 
 

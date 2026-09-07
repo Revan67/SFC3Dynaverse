@@ -37,7 +37,7 @@ The only viable path is a replacement server that owns both layers.
 - [x] Persist adjacent-hex movement and publish completion/position updates without reconnecting
 - [x] Initialize friendly-base facilities immediately at login and after movement
 - [x] Generate the starter ship from installed specs for Supply Dock and Refit
-- [x] Render Supply Dock stores/rates, the Refit editor, and the empty Shipyard auction UI
+- [x] Render Supply Dock stores/rates, the Refit editor, generated officer candidates, and the empty Shipyard auction UI
 - [x] Add one-command Windows launcher for account/profile and Dynaverse services
 - [ ] Decode the private `VerifyClientRequest` body and implement CD-key allowlist validation
 - [ ] Dynaverse game simulation (economy, AI, missions, auctions, officers, news, and turn system)
@@ -49,8 +49,9 @@ A Python asyncio replacement that implements the bootstrap relay on port 26100, 
 and status discovery, and the security/character flow on game port 27632. GameSpy account/profile
 compatibility remains in `server/probe.py`. The unmodified client can create a local account and
 character, rejoin after a restart, and enter the campaign UI. The retail map, persistent movement,
-player marker, immediate homeworld facilities, Supply Dock, Refit editor, and empty Shipyard auction
-panel are now verified against the client. Officers, news, missions, auctions, and dynamic campaign
+player marker, immediate homeworld facilities, Supply Dock, Refit editor, generated officer list,
+and empty Shipyard auction panel are now verified against the client. Officer purchasing, news,
+missions, auctions, and dynamic campaign
 simulation are the next major boundary.
 
 The implementation will:

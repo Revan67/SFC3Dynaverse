@@ -66,7 +66,8 @@ to the client presence flags, and preserves economy/strength values.
 ## Recommended extraction order
 
 1. Parse the `.gf` configuration format into typed Python data with source provenance.
-2. Generate officers from `OfficerNames.gf` plus `Character.gf` rules and serialize `tOfficer`.
+2. Generate officers from `OfficerNames.gf` plus `AI.gf` rules and serialize `tOfficer`. Candidate
+   browsing is now implemented and client-validated; purchase/transfer remains.
 3. Parse complete ship availability from `DefaultCore.txt`/`DefaultLoadOut.txt` and generate
    auction inventory according to `Ship.gf` and `Economy.gf`.
 4. Add item pricing and availability to Supply Dock and Refit from the CommonSettings catalogs.

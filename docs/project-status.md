@@ -57,8 +57,10 @@ Reviewed 2026-09-07 after persistent character entry and the first local movemen
 - Character channel 20 returns the installed starter `tTNGShip`, economic scalar, and prestige. The
   unmodified client renders the Norway Refit UI with its installed and available systems.
 - Shipyard reaches its auction UI; its listing is empty because auction inventory is not yet
-  generated. Officers accepts an empty review response but displays no panel content, so generated
-  `tOfficer` records remain required. News is also not yet implemented.
+  generated. Officers displays eight generated `tOfficer` candidates using the server kit's
+  `OfficerNames.gf` and `AI.gf` review limit. Names, stations, skills, profiles, and calculated worth
+  render correctly in the unmodified client. Officer purchase/transfer is not yet implemented.
+  News is also not yet implemented.
 - Peerchat starts with plaintext `CRYPT des 1 sfc3`, then switches to encrypted traffic after 705.
 
 ## Prototype-only
