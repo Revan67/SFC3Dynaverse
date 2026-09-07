@@ -92,6 +92,13 @@ class DynamicSecurityWireTests(unittest.TestCase):
             response = server._character_position_payload(race)
             self.assertEqual(struct.unpack_from("<ii", response, 9), expected)
 
+    def test_character_position_can_report_persisted_movement_state(self):
+        response = server._character_position_payload(
+            server.RACE_FEDERATION, (31, 2), (32, 3)
+        )
+        self.assertEqual(struct.unpack_from("<ii", response, 9), (31, 2))
+        self.assertEqual(struct.unpack_from("<ii", response, 63), (32, 3))
+
     def test_federation_character_starts_at_homeworld_with_no_destination(self):
         payload = server._default_client_character_payload(race=server.RACE_FEDERATION)
         _, offset = server._unpack_string(payload, 0)
@@ -112,11 +119,275 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual((address, account), ("192.0.2.10", "user@example"))
         self.assertEqual(payload[-1], 1)
 
-    def test_empty_fleet_data_response_shape(self):
+    def test_starting_ship_cache_uses_installed_profile_choice(self):
+        payload = server._ship_cache_payload(server.RACE_FEDERATION)
+        self.assertEqual(struct.unpack_from("<III", payload), (2, 250, 3))
+        class_name, offset = server._unpack_string(payload, 12)
+        self.assertEqual(class_name, "Norway")
+        self.assertEqual(struct.unpack_from("<f", payload, offset)[0], 1.0)
+        ship_name, offset = server._unpack_string(payload, offset + 4)
+        self.assertEqual(ship_name, "USS Venture")
+        self.assertEqual(struct.unpack_from("<I", payload, offset)[0], 0)
+
+    def test_fleet_data_contains_starter_ship_at_homeworld(self):
+        payload = server._fleet_data_payload(server.RACE_FEDERATION)
+        self.assertEqual(payload[:5], b"\x01\x01\x00\x00\x00")
         self.assertEqual(
-            server._empty_fleet_data_payload(),
-            b"\x01" + struct.pack("<I", 0) + b"\x00\x00",
+            struct.unpack_from("<IIiiIBI", payload, 5),
+            (1, 2, 32, 1, 3, 1, 0),
         )
+
+    def test_move_request_and_response_shapes(self):
+        request = struct.pack("<IIIIii", 6, 6, 4, 1, 31, 1)
+        self.assertEqual(
+            server._parse_move_request(request),
+            ((6, 6, 4), 1, (31, 1)),
+        )
+        self.assertEqual(
+            server._move_response_payload(True),
+            b"\x01" + struct.pack("<II", 1, 1),
+        )
+        self.assertEqual(
+            server._move_response_payload(True, duration_seconds=15),
+            b"\x01" + struct.pack("<II", 15, 1),
+        )
+        self.assertEqual(
+            server._move_response_payload(False),
+            b"\x01" + struct.pack("<II", 0, 0),
+        )
+        self.assertEqual(
+            server._meta_map_move_payload(1, (32, 3), 1, 1),
+            struct.pack("<IIiiII", 1, 1, 32, 3, 1, 0) + b"\x00",
+        )
+        self.assertEqual(
+            server._meta_map_move_payload(1, (33, 5), 0, 0, True)[-1],
+            1,
+        )
+
+    def test_captured_live_move_request_and_viewport_notifications(self):
+        # live-login-ethernet-20260902.pcapng frames 531, 538, and 539.
+        request = bytes.fromhex(
+            "0600000006000000000000001aa20d001c00000009000000"
+        )
+        self.assertEqual(
+            server._parse_move_request(request),
+            ((6, 6, 0), 0x000DA21A, (28, 9)),
+        )
+        self.assertEqual(
+            server._meta_map_move_payload(0x000DA21A, (28, 9), 0, 1),
+            bytes.fromhex(
+                "010000001aa20d001c00000009000000000000000000000000"
+            ),
+        )
+        self.assertEqual(
+            server._meta_map_move_payload(0x000DA21A, (28, 9), 0, 0),
+            bytes.fromhex(
+                "000000001aa20d001c00000009000000000000000000000000"
+            ),
+        )
+
+    def test_hex_adjacency_uses_axial_neighbors(self):
+        current = (10, 10)
+        for destination in ((10, 9), (11, 10), (11, 11), (10, 11), (9, 10), (9, 9)):
+            self.assertTrue(server._is_adjacent_hex(current, destination))
+        for destination in ((10, 10), (11, 9), (9, 11), (12, 10)):
+            self.assertFalse(server._is_adjacent_hex(current, destination))
+
+    def test_federation_start_region_enables_friendly_facilities(self):
+        fields = server._campaign_hex_fields((33, 5))
+        self.assertEqual(fields[:2], (server.RACE_FEDERATION,) * 2)
+        self.assertTrue(fields[3])
+        self.assertFalse(fields[4])
+        self.assertTrue(
+            server._at_friendly_base_or_planet((33, 5), server.RACE_FEDERATION)
+        )
+        self.assertFalse(
+            server._at_friendly_base_or_planet((33, 5), server.RACE_KLINGON)
+        )
+
+    def test_supply_dock_nested_serializer_shapes(self):
+        self.assertEqual(
+            server._pack_u32_vector((1, 2, 3)),
+            struct.pack("<IIII", 3, 1, 2, 3),
+        )
+        damage = server._damage_state_payload()
+        self.assertEqual(len(damage), 385)
+        self.assertEqual(damage[0], 1)
+        self.assertEqual(struct.unpack_from("<ii", damage, 1), (-1, -1))
+
+        stores = server._stores_state_payload()
+        self.assertEqual(len(stores), 116)
+        self.assertEqual(stores[:7], bytes((2, 4, 2)) + struct.pack("<I", 0))
+        self.assertEqual(struct.unpack_from("<hh", stores, 7), (-1, 0))
+        self.assertEqual(stores[-9:], bytes((4, 2, 2)) * 3)
+
+        self.assertEqual(
+            server._item_rates_payload(),
+            struct.pack("<dddd", 1.0, 2.0, 4.0, 4.0),
+        )
+
+    def test_supply_dock_nested_serializers_validate_cardinality(self):
+        with self.assertRaises(ValueError):
+            server._damage_state_payload(system_current=(1,))
+        with self.assertRaises(ValueError):
+            server._stores_state_payload(item_current=(1,))
+        with self.assertRaises(ValueError):
+            server._item_rates_payload(misc_rates=(1.0,))
+
+    def test_tng_ship_core_and_loadout_serializer_order(self):
+        core = server._ship_core_payload(
+            ((1, 2), (30, 31), (12,), (21,), (1, 2, 3), (1, 2)),
+            tuple(range(10, 18)),
+            "Fed-Destroyer",
+            "Norway",
+            tuple(range(20, 27)),
+            tuple(range(30, 34)),
+        )
+        self.assertEqual(struct.unpack_from("<III", core), (2, 1, 2))
+        class_offset = sum(4 + 4 * size for size in (2, 2, 1, 1, 3, 2)) + 32
+        class_name, offset = server._unpack_string(core, class_offset)
+        model_name, offset = server._unpack_string(core, offset)
+        self.assertEqual((class_name, model_name), ("Fed-Destroyer", "Norway"))
+        self.assertEqual(struct.unpack_from("<I", core, offset)[0], 0)
+
+        ship = server._tng_ship_payload(core, ("Federation", "Norway", "USS Venture"), 7)
+        self.assertEqual(ship[:2], b"\x01\x01")
+        loadout, offset = server._unpack_string(ship, 2 + len(core))
+        self.assertEqual(loadout, "Federation\tNorway\tUSS Venture")
+        self.assertEqual(struct.unpack_from("<I", ship, offset)[0], 7)
+
+    def test_installed_default_parser_maps_all_starter_ships(self):
+        assets = Path(r"D:\Games\GOG\Star Trek SFC3\Assets")
+        if not assets.is_dir():
+            self.skipTest("local SFC3 asset install is unavailable")
+        expected = {
+            server.RACE_FEDERATION: ("Federation", "Norway", (2, 8, 2)),
+            server.RACE_KLINGON: ("Klingon", "K'Vort", (2, 8, 2)),
+            server.RACE_ROMULAN: ("Romulan", "Falcon", (2, 8, 2)),
+            server.RACE_BORG: ("Borg", "Diamond", (3, 12, 3)),
+        }
+        for race, (political_base, model_name, mines) in expected.items():
+            defaults = server._starter_ship_defaults(race, assets)
+            self.assertEqual(defaults["political_base"], political_base)
+            self.assertEqual(defaults["starter_name"], model_name)
+            self.assertEqual(defaults["mines"], mines)
+            self.assertEqual(len(defaults["primary_hardpoints"]) > 0, True)
+            self.assertEqual(len(defaults["items"]) > 0, True)
+            vectors = server._core_hardpoint_vectors(defaults)
+            self.assertEqual(len(vectors), 6)
+            self.assertEqual(len(vectors[0]), len(vectors[1]))
+            self.assertEqual(len(vectors[2]), len(vectors[3]))
+
+    def test_weapon_arc_table_matches_executable_order(self):
+        self.assertEqual(len(server.WEAPON_ARCS), 44)
+        self.assertEqual(server._weapon_arc_id("0_360"), 3)
+        self.assertEqual(server._weapon_arc_id("300_360"), 9)
+        self.assertEqual(server._weapon_arc_id("330_30"), 15)
+        self.assertEqual(server._weapon_arc_id("165_195"), 17)
+        self.assertEqual(server._weapon_arc_id("120_300"), 43)
+        with self.assertRaises(ValueError):
+            server._weapon_arc_id("12_34")
+
+    def test_installed_norway_hardpoint_vectors_match_default_core(self):
+        assets = Path(r"D:\Games\GOG\Star Trek SFC3\Assets")
+        if not assets.is_dir():
+            self.skipTest("local SFC3 asset install is unavailable")
+        defaults = server._starter_ship_defaults(server.RACE_FEDERATION, assets)
+        self.assertEqual(
+            server._core_hardpoint_vectors(defaults),
+            ((1, 2, 3), (9, 4, 15), (12, 13, 14), (15, 15, 17), (1, 2, 3), (1, 2)),
+        )
+        core = server._default_ship_core_payload(defaults)
+        self.assertIn(server._pack_str_vector(("ship",)), core)
+        self.assertIn(server._pack_str("Fed-Destroyer"), core)
+        self.assertIn(server._pack_str("Norway"), core)
+        vectors_length = sum(4 + 4 * size for size in (3, 3, 3, 3, 3, 2))
+        self.assertEqual(
+            struct.unpack_from("<8I", core, vectors_length),
+            (2550, 1000, 2300, 10, 3, 1250, 0, 1250),
+        )
+
+    def test_ship_class_table_matches_executable_order(self):
+        self.assertEqual(server._ship_class_id("SH"), 0)
+        self.assertEqual(server._ship_class_id("DD"), 3)
+        self.assertEqual(server._ship_class_id("BIO"), 14)
+        self.assertEqual(server._ship_class_id("SPECIAL"), 16)
+
+    def test_generated_supply_dock_ship_uses_local_identity_and_defaults(self):
+        assets = Path(r"D:\Games\GOG\Star Trek SFC3\Assets")
+        if not assets.is_dir():
+            self.skipTest("local SFC3 asset install is unavailable")
+        defaults = server._starter_ship_defaults(server.RACE_FEDERATION, assets)
+        ship = server._full_ship_payload(
+            race=server.RACE_FEDERATION,
+            ship_name="USS Venture",
+            defaults=defaults,
+        )
+        self.assertEqual(
+            struct.unpack_from("<IIIBIII", ship),
+            (2, 0, 1, 0, server.RACE_FEDERATION, 3, 250),
+        )
+        class_name, offset = server._unpack_string(ship, 25)
+        ship_name, offset = server._unpack_string(ship, offset)
+        self.assertEqual((class_name, ship_name), ("Fed-Destroyer", "USS Venture"))
+        self.assertEqual(struct.unpack_from("<I", ship, offset)[0], 0)
+        self.assertEqual(struct.unpack_from("<II", ship, len(ship) - 8), (0, 1250))
+
+        response = server._supply_dock_payload(server.RACE_FEDERATION, assets)
+        self.assertEqual(response[0], 1)
+        maps = (
+            server._id_double_map_payload(((server.SHIP_DATABASE_ID, 1.0),))
+            + server._id_double_map_payload(((server.SHIP_DATABASE_ID, 0.5),))
+            + server._id_item_rates_map_payload(
+                ((server.SHIP_DATABASE_ID, (1.0, (2.0, 4.0, 4.0))),)
+            )
+        )
+        self.assertEqual(response[1:-len(maps)], ship)
+        self.assertEqual(response[-len(maps):], maps)
+        for race in (
+            server.RACE_FEDERATION,
+            server.RACE_KLINGON,
+            server.RACE_ROMULAN,
+            server.RACE_BORG,
+        ):
+            generated = server._supply_dock_payload(race, assets)
+            self.assertGreater(len(generated), 700)
+            self.assertEqual(generated[0], 1)
+            self.assertEqual(generated[-len(maps):], maps)
+
+    def test_character_ship_config_and_empty_officer_review_payloads(self):
+        assets = Path(r"D:\Games\GOG\Star Trek SFC3\Assets")
+        if not assets.is_dir():
+            self.skipTest("local SFC3 asset install is unavailable")
+        callback = (6, 20, 2)
+        config_request = struct.pack("<IIII", *callback, server.CHARACTER_DATABASE_ID) + b"\x01"
+        self.assertEqual(
+            server._parse_character_ship_config_request(config_request),
+            (callback, server.CHARACTER_DATABASE_ID, True),
+        )
+        officer_request = struct.pack("<IIII", *callback, server.CHARACTER_DATABASE_ID)
+        self.assertEqual(
+            server._parse_officers_to_review_request(officer_request),
+            (callback, server.CHARACTER_DATABASE_ID),
+        )
+
+        defaults = server._starter_ship_defaults(server.RACE_FEDERATION, assets)
+        expected_tng = server._tng_ship_payload(
+            server._default_ship_core_payload(defaults), defaults["loadout_fields"]
+        )
+        config = server._character_ship_config_payload(
+            server.RACE_FEDERATION, assets, prestige=1500
+        )
+        self.assertEqual(config[:5], b"\x01" + struct.pack("<I", server.SHIP_DATABASE_ID))
+        self.assertEqual(config[5:-8], expected_tng)
+        self.assertEqual(struct.unpack("<fI", config[-8:]), (1.0, 1500))
+
+        officers = server._officers_to_review_payload(
+            server.RACE_FEDERATION, assets, prestige=1500
+        )
+        self.assertEqual(officers[:5], b"\x01" + struct.pack("<I", 0))
+        self.assertEqual(officers[5:-8], expected_tng)
+        self.assertEqual(struct.unpack("<If", officers[-8:]), (1500, 1.0))
 
     def test_security_challenge_shape(self):
         challenge = "a" * 29
@@ -260,6 +531,11 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 )
                 record = server._load_characters()["user@example"]
                 self.assertEqual(record["character_name"], "Captain Test")
+                self.assertEqual(record["position"], [2, 27])
+                self.assertEqual(record["homeworld"], [2, 27])
+                self.assertEqual(record["destination"], [-1, -1])
+                self.assertEqual(record["ship"]["class_name"], "Falcon")
+                self.assertEqual(record["ship"]["id"], 2)
                 payload = server._stored_character_payload("user@example", record)
                 self.assertEqual(struct.unpack_from("<I", payload, len(payload) - 4)[0], 0)
         finally:

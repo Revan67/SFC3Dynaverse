@@ -84,3 +84,56 @@ The game uses an Interface Packet Layer (IPL) with namespaced packet types:
 - `IPL_Goal` — mission goals
 - `IPL_Clock` — turn timing
 - `IPL_AI` — AI character management
+
+## Campaign movement (capture-confirmed)
+
+The successful live session in `live-login-ethernet-20260902.pcapng` includes a move immediately
+before the client entered combat. Raw captures remain local and ignored; the sanitized shapes are:
+
+- Client request: server object 40, channel 41; 12-byte callback, character database ID, signed
+  destination X, and signed destination Y.
+- Observed request callback: `(switch=6, object=6, channel=0)`; destination `(28,9)`.
+- Viewport notifications: client-published `MetaViewPortHandlerNameC`, channel 4.
+- Notification body: movement state, character ID, destination X/Y, duration in seconds, packed
+  string, and an `at friendly base or planet` byte.
+- The live server sent state `1` followed by state `0`. Both captured durations were zero because
+  combat followed the move immediately; ordinary movement timing remains to be validated.
+
+Sending these notifications to `PlayerRelayC` was an earlier hypothesis and is superseded by the
+capture. The local direct callback response is accepted by the client and starts its movement bar;
+the viewport completion notification is what should end that state. Final confirmation requires one
+client move after restarting onto the current code.
+
+## Supply Dock (capture-confirmed, not implemented)
+
+The same session provides a complete initial Supply Dock transaction:
+
+- Client request: `tShipRelayS` object 22, channel 7, with callback `(6,6,2)` and character ID.
+- Server reply: callback object 6/channel 2 with a 2,654-byte payload.
+- The reply begins with success and the live player's full serialized `tShip`, then contains the
+  captured store/rate collections. This agrees with the static `tGetSupplyDockInfoReq::tRep`
+  serializer in the recovered Ghidra export.
+
+This is not safe to implement as an opaque replay: it embeds live character, ship, officer, and item
+state. The next offline step is to finish a field-level `tShip` serializer from the static export and
+installed ship profiles, then generate a fresh local response and cover its invariant structure with
+tests.
+
+The field-level vector, core/loadout, damage, stores, and rate encoders are now implemented. A
+profile parser reads both `Assets\Specs` from a client install and `Assets\Spec` from the dedicated
+server kit. It resolves all four local starter defaults, including loadout-to-core aliases such as
+`Falcon`/`RomulanFrigate` and `Diamond`/`BorgDiamond`.
+
+Ghidra's `tTNGShipCoreData::ConvertSubStringToWeaponArc` proves that firing arcs are indices into a
+44-entry, case-insensitive string table—not computed geometry or weapon-specific values. The table
+was recovered directly from `ServerPlatform.exe`; examples include `0_360 = 3`, `300_360 = 9`,
+`330_30 = 15`, and `165_195 = 17`. The generated core mapper now converts every installed starter
+arc and encodes the six hardpoint vectors, class enumeration, attributes, capacities, and base
+numeric fields without replay data.
+
+The top-level `tShip` order is also capture-aligned: database ID/reference count, owner ID, auction
+flag, race, class, EPV, class name, ship name, creation turn, `tTNGShip`, damage state, stores state,
+flags, and raw hull cost. Channel 7 now returns a wholly generated ship followed by three empty rate
+maps. Missing or invalid local specs produce a normal failure response rather than terminating the
+session. This path is ready for client validation; damage maxima, item rates, and economy-backed
+store contents remain prototype defaults.

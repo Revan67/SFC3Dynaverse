@@ -82,12 +82,39 @@ CAMPAIGN_HOMEWORLDS = {
     RACE_ROMULAN: (2, 27),
     RACE_BORG: (32, 27),
 }
+STARTING_SHIPS = {
+    RACE_FEDERATION: ("Norway", "USS Venture", 3),
+    RACE_KLINGON: ("K'Vort", "IKS Qapla'", 3),
+    RACE_ROMULAN: ("Falcon", "IRW Decius", 3),
+    RACE_BORG: ("Diamond", "Designation 01", 6),
+}
+WEAPON_ARCS = (
+    "PLANET", "SPECIAL", "NONE", "0_360", "0_60", "60_120", "120_180",
+    "180_240", "240_300", "300_360", "30_90", "90_150", "150_210",
+    "210_270", "270_330", "330_30", "345_15", "165_195", "0_120",
+    "120_240", "240_360", "60_180", "180_300", "300_60", "0_90",
+    "90_180", "180_270", "270_360", "0_180", "180_360", "270_90",
+    "90_270", "240_120", "60_300", "330_150", "210_30", "300_120",
+    "240_60", "270_120", "240_90", "0_240", "120_360", "60_240",
+    "120_300",
+)
+WEAPON_ARC_IDS = {name.casefold(): index for index, name in enumerate(WEAPON_ARCS)}
+SHIP_CLASS_CODES = (
+    "SH", "F", "FF", "DD", "CL", "CA", "BCH", "DN", "BB", "LP", "SY",
+    "BS", "BT", "SB", "BIO", "PLANET", "SPECIAL",
+)
+SHIP_CLASS_IDS = {name.casefold(): index for index, name in enumerate(SHIP_CLASS_CODES)}
+CHARACTER_DATABASE_ID = 1
+SHIP_DATABASE_ID = 2
 CHARACTER_STORE_PATH = Path(
     os.environ.get(
         "SFC3_CHARACTER_STORE",
         str(Path(__file__).with_name("characters.local.json")),
     )
 )
+ASSET_ROOT = Path(os.environ.get("SFC3_ASSET_ROOT", "")) if os.environ.get(
+    "SFC3_ASSET_ROOT"
+) else None
 
 # ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -281,27 +308,36 @@ def _campaign_homeworld_for_race(race: int) -> tuple[int, int]:
     return CAMPAIGN_HOMEWORLDS.get(race, _campaign_start_for_race(race))
 
 
-def _character_position_payload(race: int) -> bytes:
+def _character_position_payload(
+    race: int,
+    position: tuple[int, int] | None = None,
+    destination: tuple[int, int] = (-1, -1),
+) -> bytes:
     """Build IPL_Character::tGetCharacterPositionReq::tRep."""
-    start_x, start_y = _campaign_start_for_race(race)
+    position_x, position_y = position or _campaign_start_for_race(race)
     return (
         b"\x01"
         + _meta_map_hex_payload(
-            start_x,
-            start_y,
+            position_x,
+            position_y,
             race,
             has_planet=True,
             victory_points=50,
             economy_points=100,
         )
-        + struct.pack("<ii", -1, -1)
+        + struct.pack("<ii", *destination)
     )
 
 
 def _get_client_character_payload(
-    account: str, character_name: str, client_address: str, race: int
+    account: str,
+    character_name: str,
+    client_address: str,
+    race: int,
+    record: dict | None = None,
 ) -> bytes:
     """Build IPL_Character::tGetClientCharacterReq::tRep."""
+    record = _normalize_character_record(record or {"race": race})
     return (
         b"\x01"
         + _default_client_character_payload(
@@ -311,15 +347,45 @@ def _get_client_character_payload(
             race=race,
             database_id=1,
             rank=0,
+            current_position=tuple(record["position"]),
+            homeworld=tuple(record["homeworld"]),
+            destination=tuple(record["destination"]),
         )
         + b"\x01"
     )
 
 
-def _empty_fleet_data_payload() -> bytes:
-    """Build a successful tGetFleetDataReq::tRep with no fleet icons."""
-    # success, vector<tFleetIconInfo> count, trailing response flags
-    return b"\x01" + struct.pack("<I", 0) + b"\x00\x00"
+def _starting_ship_for_race(race: int) -> tuple[str, str, int]:
+    return STARTING_SHIPS.get(race, STARTING_SHIPS[RACE_FEDERATION])
+
+
+def _ship_cache_payload(race: int) -> bytes:
+    """Serialize tServCharacter::tShipCache for the race's starter ship."""
+    class_name, ship_name, class_type = _starting_ship_for_race(race)
+    return (
+        struct.pack("<III", SHIP_DATABASE_ID, 250, class_type)
+        + _pack_str(class_name)
+        + struct.pack("<f", 1.0)  # undamaged
+        + _pack_str(ship_name)
+        + struct.pack("<I", 0)    # flags
+    )
+
+
+def _fleet_data_payload(race: int) -> bytes:
+    """Build tGetFleetDataReq::tRep with the player's starter ship icon."""
+    x, y = _campaign_start_for_race(race)
+    _class_name, _ship_name, class_type = _starting_ship_for_race(race)
+    fleet_icon = struct.pack(
+        "<IIiiIBI",
+        CHARACTER_DATABASE_ID,
+        SHIP_DATABASE_ID,
+        x,
+        y,
+        class_type,
+        1,  # belongs to the requesting character
+        0,  # icon flags
+    )
+    return b"\x01" + struct.pack("<I", 1) + fleet_icon
 
 
 def _map_snapshot_payload() -> bytes:
@@ -331,6 +397,25 @@ def _map_snapshot_payload() -> bytes:
         + CLIENT_HEX_RECORDS
         + struct.pack("<II", CAMPAIGN_MAP_WIDTH, CAMPAIGN_MAP_HEIGHT)
     )
+
+
+def _campaign_hex_fields(position: tuple[int, int]) -> tuple[int, int, int, bool, bool, int, int, int]:
+    """Decode one compact tClientHex from the captured campaign baseline."""
+    x, y = position
+    if not (0 <= x < CAMPAIGN_MAP_WIDTH and 0 <= y < CAMPAIGN_MAP_HEIGHT):
+        raise ValueError("campaign position outside map")
+    offset = (y * CAMPAIGN_MAP_WIDTH + x) * 11
+    race, planet_race, terrain, has_planet, has_starbase, victory, economy, speed = (
+        struct.unpack_from("<BBIBBBBB", CLIENT_HEX_RECORDS, offset)
+    )
+    return race, planet_race, terrain, bool(has_planet), bool(has_starbase), victory, economy, speed
+
+
+def _at_friendly_base_or_planet(position: tuple[int, int], race: int) -> bool:
+    political_race, planet_race, _terrain, has_planet, has_starbase, *_ = (
+        _campaign_hex_fields(position)
+    )
+    return has_starbase and political_race == race or has_planet and planet_race == race
 
 
 def _relay_claim_payload(name: bytes, object_id: int) -> bytes:
@@ -371,6 +456,10 @@ def _default_client_character_payload(
     race: int = 0,
     database_id: int = 0,
     rank: int = 0xFFFFFFFF,
+    include_ship: bool = True,
+    current_position: tuple[int, int] | None = None,
+    homeworld: tuple[int, int] | None = None,
+    destination: tuple[int, int] = (-1, -1),
 ) -> bytes:
     """Serialize the wire-visible fields of a minimal tClientCharacter."""
     payload = bytearray(_pack_str(client_address) + _pack_str(account))
@@ -384,12 +473,15 @@ def _default_client_character_payload(
         0, 0, 0, 0, # prestige/disrepute totals
         0xFFFFFFFF,  # mission slot
     )
-    start_x, start_y = _campaign_start_for_race(race)
-    home_x, home_y = _campaign_homeworld_for_race(race)
+    start_x, start_y = current_position or _campaign_start_for_race(race)
+    home_x, home_y = homeworld or _campaign_homeworld_for_race(race)
     payload += struct.pack("<ii", start_x, start_y)  # current hex
     payload += struct.pack("<ii", home_x, home_y)    # homeworld hex
-    payload += struct.pack("<ii", -1, -1)           # no destination
-    payload += struct.pack("<I", 0)  # empty ship-cache vector
+    payload += struct.pack("<ii", *destination)
+    if include_ship:
+        payload += struct.pack("<I", 1) + _ship_cache_payload(race)
+    else:
+        payload += struct.pack("<I", 0)
 
     payload += _meta_map_hex_payload(
         start_x,
@@ -405,7 +497,11 @@ def _default_client_character_payload(
 
 def _character_not_found_payload() -> bytes:
     """Build IPL_Character::tConnectPlayerReq::tRep for a new account."""
-    return b"\x01" + _default_client_character_payload() + struct.pack("<I", 1)
+    return (
+        b"\x01"
+        + _default_client_character_payload(include_ship=False)
+        + struct.pack("<I", 1)
+    )
 
 
 def _parse_create_client_character(
@@ -486,25 +582,526 @@ def _load_characters() -> dict[str, dict]:
     data = json.loads(CHARACTER_STORE_PATH.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("character store must contain an object")
-    return data
+    return {account: _normalize_character_record(record) for account, record in data.items()}
+
+
+def _normalize_character_record(record: dict) -> dict:
+    """Add deterministic campaign defaults to old prototype character records."""
+    normalized = dict(record)
+    race = int(normalized.get("race", RACE_FEDERATION))
+    class_name, ship_name, class_type = _starting_ship_for_race(race)
+    normalized.setdefault("position", list(_campaign_start_for_race(race)))
+    normalized.setdefault("homeworld", list(_campaign_homeworld_for_race(race)))
+    normalized.setdefault("destination", [-1, -1])
+    normalized.setdefault(
+        "ship",
+        {
+            "id": SHIP_DATABASE_ID,
+            "class_name": class_name,
+            "name": ship_name,
+            "class_type": class_type,
+            "bpv": 250,
+            "damage": 1.0,
+            "flags": 0,
+        },
+    )
+    return normalized
 
 
 def _save_character(
     account: str, character_name: str, client_address: str, race: int
-) -> None:
+) -> dict:
     characters = _load_characters()
-    characters[account] = {
+    record = _normalize_character_record({
         "character_name": character_name,
         "client_address": client_address,
         "race": race,
-    }
+    })
+    characters[account] = record
     CHARACTER_STORE_PATH.write_text(
         json.dumps(characters, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    return record
+
+
+def _write_character_record(account: str, record: dict) -> dict:
+    characters = _load_characters()
+    normalized = _normalize_character_record(record)
+    characters[account] = normalized
+    CHARACTER_STORE_PATH.write_text(
+        json.dumps(characters, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return normalized
+
+
+def _parse_move_request(payload: bytes) -> tuple[tuple[int, int, int], int, tuple[int, int]]:
+    """Parse IPL_Map::tMoveRequestReq (channel 41)."""
+    if len(payload) != 24:
+        raise ValueError("invalid move-request length")
+    callback = struct.unpack_from("<III", payload, 0)
+    character_id, x, y = struct.unpack_from("<Iii", payload, 12)
+    return callback, character_id, (x, y)
+
+
+def _is_adjacent_hex(current: tuple[int, int], destination: tuple[int, int]) -> bool:
+    dx = destination[0] - current[0]
+    dy = destination[1] - current[1]
+    return (dx, dy) in {(0, -1), (1, 0), (1, 1), (0, 1), (-1, 0), (-1, -1)}
+
+
+def _move_response_payload(accepted: bool, duration_seconds: int = 1) -> bytes:
+    """Build tMoveRequestReq::tRep with duration (seconds) and result code."""
+    return b"\x01" + struct.pack(
+        "<II", duration_seconds if accepted else 0, 1 if accepted else 0
+    )
+
+
+def _meta_map_move_payload(
+    character_id: int,
+    destination: tuple[int, int],
+    duration_seconds: int,
+    movement_state: int,
+    at_friendly_base_or_planet: bool = False,
+) -> bytes:
+    """Build the viewport channel-4 tMetaMapMoveResponse body."""
+    return (
+        struct.pack(
+            "<IIiiI",
+            movement_state,
+            character_id,
+            destination[0],
+            destination[1],
+            duration_seconds,
+        )
+        + _pack_str("")
+        + bytes((at_friendly_base_or_planet,))
+    )
+
+
+def _pack_u32_vector(values) -> bytes:
+    """Serialize the VC6 nDataStore representation of vector<unsigned long>."""
+    values = tuple(values)
+    return struct.pack("<I", len(values)) + b"".join(
+        struct.pack("<I", value) for value in values
+    )
+
+
+def _pack_str_vector(values) -> bytes:
+    values = tuple(values)
+    return struct.pack("<I", len(values)) + b"".join(_pack_str(value) for value in values)
+
+
+def _damage_state_payload(
+    system_current=(),
+    system_maximum=(),
+    hardpoint_current=(),
+    hardpoint_maximum=(),
+    initialized: bool = True,
+) -> bytes:
+    """Serialize tDamageState without copying state from a captured character."""
+    current_systems = tuple(system_current) or (-1,) * 23
+    maximum_systems = tuple(system_maximum) or (-1,) * 23
+    current_hardpoints = tuple(hardpoint_current) or (-1,) * 25
+    maximum_hardpoints = tuple(hardpoint_maximum) or (-1,) * 25
+    if not (
+        len(current_systems) == len(maximum_systems) == 23
+        and len(current_hardpoints) == len(maximum_hardpoints) == 25
+    ):
+        raise ValueError("tDamageState requires 23 systems and 25 hardpoints")
+    payload = bytearray((int(initialized),))
+    for current, maximum in zip(current_systems, maximum_systems):
+        payload += struct.pack("<ii", current, maximum)
+    for current, maximum in zip(current_hardpoints, maximum_hardpoints):
+        payload += struct.pack("<ii", current, maximum)
+    return bytes(payload)
+
+
+def _stores_state_payload(
+    shuttle_counts=(2, 4, 2),
+    transporter_ids=(),
+    item_current=(),
+    item_maximum=(),
+    mine_counts=(4, 4, 4),
+    marine_counts=(2, 2, 2),
+    spare_counts=(2, 2, 2),
+) -> bytes:
+    """Serialize tStoresState using its recovered field-level StreamOut order."""
+    if not all(len(values) == 3 for values in (
+        shuttle_counts, mine_counts, marine_counts, spare_counts
+    )):
+        raise ValueError("store count groups require three values")
+    current = tuple(item_current) or (-1,) * 25
+    maximum = tuple(item_maximum) or (0,) * 25
+    if len(current) != 25 or len(maximum) != 25:
+        raise ValueError("tStoresState requires 25 item slots")
+    payload = bytearray(bytes(shuttle_counts))
+    payload += _pack_u32_vector(transporter_ids)
+    for current_value, maximum_value in zip(current, maximum):
+        payload += struct.pack("<hh", current_value, maximum_value)
+    for index in range(3):
+        payload += bytes((mine_counts[index], marine_counts[index], spare_counts[index]))
+    return bytes(payload)
+
+
+def _item_rates_payload(item_rate=1.0, misc_rates=(2.0, 4.0, 4.0)) -> bytes:
+    """Serialize tStoresState::tItemRates."""
+    if len(misc_rates) != 3:
+        raise ValueError("item rates require three miscellaneous rates")
+    return struct.pack("<dddd", item_rate, *misc_rates)
+
+
+def _id_double_map_payload(values) -> bytes:
+    """Serialize map<nDatabase::tID, double> in nDataStore order."""
+    entries = tuple(values)
+    return struct.pack("<I", len(entries)) + b"".join(
+        struct.pack("<Id", database_id, value) for database_id, value in entries
+    )
+
+
+def _id_item_rates_map_payload(values) -> bytes:
+    """Serialize map<nDatabase::tID, tStoresState::tItemRates>."""
+    entries = tuple(values)
+    return struct.pack("<I", len(entries)) + b"".join(
+        struct.pack("<I", database_id) + _item_rates_payload(*rates)
+        for database_id, rates in entries
+    )
+
+
+def _ship_core_payload(
+    hardpoint_groups,
+    primary_values,
+    class_name: str,
+    model_name: str,
+    model_values,
+    secondary_values,
+    attributes=(),
+) -> bytes:
+    """Serialize tTNGShipCoreData in its recovered StreamOut order.
+
+    The six hardpoint groups and numeric fields intentionally remain explicit: their
+    meanings come from DefaultCore.txt, while this routine owns only wire encoding.
+    """
+    groups = tuple(tuple(group) for group in hardpoint_groups)
+    primary = tuple(primary_values)
+    model = tuple(model_values)
+    secondary = tuple(secondary_values)
+    if len(groups) != 6:
+        raise ValueError("ship core requires six hardpoint vectors")
+    if len(primary) != 8 or len(model) != 7 or len(secondary) != 4:
+        raise ValueError("ship core numeric groups require 8, 7, and 4 values")
+    return (
+        b"".join(_pack_u32_vector(group) for group in groups)
+        + struct.pack("<8I", *primary)
+        + _pack_str(class_name)
+        + _pack_str(model_name)
+        + _pack_str_vector(attributes)
+        + struct.pack("<7I", *model)
+        + struct.pack("<4I", *secondary)
+    )
+
+
+def _tng_ship_payload(
+    core_payload: bytes,
+    loadout_fields,
+    configuration_revision: int = 0,
+) -> bytes:
+    """Serialize tTNGShip from generated core and DefaultLoadOut fields."""
+    loadout = "\t".join(str(field) for field in loadout_fields)
+    return b"\x01\x01" + core_payload + _pack_str(loadout) + struct.pack(
+        "<I", configuration_revision
+    )
+
+
+def _spec_rows(path: Path):
+    """Yield tab-separated SFC3 spec rows between [BEGIN] and [END]."""
+    active = False
+    with path.open("r", encoding="cp1252") as stream:
+        for raw_line in stream:
+            line = raw_line.rstrip("\r\n")
+            if line.startswith("[BEGIN]"):
+                active = True
+                continue
+            if line.startswith("[END]"):
+                break
+            if active and line.strip():
+                yield line.rstrip("\t").split("\t")
+
+
+def _parse_triplet(value: str, prefix: str) -> tuple[int, int, int]:
+    fields = value.split(":")
+    if len(fields) != 4 or fields[0] != prefix:
+        raise ValueError(f"invalid {prefix} field: {value!r}")
+    return tuple(int(field) for field in fields[1:])
+
+
+def _parse_hardpoints(value: str, prefix: str) -> tuple[tuple[int, str], ...]:
+    fields = value.split(":")
+    if not fields or fields[0] != prefix or (len(fields) - 1) % 2:
+        raise ValueError(f"invalid {prefix} field: {value!r}")
+    return tuple(
+        (int(fields[index]), fields[index + 1])
+        for index in range(1, len(fields), 2)
+    )
+
+
+def _weapon_arc_id(value: str) -> int:
+    """Convert a DefaultCore firing arc using the executable's WeaponArcs table."""
+    try:
+        return WEAPON_ARC_IDS[value.casefold()]
+    except KeyError as exc:
+        raise ValueError(f"unknown SFC3 weapon arc: {value!r}") from exc
+
+
+def _core_hardpoint_vectors(defaults: dict) -> tuple[tuple[int, ...], ...]:
+    primary = defaults["primary_hardpoints"]
+    heavy = defaults["heavy_hardpoints"]
+    return (
+        tuple(hardpoint for hardpoint, _arc in primary),
+        tuple(_weapon_arc_id(arc) for _hardpoint, arc in primary),
+        tuple(hardpoint for hardpoint, _arc in heavy),
+        tuple(_weapon_arc_id(arc) for _hardpoint, arc in heavy),
+        tuple(defaults["hull_hardpoints"]),
+        tuple(defaults["bridge_hardpoints"]),
+    )
+
+
+def _ship_class_id(value: str) -> int:
+    try:
+        return SHIP_CLASS_IDS[value.casefold()]
+    except KeyError as exc:
+        raise ValueError(f"unknown SFC3 ship class: {value!r}") from exc
+
+
+def _default_ship_core_payload(defaults: dict) -> bytes:
+    """Map a parsed DefaultCore row into the recovered field serialization order."""
+    mines = defaults["mines"]
+    marines = defaults["marines"]
+    shuttles = defaults["shuttles"]
+    primary_values = (
+        defaults["power_space"],
+        defaults["weapon_space"],
+        defaults["hull_space"],
+        defaults["size_class"],
+        _ship_class_id(defaults["class_code"]),
+        defaults["base_weight"],
+        defaults["cargo_space"],
+        defaults["hull_cost"],
+    )
+    model_values = (
+        mines[1],
+        mines[0],
+        mines[2],
+        marines[1],
+        marines[0],
+        marines[2],
+        shuttles[1],
+    )
+    secondary_values = (
+        shuttles[0],
+        shuttles[2],
+        defaults["shield_space"],
+        defaults["ship_size"],
+    )
+    core = _ship_core_payload(
+        _core_hardpoint_vectors(defaults),
+        primary_values,
+        defaults["class_name"],
+        defaults["model_name"],
+        model_values,
+        secondary_values,
+        defaults["attributes"],
+    )
+    return core
+
+
+def _full_ship_payload(
+    *,
+    race: int,
+    ship_name: str,
+    defaults: dict,
+    database_id: int = SHIP_DATABASE_ID,
+    owner_id: int = CHARACTER_DATABASE_ID,
+    epv: int = 250,
+    turn_created: int = 0,
+) -> bytes:
+    """Serialize the complete top-level tShip in recovered StreamOut order."""
+    core = _default_ship_core_payload(defaults)
+    tng_ship = _tng_ship_payload(core, defaults["loadout_fields"])
+    class_type = _ship_class_id(defaults["class_code"])
+    database_object = struct.pack("<II", database_id, 0)
+    ship_header = (
+        struct.pack("<I", owner_id)
+        + b"\x00"
+        + struct.pack("<III", race, class_type, epv)
+        + _pack_str(defaults["class_name"])
+        + _pack_str(ship_name)
+        + struct.pack("<I", turn_created)
+    )
+    return (
+        database_object
+        + ship_header
+        + tng_ship
+        + _damage_state_payload(
+            system_current=(100,) * 23,
+            system_maximum=(100,) * 23,
+            hardpoint_current=(100,) * 25,
+            hardpoint_maximum=(100,) * 25,
+        )
+        + _stores_state_payload(
+            shuttle_counts=defaults["shuttles"],
+            mine_counts=defaults["mines"],
+            marine_counts=defaults["marines"],
+            spare_counts=(0, 0, 0),
+        )
+        + struct.pack("<II", 0, defaults["hull_cost"])
+    )
+
+
+def _supply_dock_payload(race: int, asset_root: Path | None = None) -> bytes:
+    """Build tGetSupplyDockInfoReq::tRep from installed defaults, never capture data."""
+    defaults = _starter_ship_defaults(race, asset_root)
+    _class_name, ship_name, _class_type = _starting_ship_for_race(race)
+    ship = _full_ship_payload(race=race, ship_name=ship_name, defaults=defaults)
+    return (
+        b"\x01"
+        + ship
+        + _id_double_map_payload(((SHIP_DATABASE_ID, 1.0),))
+        + _id_double_map_payload(((SHIP_DATABASE_ID, 0.5),))
+        + _id_item_rates_map_payload(((SHIP_DATABASE_ID, (1.0, (2.0, 4.0, 4.0))),))
+    )
+
+
+def _parse_character_ship_config_request(
+    payload: bytes,
+) -> tuple[tuple[int, int, int], int, bool]:
+    """Parse IPL_Character::tGetCharacterShipConfigReq (channel 20)."""
+    if len(payload) != 17:
+        raise ValueError("invalid character ship-config request length")
+    return _parse_callback(payload), struct.unpack_from("<I", payload, 12)[0], bool(payload[16])
+
+
+def _character_ship_config_payload(
+    race: int,
+    asset_root: Path | None = None,
+    *,
+    ship_id: int = SHIP_DATABASE_ID,
+    economic_scalar: float = 1.0,
+    prestige: int = 0,
+) -> bytes:
+    """Build tGetCharacterShipConfigReq::tRep from installed starter defaults."""
+    defaults = _starter_ship_defaults(race, asset_root)
+    tng_ship = _tng_ship_payload(
+        _default_ship_core_payload(defaults), defaults["loadout_fields"]
+    )
+    return (
+        b"\x01"
+        + struct.pack("<I", ship_id)
+        + tng_ship
+        + struct.pack("<fI", economic_scalar, prestige)
+    )
+
+
+def _parse_officers_to_review_request(
+    payload: bytes,
+) -> tuple[tuple[int, int, int], int]:
+    """Parse IPL_Character::tGetOfficersToReviewReq (channel 27)."""
+    if len(payload) != 16:
+        raise ValueError("invalid officers-to-review request length")
+    return _parse_callback(payload), struct.unpack_from("<I", payload, 12)[0]
+
+
+def _officers_to_review_payload(
+    race: int,
+    asset_root: Path | None = None,
+    *,
+    prestige: int = 0,
+    economic_scalar: float = 1.0,
+) -> bytes:
+    """Build a valid empty tGetOfficersToReviewReq::tRep with current ship config."""
+    defaults = _starter_ship_defaults(race, asset_root)
+    tng_ship = _tng_ship_payload(
+        _default_ship_core_payload(defaults), defaults["loadout_fields"]
+    )
+    return b"\x01" + struct.pack("<I", 0) + tng_ship + struct.pack(
+        "<If", prestige, economic_scalar
+    )
+
+
+def _parse_ids(value: str, prefix: str) -> tuple[int, ...]:
+    fields = value.split(":")
+    if not fields or fields[0] != prefix:
+        raise ValueError(f"invalid {prefix} field: {value!r}")
+    return tuple(int(field) for field in fields[1:])
+
+
+def _load_ship_defaults(core_path: Path, loadout_path: Path, model_name: str) -> dict:
+    """Load one base ship from the user's installed, unmodified SFC3 specs."""
+    loadout_row = next(
+        (row for row in _spec_rows(loadout_path) if len(row) >= 7 and row[2].strip() == model_name),
+        None,
+    )
+    core_model_name = loadout_row[3] if loadout_row is not None else model_name
+    core_row = next(
+        (
+            row
+            for row in _spec_rows(core_path)
+            if len(row) >= 20 and row[11] == core_model_name
+        ),
+        None,
+    )
+    if core_row is None or loadout_row is None:
+        raise ValueError(f"starter ship {model_name!r} is absent from installed specs")
+    return {
+        "size_class": int(core_row[0]),
+        "class_code": core_row[1],
+        "base_weight": int(core_row[2]),
+        "cargo_space": int(core_row[3]),
+        "hull_cost": int(core_row[4]),
+        "power_space": int(core_row[5]),
+        "weapon_space": int(core_row[6]),
+        "hull_space": int(core_row[7]),
+        "shield_space": int(core_row[8]),
+        "ship_size": int(core_row[9]),
+        "class_name": core_row[10],
+        "model_name": core_row[11],
+        "starter_name": model_name,
+        "primary_hardpoints": _parse_hardpoints(core_row[12], "PrimaryHP"),
+        "heavy_hardpoints": _parse_hardpoints(core_row[13], "HeavyHP"),
+        "hull_hardpoints": _parse_ids(core_row[14], "HullHP"),
+        "bridge_hardpoints": _parse_ids(core_row[15], "BridgeHP"),
+        "attributes": tuple(filter(None, core_row[16].split(":"))),
+        "mines": _parse_triplet(core_row[17], "Mines"),
+        "marines": _parse_triplet(core_row[18], "Marines"),
+        "shuttles": _parse_triplet(core_row[19], "Shuttles"),
+        "political_base": loadout_row[0],
+        "loadout_class_name": loadout_row[1],
+        "sub_name": loadout_row[2],
+        "ui_name": loadout_row[3],
+        "default": loadout_row[4],
+        "special": loadout_row[5],
+        "items": tuple(field for field in loadout_row[6:] if field),
+        "loadout_fields": tuple(loadout_row),
+    }
+
+
+def _starter_ship_defaults(race: int, asset_root: Path | None = None) -> dict:
+    root = asset_root or ASSET_ROOT
+    if root is None:
+        raise RuntimeError("SFC3_ASSET_ROOT must point to the installed SFC3 Assets directory")
+    model_name, _ship_name, _class_type = _starting_ship_for_race(race)
+    specs = root / "Specs"
+    if not specs.is_dir():
+        # The recovered dedicated-server kit uses the singular directory name.
+        specs = root / "Spec"
+    return _load_ship_defaults(
+        specs / "DefaultCore.txt", specs / "DefaultLoadOut.txt", model_name
+    )
 
 
 def _stored_character_payload(account: str, record: dict) -> bytes:
+    record = _normalize_character_record(record)
     return b"\x01" + _default_client_character_payload(
         client_address=str(record["client_address"]),
         account=account,
@@ -512,6 +1109,9 @@ def _stored_character_payload(account: str, record: dict) -> bytes:
         race=int(record["race"]),
         database_id=1,
         rank=0,
+        current_position=tuple(record["position"]),
+        homeworld=tuple(record["homeworld"]),
+        destination=tuple(record["destination"]),
     ) + struct.pack("<I", 0)
 
 
@@ -524,8 +1124,8 @@ class SFC3Client:
         self.addr   = writer.get_extra_info("peername")
         self.sw_id  = random.randint(1, 0xFFFFFFFE)
 
-    def _log(self, level, msg, *args):
-        getattr(log, level)(f"{self.addr[0]}:{self.addr[1]} {msg}", *args)
+    def _log(self, level, msg, *args, **kwargs):
+        getattr(log, level)(f"{self.addr[0]}:{self.addr[1]} {msg}", *args, **kwargs)
 
     async def run(self):
         self._log("info", "CONNECT sw_id=0x%08x", self.sw_id)
@@ -745,9 +1345,16 @@ class DynamicSecurityClient:
         self.addr = writer.get_extra_info("peername")
         self.sw_id = random.randint(1, 0xFFFFFFFE)
         self.current_character = None
+        self.current_record = None
+        self.player_relay_address = None
+        self.viewport_relay_address = None
 
-    def _log(self, level, msg, *args):
-        getattr(log, level)(f"[game:{GAME_PORT}] {self.addr[0]}:{self.addr[1]} {msg}", *args)
+    def _log(self, level, msg, *args, **kwargs):
+        getattr(log, level)(
+            f"[game:{GAME_PORT}] {self.addr[0]}:{self.addr[1]} {msg}",
+            *args,
+            **kwargs,
+        )
 
     async def run(self):
         self._log("info", "CONNECT sw_id=0x%08x", self.sw_id)
@@ -879,6 +1486,7 @@ class DynamicSecurityClient:
             character_reply = _character_not_found_payload()
         else:
             character_reply = _stored_character_payload(account, stored_character)
+            self.current_record = stored_character
             self.current_character = (
                 account,
                 str(stored_character["character_name"]),
@@ -904,6 +1512,46 @@ class DynamicSecurityClient:
                 timeout=SESSION_IDLE_TIMEOUT
             )
             self._log("info", "<- frame sw=%d obj=%d ch=%d plen=%d", sw, obj, ch, len(payload))
+            if (sw, obj, ch) == (0, 1, 0):
+                try:
+                    relay_name, relay_address = _parse_relay_publication(payload)
+                except ValueError:
+                    pass
+                else:
+                    # Relay names and numeric callback addresses are protocol metadata,
+                    # and recording them lets us route asynchronous player updates.
+                    self._log(
+                        "info",
+                        "<- client relay publication name=%r address=%r",
+                        relay_name,
+                        relay_address,
+                    )
+                    if relay_name.endswith(b"PlayerRelayC"):
+                        self.player_relay_address = relay_address
+                    if relay_name.endswith(b"MetaViewPortHandlerNameC"):
+                        self.viewport_relay_address = relay_address
+                        if self.current_character is not None and self.current_record is not None:
+                            position = tuple(self.current_record["position"])
+                            at_friendly_facility = _at_friendly_base_or_planet(
+                                position, self.current_character[3]
+                            )
+                            self.writer.write(_nswitch_frame(
+                                relay_address[0],
+                                relay_address[1],
+                                4,
+                                _meta_map_move_payload(
+                                    CHARACTER_DATABASE_ID,
+                                    position,
+                                    0,
+                                    0,
+                                    at_friendly_facility,
+                                ),
+                            ))
+                            await self.writer.drain()
+                            self._log(
+                                "info",
+                                "-> initial viewport position/facility state",
+                            )
             if (sw, obj, ch) == (0, 1, 0) and b"CharacterLogOnRelayNameC" in payload:
                 if self.current_character is None:
                     raise ValueError("character logon publication preceded character creation")
@@ -967,14 +1615,126 @@ class DynamicSecurityClient:
                 await self.writer.drain()
                 self._log("info", "-> observed 35x29 live campaign map baseline")
                 continue
+            if (sw, obj, ch) == (0, 22, 7):
+                callback = _parse_callback(payload)
+                if len(payload) != 16:
+                    raise ValueError("invalid supply-dock request length")
+                character_id = struct.unpack_from("<I", payload, 12)[0]
+                if character_id != CHARACTER_DATABASE_ID or self.current_character is None:
+                    response = b"\x00"
+                else:
+                    try:
+                        response = _supply_dock_payload(self.current_character[3])
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        self._log("warning", "Supply Dock defaults unavailable: %s", exc)
+                        response = b"\x00"
+                self.writer.write(_nswitch_frame(
+                    callback[0], callback[1], callback[2], response
+                ))
+                await self.writer.drain()
+                self._log("info", "-> generated Supply Dock ship state")
+                continue
+            if (sw, obj, ch) == (0, 6, 20):
+                callback, character_id, _for_update = (
+                    _parse_character_ship_config_request(payload)
+                )
+                if character_id != CHARACTER_DATABASE_ID or self.current_character is None:
+                    response = b"\x00"
+                else:
+                    try:
+                        response = _character_ship_config_payload(self.current_character[3])
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        self._log("warning", "Ship config defaults unavailable: %s", exc)
+                        response = b"\x00"
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> current character ship config")
+                continue
+            if (sw, obj, ch) == (0, 6, 27):
+                callback, character_id = _parse_officers_to_review_request(payload)
+                if character_id != CHARACTER_DATABASE_ID or self.current_character is None:
+                    response = b"\x00"
+                else:
+                    try:
+                        response = _officers_to_review_payload(self.current_character[3])
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        self._log("warning", "Officer-review defaults unavailable: %s", exc)
+                        response = b"\x00"
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> empty officer review with current ship config")
+                continue
+            if (sw, obj, ch) == (0, 40, 41):
+                callback, _character_id, destination = _parse_move_request(payload)
+                if self.current_character is None or self.current_record is None:
+                    raise ValueError("move request preceded character logon")
+                current = tuple(self.current_record["position"])
+                accepted = (
+                    _character_id == CHARACTER_DATABASE_ID
+                    and self.viewport_relay_address is not None
+                    and 0 <= destination[0] < CAMPAIGN_MAP_WIDTH
+                    and 0 <= destination[1] < CAMPAIGN_MAP_HEIGHT
+                    and _is_adjacent_hex(current, destination)
+                )
+                if accepted:
+                    self.current_record["position"] = list(destination)
+                    self.current_record["destination"] = [-1, -1]
+                    self.current_record = _write_character_record(
+                        self.current_character[0], self.current_record
+                    )
+                self.writer.write(_nswitch_frame(
+                    callback[0], callback[1], callback[2], _move_response_payload(accepted)
+                ))
+                await self.writer.drain()
+                if accepted and self.viewport_relay_address is not None:
+                    viewport_switch, viewport_object = self.viewport_relay_address
+                    at_friendly_facility = _at_friendly_base_or_planet(
+                        destination, self.current_character[3]
+                    )
+                    self.writer.write(_nswitch_frame(
+                        viewport_switch,
+                        viewport_object,
+                        4,
+                        _meta_map_move_payload(
+                            _character_id, destination, 1, 1, at_friendly_facility
+                        ),
+                    ))
+                    await self.writer.drain()
+                    await asyncio.sleep(1)
+                    self.writer.write(_nswitch_frame(
+                        viewport_switch,
+                        viewport_object,
+                        4,
+                        _meta_map_move_payload(
+                            _character_id, destination, 0, 0, at_friendly_facility
+                        ),
+                    ))
+                    await self.writer.drain()
+                    self._log("info", "-> viewport movement start/completion")
+                self._log(
+                    "info",
+                    "-> movement %s destination=(%d,%d)",
+                    "accepted" if accepted else "rejected",
+                    destination[0],
+                    destination[1],
+                )
+                continue
             if (sw, obj, ch) == (0, 6, 12):
                 callback = _parse_callback(payload)
                 race = self.current_character[3] if self.current_character else RACE_NEUTRAL
+                position = None
+                destination = (-1, -1)
+                if self.current_record is not None:
+                    position = tuple(self.current_record["position"])
+                    destination = tuple(self.current_record["destination"])
                 self.writer.write(_nswitch_frame(
-                    callback[0], callback[1], callback[2], _character_position_payload(race)
+                    callback[0],
+                    callback[1],
+                    callback[2],
+                    _character_position_payload(race, position, destination),
                 ))
                 await self.writer.drain()
-                self._log("info", "-> character position at campaign start hex")
+                self._log("info", "-> persisted character position")
                 continue
             if (sw, obj, ch) == (0, 6, 24):
                 callback = _parse_callback(payload)
@@ -984,7 +1744,9 @@ class DynamicSecurityClient:
                     callback[0],
                     callback[1],
                     callback[2],
-                    _get_client_character_payload(*self.current_character),
+                    _get_client_character_payload(
+                        *self.current_character, record=self.current_record
+                    ),
                 ))
                 await self.writer.drain()
                 self._log("info", "-> current client character")
@@ -992,10 +1754,12 @@ class DynamicSecurityClient:
             if (sw, obj, ch) == (0, 6, 26):
                 callback = _parse_callback(payload)
                 self.writer.write(_nswitch_frame(
-                    callback[0], callback[1], callback[2], _empty_fleet_data_payload()
+                    callback[0], callback[1], callback[2], _fleet_data_payload(
+                        self.current_character[3] if self.current_character else RACE_NEUTRAL
+                    )
                 ))
                 await self.writer.drain()
-                self._log("info", "-> empty fleet data")
+                self._log("info", "-> starter-ship fleet data")
                 continue
             if (sw, obj, ch) == (0, 6, 6):
                 (
@@ -1022,7 +1786,7 @@ class DynamicSecurityClient:
                     create_address,
                     race,
                 )
-                _save_character(
+                self.current_record = _save_character(
                     create_account,
                     character_name,
                     create_address,

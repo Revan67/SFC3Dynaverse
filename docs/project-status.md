@@ -1,6 +1,6 @@
 # Project Status
 
-Reviewed 2026-09-03 after the first complete local campaign-UI entry.
+Reviewed 2026-09-07 after persistent character entry and the first local movement test.
 
 ## Evidence levels
 
@@ -39,9 +39,26 @@ Reviewed 2026-09-03 after the first complete local campaign-UI entry.
   instead start at the Federation homeworld `(32,1)` with destination `(-1,-1)`, allowing the
   initial viewport and Center action to target faction space.
 - Character channels 24 and 26 are identified as `tGetClientCharacterReq` and `tGetFleetDataReq`;
-  the server generates the local character and a valid empty fleet response. This restores the
+  the server generates the local character and a one-ship fleet response. This restores the
   player marker, initial faction-homeworld camera, and Center action. A channel-12 position handler
-  is implemented from the live schema, although the present local login sequence does not request it.
+  is implemented from the live schema and now reports the persisted position rather than always
+  returning the faction start.
+- The live Ethernet capture contains a movement immediately before combat. The client sends
+  `IPL_Map` object 40/channel 41 with callback `(6,6,0)`, character ID, and destination `(28,9)`.
+  The live server publishes movement-active and movement-complete records on channel 4 of the
+  client `MetaViewPortHandlerNameC` object. Exact sanitized wire bodies are covered by tests.
+- The local server validates an adjacent destination, completes it without a reconnect, persists
+  it, and returns the character there after reconnect. The player marker and Center action track
+  the resulting position.
+- The recovered `tShip` serializer is implemented from field-level Ghidra evidence. Supply Dock
+  channel 7 generates the race-specific installed starter core/loadout, full damage and stores
+  structures, and per-ship repair, trade-in, and item-rate maps without replaying captured player
+  data. The unmodified client renders the resulting Supply Dock UI and starter-ship inventory.
+- Character channel 20 returns the installed starter `tTNGShip`, economic scalar, and prestige. The
+  unmodified client renders the Norway Refit UI with its installed and available systems.
+- Shipyard reaches its auction UI; its listing is empty because auction inventory is not yet
+  generated. Officers accepts an empty review response but displays no panel content, so generated
+  `tOfficer` records remain required. News is also not yet implemented.
 - Peerchat starts with plaintext `CRYPT des 1 sfc3`, then switches to encrypted traffic after 705.
 
 ## Prototype-only
@@ -61,9 +78,10 @@ initial service-relay setup, mission-matching traffic, and encrypted Peerchat st
 
 `server/server.py` now carries the unmodified client through discovery, dynamic-port security,
 character lookup/creation, persistence, character logon, and entry into the Dynaverse campaign UI.
-The client accepts clock initialization and renders a generated four-faction 35x29 map. The next
-milestone is the `PlayerRelayC`/notification path needed for the visible player indicator, followed
-by named map objects, terrain, economy, ship location, and turn state. See
+The client accepts clock initialization, renders the captured 35x29 map, displays a race-specific
+starter ship and marker, and recenters on the persisted player position. The next milestone is live
+validation of the capture-correct `MetaViewPortHandlerNameC` movement notifications, followed by
+Supply Dock/ship state, missions, economy, and turn simulation. See
 `docs/dynamic-security-protocol.md` and `docs/character-login-protocol.md` for the sanitized wire
 structures.
 
