@@ -34,7 +34,7 @@ Reviewed 2026-09-07 after persistent character entry and the first local movemen
 - The map now uses the stock 51x34 retail `MetaAssets/Multi.mvm`, converted from its map-editor
   records to compact client records. Region, terrain, planet/base presence, victory, and economy
   come from the retail map; its source and generated-record SHA-256 hashes are recorded in
-  `server/campaign_map.py`.
+  `server/campaign_map.py`. The unmodified retail client renders the converted map successfully.
 - The captured live character was located at neutral hex `(28,8)`. New local Federation characters
   instead start at the retail Federation homeworld `(24,19)` with destination `(-1,-1)`, allowing the
   initial viewport and Center action to target faction space.
@@ -56,8 +56,13 @@ Reviewed 2026-09-07 after persistent character entry and the first local movemen
   data. The unmodified client renders the resulting Supply Dock UI and starter-ship inventory.
 - Character channel 20 returns the installed starter `tTNGShip`, economic scalar, and prestige. The
   unmodified client renders the Norway Refit UI with its installed and available systems.
-- Shipyard reaches its auction UI; its listing is empty because auction inventory is not yet
-  generated. Officers displays eight generated `tOfficer` candidates using the server kit's
+- Economy channel 2 now returns a faction-specific Shipyard catalog generated from the retail
+  `DefaultCore.txt` and `DefaultLoadOut.txt`, with auction defaults from the server kit's
+  `Economy.gf`. The unmodified client renders all Federation rows, tracks row selection and bid
+  increments, and opens the selected hull in Vessel Library. Player-facing class names (for example
+  `Norway` and `Sovereign`) must be serialized rather than internal `Fed-*` loadout identifiers.
+  Placing and completing bids is not yet implemented. Officers displays eight generated `tOfficer`
+  candidates using the server kit's
   `OfficerNames.gf` and `AI.gf` review limit. Names, stations, skills, profiles, and calculated worth
   render correctly in the unmodified client. Officer purchase/transfer is not yet implemented.
   News is also not yet implemented.
@@ -81,9 +86,10 @@ initial service-relay setup, mission-matching traffic, and encrypted Peerchat st
 `server/server.py` now carries the unmodified client through discovery, dynamic-port security,
 character lookup/creation, persistence, character logon, and entry into the Dynaverse campaign UI.
 The client accepts clock initialization, renders the retail 51x34 map, displays a race-specific
-starter ship and marker, and recenters on the persisted player position. The next milestone is live
-validation of the capture-correct `MetaViewPortHandlerNameC` movement notifications, followed by
-Supply Dock/ship state, missions, economy, and turn simulation. See
+starter ship and marker, recenters on the persisted player position, completes adjacent movement,
+and renders the generated Supply Dock, Refit, Officers, and Shipyard browsing interfaces. The next
+milestone is implementing mutations behind those interfaces—starting with Shipyard bids and officer
+transfers—then missions, news, economy, and turn simulation. See
 `docs/dynamic-security-protocol.md` and `docs/character-login-protocol.md` for the sanitized wire
 structures.
 

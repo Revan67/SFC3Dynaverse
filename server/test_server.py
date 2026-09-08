@@ -26,6 +26,38 @@ class DynamicSecurityWireTests(unittest.TestCase):
         payload = struct.pack("<III", 6, 6, 4) + b"request fields"
         self.assertEqual(server._parse_callback(payload), (6, 6, 4))
 
+    def test_get_auction_ships_request_shape(self):
+        payload = (
+            b"\x01"
+            + struct.pack("<III", 9, 8, 7)
+            + struct.pack("<IfI", server.CHARACTER_DATABASE_ID, 1.0, 0)
+        )
+        self.assertEqual(len(payload), 25)
+        self.assertEqual(
+            server._parse_get_auction_ships_request(payload),
+            ((9, 8, 7), server.CHARACTER_DATABASE_ID, 1.0, ()),
+        )
+
+    def test_auction_catalog_is_keyed_by_item_id(self):
+        defaults = {
+            "hull_cost": 825,
+            "loadout_class_name": "Fed-Frigate",
+            "ui_name": "Saber",
+            "class_code": "FF",
+        }
+        item = server._auction_item_payload(
+            defaults,
+            auction_id=2000,
+            ship_id=3000,
+            bid_factor=1.0,
+            turns_until_close=3,
+        )
+        self.assertEqual(struct.unpack_from("<I", item, 0)[0], 2000)
+        description_length = struct.unpack_from("<I", item, 9)[0]
+        self.assertEqual(item[13 : 13 + description_length], b"Saber")
+        item_id_offset = 13 + description_length
+        self.assertEqual(struct.unpack_from("<I", item, item_id_offset)[0], 3000)
+
     def test_clock_snapshot_shape(self):
         payload = server._clock_snapshot_payload()
         self.assertEqual(len(payload), 21)
@@ -331,7 +363,7 @@ class DynamicSecurityWireTests(unittest.TestCase):
         )
         class_name, offset = server._unpack_string(ship, 25)
         ship_name, offset = server._unpack_string(ship, offset)
-        self.assertEqual((class_name, ship_name), ("Fed-Destroyer", "USS Venture"))
+        self.assertEqual((class_name, ship_name), ("Norway", "USS Venture"))
         self.assertEqual(struct.unpack_from("<I", ship, offset)[0], 0)
         self.assertEqual(struct.unpack_from("<II", ship, len(ship) - 8), (0, 1250))
 

@@ -69,7 +69,9 @@ to the client presence flags, and preserves economy/strength values.
 2. Generate officers from `OfficerNames.gf` plus `AI.gf` rules and serialize `tOfficer`. Candidate
    browsing is now implemented and client-validated; purchase/transfer remains.
 3. Parse complete ship availability from `DefaultCore.txt`/`DefaultLoadOut.txt` and generate
-   auction inventory according to `Ship.gf` and `Economy.gf`.
+   auction inventory according to `Ship.gf` and `Economy.gf`. Faction catalogs, bid presentation,
+   and selected-hull Vessel Library previews are implemented and client-validated; bid persistence
+   and settlement remain.
 4. Add item pricing and availability to Supply Dock and Refit from the CommonSettings catalogs.
 5. Implement news retention/publication from `News.gf` and recovered request serializers.
 6. Analyze the SQL schema and `.sds` save as behavioral evidence for persistent campaign entities.

@@ -33,11 +33,12 @@ The only viable path is a replacement server that owns both layers.
 - [x] Character lookup, creation, local persistence, and restart/re-login verified end to end
 - [x] Capture and decode a successful `tSecurityRelayS` challenge/response on the dynamic game port
 - [x] Implement the minimal dynamic-port security exchange through `tCharacterRelayS`
-- [x] Decode compact hex records and convert the stock 51x34 `Multi.mvm` map with race-specific starts
+- [x] Decode compact hex records and client-validate the stock 51x34 `Multi.mvm` map with race-specific starts
 - [x] Persist adjacent-hex movement and publish completion/position updates without reconnecting
 - [x] Initialize friendly-base facilities immediately at login and after movement
 - [x] Generate the starter ship from installed specs for Supply Dock and Refit
-- [x] Render Supply Dock stores/rates, the Refit editor, generated officer candidates, and the empty Shipyard auction UI
+- [x] Render Supply Dock stores/rates, the Refit editor, and generated officer candidates
+- [x] Generate the retail faction Shipyard catalog with working bids and Vessel Library previews
 - [x] Add one-command Windows launcher for account/profile and Dynaverse services
 - [ ] Decode the private `VerifyClientRequest` body and implement CD-key allowlist validation
 - [ ] Dynaverse game simulation (economy, AI, missions, auctions, officers, news, and turn system)
@@ -50,8 +51,9 @@ and status discovery, and the security/character flow on game port 27632. GameSp
 compatibility remains in `server/probe.py`. The unmodified client can create a local account and
 character, rejoin after a restart, and enter the campaign UI. The retail map, persistent movement,
 player marker, immediate homeworld facilities, Supply Dock, Refit editor, generated officer list,
-and empty Shipyard auction panel are now verified against the client. Officer purchasing, news,
-missions, auctions, and dynamic campaign
+and retail Shipyard auction catalog are now verified against the client. Shipyard selection, bid
+increments, and Vessel Library previews resolve the selected retail hull correctly. Completing bids,
+officer purchasing, news, missions, and dynamic campaign
 simulation are the next major boundary.
 
 The implementation will:
@@ -309,9 +311,9 @@ The security handler currently verifies the captured exchange shape but does not
 private CD-key body against an allowlist. Campaign relay registration, account persistence, character
 persistence, campaign UI entry, clock initialization, the retail multiplayer map baseline,
 race-specific starting regions, starter-ship display, and persistent adjacent-hex movement are
-working. The capture-correct movement completion path still needs one live validation. A generated
-starter-ship Supply Dock response is implemented but not yet client-validated. Dynamic economy,
-priced Supply Dock inventory, missions, and turn simulation are not implemented.
+working and client-validated. Generated starter-ship Supply Dock and Refit state, officer candidates,
+and the retail Shipyard browsing catalog are also client-validated. State-changing purchases,
+transfers, refits, Shipyard bid settlement, missions, news, and turn simulation are not implemented.
 
 ## Development
 

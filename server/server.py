@@ -110,6 +110,7 @@ SHIP_CLASS_CODES = (
 SHIP_CLASS_IDS = {name.casefold(): index for index, name in enumerate(SHIP_CLASS_CODES)}
 CHARACTER_DATABASE_ID = 1
 SHIP_DATABASE_ID = 2
+AUCTION_DATABASE_ID_BASE = 2000
 CHARACTER_STORE_PATH = Path(
     os.environ.get(
         "SFC3_CHARACTER_STORE",
@@ -949,7 +950,11 @@ def _full_ship_payload(
         struct.pack("<I", owner_id)
         + b"\x00"
         + struct.pack("<III", race, class_type, epv)
-        + _pack_str(defaults["class_name"])
+        # tShip::GetShipClassName is the player-facing hull/variant name from
+        # DefaultLoadOut (for example "Norway" or "Sovereign"), not the
+        # internal core key ("Fed-Destroyer" / "Fed-Dreadnaught2").  The
+        # Vessel Library resolves this string locally.
+        + _pack_str(defaults["ui_name"])
         + _pack_str(ship_name)
         + struct.pack("<I", turn_created)
     )
@@ -1106,6 +1111,133 @@ def _generated_officers(race: int) -> tuple[bytes, ...]:
         _officer_payload(1000 + index, names[index], race, OFFICER_STATIONS[index % 6])
         for index in range(limit)
     )
+
+
+SHIP_POLITICAL_BASES = {
+    RACE_FEDERATION: "Federation",
+    RACE_KLINGON: "Klingon",
+    RACE_ROMULAN: "Romulan",
+    RACE_BORG: "Borg",
+}
+
+
+def _shipyard_defaults(race: int, asset_root: Path | None = None) -> tuple[dict, ...]:
+    """Load the stock, player-facing ship classes for one empire."""
+    root = asset_root or ASSET_ROOT
+    if root is None:
+        raise RuntimeError("SFC3_ASSET_ROOT must point to the installed SFC3 Assets directory")
+    specs = root / "Specs"
+    if not specs.is_dir():
+        specs = root / "Spec"
+    political_base = SHIP_POLITICAL_BASES[race]
+    rows = tuple(_spec_rows(specs / "DefaultLoadOut.txt"))
+    model_names = []
+    for row in rows:
+        if len(row) < 7 or row[0].strip() != political_base or not row[2].strip():
+            continue
+        # Each stock empire begins with one contiguous block of player
+        # loadouts, followed by its AI variants and scenario definitions.
+        if row[5].strip().casefold() == "ai":
+            break
+        model_names.append(row[2].strip())
+    ships = []
+    for name in model_names:
+        try:
+            defaults = _load_ship_defaults(
+                specs / "DefaultCore.txt", specs / "DefaultLoadOut.txt", name
+            )
+            class_id = _ship_class_id(defaults["class_code"])
+        except ValueError:
+            # Stock loadouts also contain installations and aliases without a
+            # corresponding player-ship core row.
+            continue
+        if class_id <= SHIP_CLASS_IDS["bb"]:
+            ships.append(defaults)
+    return tuple(ships)
+
+
+def _economy_ship_auction_settings() -> tuple[float, int, int]:
+    source = find_structured_asset(
+        "ServerProfiles/Economy.gf",
+        server_asset_root=SERVER_ASSET_ROOT,
+        retail_asset_root=ASSET_ROOT,
+    )
+    values = parse_gf(source.path).get("Auction/Ship", {})
+    return (
+        float(values.get("MinimumBidFactor", "1.0")),
+        int(values.get("TurnsUntilClose", "3")),
+        int(values.get("MaximumInReviewByEmpire", "40")),
+    )
+
+
+def _auction_item_payload(
+    defaults: dict,
+    *,
+    auction_id: int,
+    ship_id: int,
+    bid_factor: float,
+    turns_until_close: int,
+) -> bytes:
+    """Serialize tAuctionItem in the recovered ServerPlatform StreamOut order."""
+    rating = int(defaults["hull_cost"])
+    current_bid = max(1, int(rating * bid_factor))
+    return (
+        struct.pack("<II", auction_id, 0)       # tDatabaseObject
+        + b"\x00"                               # bidding has begun
+        # The client passes this description directly to Vessel Library.
+        + _pack_str(defaults["ui_name"])
+        + struct.pack("<I", ship_id)           # item ID
+        + struct.pack("<II", rating, rating)
+        + struct.pack("<dII", bid_factor, 0, turns_until_close)
+        + b"\x00"                               # closing
+        + struct.pack("<I", current_bid)
+        + struct.pack("<I", 0)                 # hidden/no bid owner
+        + struct.pack("<III", 0, 0, 0)         # bid turn, maximum, escrow
+        + struct.pack("<I", 1)                 # item-detail map
+        + _pack_str("IsBase")
+        + _pack_str("No")
+    )
+
+
+def _parse_get_auction_ships_request(
+    payload: bytes,
+) -> tuple[tuple[int, int, int], int, float, tuple[float, ...]]:
+    """Parse tGetAuctionShipsRequest (callback, character, scalar, modifiers)."""
+    if len(payload) < 25 or payload[0] != 1:
+        raise ValueError("truncated get-auction-ships request")
+    callback = _parse_async_return(payload)
+    character_id, scalar, count = struct.unpack_from("<IfI", payload, 13)
+    expected = 25 + count * 4
+    if len(payload) != expected:
+        raise ValueError("invalid get-auction-ships request length")
+    modifiers = struct.unpack_from(f"<{count}f", payload, 25) if count else ()
+    return callback, character_id, scalar, modifiers
+
+
+def _auction_ships_payload(race: int, asset_root: Path | None = None) -> bytes:
+    """Build the client shipyard catalog from stock specs and kit economy rules."""
+    bid_factor, turns_until_close, limit = _economy_ship_auction_settings()
+    ships = _shipyard_defaults(race, asset_root)[:limit]
+    entries = []
+    for index, defaults in enumerate(ships):
+        auction_id = AUCTION_DATABASE_ID_BASE + index
+        ship_id = AUCTION_DATABASE_ID_BASE + 1000 + index
+        entries.append(
+            # The stock database routine indexes this map by GetItemID(), not
+            # by the tAuctionItem database object's own ID. The client uses
+            # this key to resolve the selected row for View Ship.
+            struct.pack("<I", ship_id)
+            + _auction_item_payload(
+                defaults,
+                auction_id=auction_id,
+                ship_id=ship_id,
+                bid_factor=bid_factor,
+                turns_until_close=turns_until_close,
+            )
+        )
+    # Unlike the IPL panel replies, this stored-procedure response inherits
+    # nSwitch::tResponse, whose success value is serialized as an unsigned long.
+    return struct.pack("<II", 1, len(entries)) + b"".join(entries)
 
 
 def _parse_ids(value: str, prefix: str) -> tuple[int, ...]:
@@ -1718,6 +1850,22 @@ class DynamicSecurityClient:
                 await self.writer.drain()
                 self._log("info", "-> generated Supply Dock ship state")
                 continue
+            if (sw, obj, ch) == (0, 19, 2):
+                callback, character_id, _scalar, _modifiers = (
+                    _parse_get_auction_ships_request(payload)
+                )
+                if character_id != CHARACTER_DATABASE_ID or self.current_character is None:
+                    response = struct.pack("<I", 0)
+                else:
+                    try:
+                        response = _auction_ships_payload(self.current_character[3])
+                    except (KeyError, OSError, RuntimeError, ValueError) as exc:
+                        self._log("warning", "Shipyard defaults unavailable: %s", exc)
+                        response = b"\x00"
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> retail shipyard auction catalog")
+                continue
             if (sw, obj, ch) == (0, 6, 20):
                 callback, character_id, _for_update = (
                     _parse_character_ship_config_request(payload)
@@ -1746,7 +1894,7 @@ class DynamicSecurityClient:
                         response = b"\x00"
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
-                self._log("info", "-> empty officer review with current ship config")
+                self._log("info", "-> server-kit officer review with current ship config")
                 continue
             if (sw, obj, ch) == (0, 40, 41):
                 callback, _character_id, destination = _parse_move_request(payload)
