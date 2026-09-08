@@ -10,6 +10,7 @@ __pycache__/
 *.reg
 accounts.local.json
 characters.local.json
+campaign.local.json
 
 # Private captures and imported research-session records
 *.pcapng

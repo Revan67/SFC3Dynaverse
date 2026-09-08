@@ -39,8 +39,11 @@ The only viable path is a replacement server that owns both layers.
 - [x] Generate the starter ship from installed specs for Supply Dock and Refit
 - [x] Render Supply Dock stores/rates, the Refit editor, and generated officer candidates
 - [x] Generate the retail faction Shipyard catalog with working bids and Vessel Library previews
+- [x] Persist campaign turns and Shipyard bids; close and settle auctions on server-kit timing
+- [x] Add persistent state engines for officer purchases, supplies, refits, news, and missions
 - [x] Add one-command Windows launcher for account/profile and Dynaverse services
-- [ ] Decode the private `VerifyClientRequest` body and implement CD-key allowlist validation
+- [x] Add permissive-by-default CD-key policy with registered/strict HMAC identifier modes
+- [ ] Client-validate mutation replies and recover remaining news/mission wire serializers
 - [ ] Dynaverse game simulation (economy, AI, missions, auctions, officers, news, and turn system)
 - [ ] In-game chat (GameSpy Peerchat / IRC protocol)
 
@@ -52,16 +55,16 @@ compatibility remains in `server/probe.py`. The unmodified client can create a l
 character, rejoin after a restart, and enter the campaign UI. The retail map, persistent movement,
 player marker, immediate homeworld facilities, Supply Dock, Refit editor, generated officer list,
 and retail Shipyard auction catalog are now verified against the client. Shipyard selection, bid
-increments, and Vessel Library previews resolve the selected retail hull correctly. Completing bids,
-officer purchasing, news, missions, and dynamic campaign
-simulation are the next major boundary.
+increments, and Vessel Library previews resolve the selected retail hull correctly. Persistent
+campaign time, auction settlement, and the offline state engines for officers, supplies, refits,
+news, and missions are implemented; their remaining client mutation wire paths need validation.
 
 The implementation will:
 
 - Speak the GT2 ASCII negotiation handshake natively
 - Compute the correct GT2 challenge/response hash
 - Handle the nSwitch binary framing used for all post-handshake traffic
-- Validate CD keys against a local allowlist (no GameSpy or WON dependency)
+- Accept structurally valid CD-key verification by default, with optional registered/strict policies
 - Eventually serve the full Dynaverse campaign simulation
 
 ## Protocol Reference
@@ -130,7 +133,11 @@ C→S:  VerifyClientRequest     (challenge reply + CD key from registry + WON lo
 S→C:  auth accept / reject
 ```
 
-The CD key is read from `HKLM\SOFTWARE\WOW6432Node\Activision\Star Trek Starfleet Command III\KEY`. The replacement server checks it against a configured allowlist. The WON login name (typed at the game's login screen) becomes the player's display name.
+The CD key is read from `HKLM\SOFTWARE\WOW6432Node\Activision\Star Trek Starfleet Command III\KEY`.
+Because no authoritative retail-key registry survives, the replacement defaults to permissive
+verification. Optional registered/strict policies may bind a non-reversible, server-secret HMAC
+identifier to an account; raw keys and reusable proofs must never be logged or stored. The WON login
+name (typed at the game's login screen) becomes the player's display name.
 
 ## Key Ghidra Symbols (SFC3.exe)
 
@@ -304,16 +311,24 @@ accepted). These locally installed files supply ship defaults and are never copi
 `SFC3_SERVER_ASSET_ROOT` identifies the dedicated-server kit's `Assets` directory. Structured
 server-kit settings take precedence over matching retail data; retail files are the fallback,
 and packet captures are used only for wire formats or behavior absent from the distributed files.
+`SFC3_CDKEY_POLICY` accepts `permissive` (default), `registered`, or `strict`. Non-permissive modes
+also require `SFC3_IDENTITY_HMAC_SECRET`, `SFC3_CDKEY_ID_OFFSET`, and `SFC3_CDKEY_ID_LENGTH`;
+approved HMAC identifiers are comma-separated in `SFC3_REGISTERED_KEY_IDS`. Keep all of these in the
+ignored private environment file, never in source control.
 The post-login idle timeout is currently fixed at 15 minutes and will become configurable with the
 planned server UI.
 
-The security handler currently verifies the captured exchange shape but does not yet validate the
-private CD-key body against an allowlist. Campaign relay registration, account persistence, character
+The security handler defaults to permissive verification because no authoritative retail-key
+registry survives. Registered and strict modes compare only server-secret HMAC identifiers and
+require explicitly configured, recovered identity-field boundaries; raw private verification bytes
+are never logged or stored. Campaign relay registration, account persistence, character
 persistence, campaign UI entry, clock initialization, the retail multiplayer map baseline,
 race-specific starting regions, starter-ship display, and persistent adjacent-hex movement are
 working and client-validated. Generated starter-ship Supply Dock and Refit state, officer candidates,
-and the retail Shipyard browsing catalog are also client-validated. State-changing purchases,
-transfers, refits, Shipyard bid settlement, missions, news, and turn simulation are not implemented.
+and the retail Shipyard browsing catalog are also client-validated. Campaign turns and Shipyard bid
+settlement are implemented but await live validation. Officer, Supply Dock, Refit, news, and mission
+state engines are persistent and tested; their client mutation/request serializers remain the next
+reverse-engineering boundary.
 
 ## Development
 

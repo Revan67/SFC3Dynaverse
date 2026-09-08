@@ -1,9 +1,11 @@
 import asyncio
 import hashlib
+import json
 import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import gamespy
 import server
@@ -58,13 +60,132 @@ class DynamicSecurityWireTests(unittest.TestCase):
         item_id_offset = 13 + description_length
         self.assertEqual(struct.unpack_from("<I", item, item_id_offset)[0], 3000)
 
-    def test_clock_snapshot_shape(self):
-        payload = server._clock_snapshot_payload()
-        self.assertEqual(len(payload), 21)
-        self.assertEqual(
-            struct.unpack_from("<IIIII", payload, 1),
-            (0, 8, 10_000, 120_000, 2159),
+    def test_bid_request_shape(self):
+        payload = (
+            b"\x01"
+            + struct.pack("<III", 9, 8, 7)
+            + struct.pack("<IIII", 3002, server.CHARACTER_DATABASE_ID, 1, 0)
+            + struct.pack("<dI", 1300.0, 2)
+            + struct.pack("<ff", 1.0, 0.5)
         )
+        self.assertEqual(
+            server._parse_bid_request(payload),
+            ((9, 8, 7), 3002, server.CHARACTER_DATABASE_ID, 1, 0, 1300.0, (1.0, 0.5)),
+        )
+
+    def test_shipyard_bid_persists_and_accepts_initial_minimum(self):
+        defaults = {
+            "hull_cost": 1250,
+            "loadout_class_name": "Fed-Destroyer",
+            "ui_name": "Norway",
+            "class_code": "DD",
+        }
+        old_path = server.CAMPAIGN_STATE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.CAMPAIGN_STATE_PATH = Path(directory) / "campaign.json"
+                with (
+                    mock.patch.object(server, "_shipyard_defaults", return_value=(defaults,)),
+                    mock.patch.object(server, "_economy_ship_auction_settings", return_value=(1.0, 3, 40)),
+                    mock.patch.object(server, "_campaign_turn", return_value=7),
+                ):
+                    response, result = server._place_shipyard_bid(
+                        server.RACE_FEDERATION, "captain@example", 3000, 1250, now=1000.0
+                    )
+                self.assertEqual(result, 2)
+                self.assertEqual(struct.unpack_from("<I", response)[0], 1)
+                saved = json.loads(server.CAMPAIGN_STATE_PATH.read_text(encoding="utf-8"))
+                self.assertEqual(saved["auctions"]["3000"]["bid_owner"], "captain@example")
+                self.assertEqual(saved["auctions"]["3000"]["bid_maximum"], 1250)
+                self.assertEqual(saved["auctions"]["3000"]["turn_bid_made"], 7)
+        finally:
+            server.CAMPAIGN_STATE_PATH = old_path
+
+    def test_competing_proxy_bid_is_persisted(self):
+        defaults = {"hull_cost": 100, "ui_name": "Test", "class_code": "DD"}
+        old_path = server.CAMPAIGN_STATE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.CAMPAIGN_STATE_PATH = Path(directory) / "campaign.json"
+                server.CAMPAIGN_STATE_PATH.write_text(json.dumps({
+                    "epoch_unix": 1.0, "initial_turn": 0,
+                    "auctions": {"3000": {"current_bid": 100, "bid_owner": "leader", "bid_maximum": 200, "turn_bid_made": 2, "escrow": 200}},
+                }), encoding="utf-8")
+                with (mock.patch.object(server, "_shipyard_defaults", return_value=(defaults,)), mock.patch.object(server, "_economy_ship_auction_settings", return_value=(1.0, 3, 40)), mock.patch.object(server, "_campaign_turn", return_value=3)):
+                    _response, result = server._place_shipyard_bid(server.RACE_FEDERATION, "challenger", 3000, 150, now=2.0)
+                self.assertEqual(result, 1)
+                saved = json.loads(server.CAMPAIGN_STATE_PATH.read_text(encoding="utf-8"))
+                self.assertEqual(saved["auctions"]["3000"]["current_bid"], 151)
+                self.assertEqual(saved["auctions"]["3000"]["bid_owner"], "leader")
+        finally:
+            server.CAMPAIGN_STATE_PATH = old_path
+
+    def test_verification_policies_do_not_require_raw_key_storage(self):
+        with mock.patch.dict(server.os.environ, {"SFC3_CDKEY_POLICY": "permissive"}, clear=False):
+            self.assertTrue(server._verification_allowed(b"opaque-private-proof"))
+        with mock.patch.dict(server.os.environ, {"SFC3_CDKEY_POLICY": "strict", "SFC3_IDENTITY_HMAC_SECRET": "local-secret"}, clear=False):
+            identifier = server._verification_identifier(b"identity")
+            with mock.patch.dict(server.os.environ, {"SFC3_REGISTERED_KEY_IDS": identifier}, clear=False):
+                self.assertTrue(server._verification_allowed(b"identity"))
+                self.assertFalse(server._verification_allowed(b"different"))
+
+    def test_mission_lifecycle_is_persistent(self):
+        old_campaign = server.CAMPAIGN_STATE_PATH
+        old_characters = server.CHARACTER_STORE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                server.CAMPAIGN_STATE_PATH = root / "campaign.json"
+                server.CHARACTER_STORE_PATH = root / "characters.json"
+                server.CHARACTER_STORE_PATH.write_text(json.dumps({"captain": {"race": 0, "character_name": "Test", "client_address": "local", "prestige": 200}}), encoding="utf-8")
+                with mock.patch.object(server, "_campaign_turn", return_value=4):
+                    mission = server._offer_mission("captain", "Patrol sector")
+                self.assertEqual(server._set_mission_status("captain", mission["id"], "accepted")["status"], "accepted")
+                self.assertEqual(server._set_mission_status("captain", mission["id"], "launched")["status"], "launched")
+                self.assertEqual(server._set_mission_status("captain", mission["id"], "completed")["status"], "completed")
+                character = json.loads(server.CHARACTER_STORE_PATH.read_text(encoding="utf-8"))["captain"]
+                self.assertEqual(character["prestige"], 210)
+        finally:
+            server.CAMPAIGN_STATE_PATH = old_campaign
+            server.CHARACTER_STORE_PATH = old_characters
+
+    def test_purchase_officers_request_shape(self):
+        payload = (
+            b"\x01"
+            + struct.pack("<III", 9, 8, 7)
+            + struct.pack("<II", server.CHARACTER_DATABASE_ID, 2)
+            + struct.pack("<IIII", 1000, 0x60, 1001, 0x61)
+        )
+        self.assertEqual(
+            server._parse_purchase_officers_request(payload),
+            ((9, 8, 7), server.CHARACTER_DATABASE_ID, {1000: 0x60, 1001: 0x61}),
+        )
+
+    def test_clock_snapshot_shape(self):
+        old_path = server.CAMPAIGN_STATE_PATH
+        old_server_root = server.SERVER_ASSET_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                profile = root / "ServerProfiles"
+                profile.mkdir()
+                (profile / "Time.gf").write_text(
+                    "[Clock]\nTurnsPerYear=10000\nMilliSecondsPerTurn=120000\n",
+                    encoding="ascii",
+                )
+                server.CAMPAIGN_STATE_PATH = root / "campaign.json"
+                server.SERVER_ASSET_ROOT = root
+                payload = server._clock_snapshot_payload(now=1_000.0)
+                self.assertEqual(len(payload), 21)
+                self.assertEqual(
+                    struct.unpack_from("<IIIII", payload, 1),
+                    (0, 8, 10_000, 120_000, 2159),
+                )
+                self.assertEqual(server._campaign_turn(now=1_239.999), 1)
+                self.assertEqual(server._campaign_turn(now=1_240.0), 2)
+        finally:
+            server.CAMPAIGN_STATE_PATH = old_path
+            server.SERVER_ASSET_ROOT = old_server_root
 
     def test_map_size_shape_matches_retail_map(self):
         payload = server._map_size_payload()

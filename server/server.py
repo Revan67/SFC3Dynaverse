@@ -26,12 +26,15 @@ Confirmed 18-step protocol (live Wireshark stream 42, 70.27.77.102:26100, 2026-0
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import json
 import random
 import string
 import struct
 import logging
 import os
+import time
 from pathlib import Path
 
 from asset_sources import find_structured_asset, parse_gf
@@ -115,6 +118,12 @@ CHARACTER_STORE_PATH = Path(
     os.environ.get(
         "SFC3_CHARACTER_STORE",
         str(Path(__file__).with_name("characters.local.json")),
+    )
+)
+CAMPAIGN_STATE_PATH = Path(
+    os.environ.get(
+        "SFC3_CAMPAIGN_STATE",
+        str(Path(__file__).with_name("campaign.local.json")),
     )
 )
 ASSET_ROOT = Path(os.environ.get("SFC3_ASSET_ROOT", "")) if os.environ.get(
@@ -229,10 +238,71 @@ def _security_success_payload() -> bytes:
     return struct.pack("<II", 1, 0) + struct.pack("<I", len(message)) + message
 
 
-def _clock_snapshot_payload() -> bytes:
-    """Build the captured tCurrentTime response used during campaign startup."""
-    # success, turn, adjustment, milliseconds/turn, epoch length, base year
-    return b"\x01" + struct.pack("<IIIII", 0, 8, 10_000, 120_000, 2159)
+def _clock_settings() -> tuple[int, int]:
+    """Return turns/year and milliseconds/turn using normal asset precedence."""
+    source = find_structured_asset(
+        "ServerProfiles/Time.gf",
+        server_asset_root=SERVER_ASSET_ROOT,
+        retail_asset_root=ASSET_ROOT,
+    )
+    values = parse_gf(source.path).get("Clock", {})
+    turns_per_year = int(values.get("TurnsPerYear", 10_000))
+    milliseconds_per_turn = int(values.get("MilliSecondsPerTurn", 120_000))
+    if turns_per_year <= 0 or milliseconds_per_turn <= 0:
+        raise ValueError("Time.gf clock values must be positive")
+    return turns_per_year, milliseconds_per_turn
+
+
+def _load_campaign_clock(now: float | None = None) -> dict:
+    """Load or initialize the restart-stable wall-clock campaign epoch."""
+    current_time = time.time() if now is None else float(now)
+    if CAMPAIGN_STATE_PATH.exists():
+        state = json.loads(CAMPAIGN_STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("campaign state must contain an object")
+        epoch = float(state["epoch_unix"])
+        initial_turn = int(state.get("initial_turn", 0))
+        if epoch < 0 or initial_turn < 0:
+            raise ValueError("campaign clock values cannot be negative")
+        state["epoch_unix"] = epoch
+        state["initial_turn"] = initial_turn
+        state.setdefault("auctions", {})
+        return state
+    state = {"epoch_unix": current_time, "initial_turn": 0, "auctions": {}}
+    CAMPAIGN_STATE_PATH.write_text(
+        json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return state
+
+
+def _write_campaign_state(state: dict) -> None:
+    CAMPAIGN_STATE_PATH.write_text(
+        json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def _campaign_turn(now: float | None = None) -> int:
+    """Calculate the current turn while preserving the epoch across restarts."""
+    current_time = time.time() if now is None else float(now)
+    state = _load_campaign_clock(current_time)
+    _turns_per_year, milliseconds_per_turn = _clock_settings()
+    elapsed_ms = max(0.0, (current_time - state["epoch_unix"]) * 1000.0)
+    return state["initial_turn"] + int(elapsed_ms // milliseconds_per_turn)
+
+
+def _clock_snapshot_payload(now: float | None = None) -> bytes:
+    """Build tCurrentTime using persistent time and server-kit cadence."""
+    turns_per_year, milliseconds_per_turn = _clock_settings()
+    # 2159 is the capture-compatible client display epoch. Time.gf's
+    # StartingDate/BaseYear is a distinct internal stardate representation.
+    return b"\x01" + struct.pack(
+        "<IIIII",
+        _campaign_turn(now),
+        8,
+        turns_per_year,
+        milliseconds_per_turn,
+        2159,
+    )
 
 
 def _map_size_payload() -> bytes:
@@ -358,6 +428,8 @@ def _get_client_character_payload(
             current_position=tuple(record["position"]),
             homeworld=tuple(record["homeworld"]),
             destination=tuple(record["destination"]),
+            prestige=int(record["prestige"]),
+            ship=record["ship"],
         )
         + b"\x01"
     )
@@ -367,15 +439,21 @@ def _starting_ship_for_race(race: int) -> tuple[str, str, int]:
     return STARTING_SHIPS.get(race, STARTING_SHIPS[RACE_FEDERATION])
 
 
-def _ship_cache_payload(race: int) -> bytes:
+def _ship_cache_payload(race: int, ship: dict | None = None) -> bytes:
     """Serialize tServCharacter::tShipCache for the race's starter ship."""
     class_name, ship_name, class_type = _starting_ship_for_race(race)
+    ship = ship or {}
     return (
-        struct.pack("<III", SHIP_DATABASE_ID, 250, class_type)
-        + _pack_str(class_name)
-        + struct.pack("<f", 1.0)  # undamaged
-        + _pack_str(ship_name)
-        + struct.pack("<I", 0)    # flags
+        struct.pack(
+            "<III",
+            int(ship.get("id", SHIP_DATABASE_ID)),
+            int(ship.get("bpv", 250)),
+            int(ship.get("class_type", class_type)),
+        )
+        + _pack_str(str(ship.get("class_name", class_name)))
+        + struct.pack("<f", float(ship.get("damage", 1.0)))
+        + _pack_str(str(ship.get("name", ship_name)))
+        + struct.pack("<I", int(ship.get("flags", 0)))
     )
 
 
@@ -468,6 +546,8 @@ def _default_client_character_payload(
     current_position: tuple[int, int] | None = None,
     homeworld: tuple[int, int] | None = None,
     destination: tuple[int, int] = (-1, -1),
+    prestige: int = 0,
+    ship: dict | None = None,
 ) -> bytes:
     """Serialize the wire-visible fields of a minimal tClientCharacter."""
     payload = bytearray(_pack_str(client_address) + _pack_str(account))
@@ -478,7 +558,7 @@ def _default_client_character_payload(
         race,
         rank,
         1500,        # rating
-        0, 0, 0, 0, # prestige/disrepute totals
+        prestige, prestige, 0, 0, # current/total prestige and disrepute
         0xFFFFFFFF,  # mission slot
     )
     start_x, start_y = current_position or _campaign_start_for_race(race)
@@ -487,7 +567,7 @@ def _default_client_character_payload(
     payload += struct.pack("<ii", home_x, home_y)    # homeworld hex
     payload += struct.pack("<ii", *destination)
     if include_ship:
-        payload += struct.pack("<I", 1) + _ship_cache_payload(race)
+        payload += struct.pack("<I", 1) + _ship_cache_payload(race, ship)
     else:
         payload += struct.pack("<I", 0)
 
@@ -620,17 +700,39 @@ def _normalize_character_record(record: dict) -> dict:
             "flags": 0,
         },
     )
+    if "prestige" not in normalized:
+        normalized["prestige"] = _starting_prestige()
+    normalized.setdefault("officers", [])
+    normalized.setdefault("stores", {})
+    normalized.setdefault("refit", {})
+    normalized.setdefault("missions", [])
     return normalized
 
 
+def _starting_prestige(difficulty: int = 0) -> int:
+    """Load the server-kit starting balance; difficulty zero is the retail default."""
+    try:
+        source = find_structured_asset(
+            "ServerProfiles/Character.gf",
+            server_asset_root=SERVER_ASSET_ROOT,
+            retail_asset_root=ASSET_ROOT,
+        )
+    except FileNotFoundError:
+        return 200
+    values = parse_gf(source.path).get(f"Create/{difficulty}", {})
+    return max(0, int(values.get("StartingPrestige", 200)))
+
+
 def _save_character(
-    account: str, character_name: str, client_address: str, race: int
+    account: str, character_name: str, client_address: str, race: int,
+    verification_id: str = "",
 ) -> dict:
     characters = _load_characters()
     record = _normalize_character_record({
         "character_name": character_name,
         "client_address": client_address,
         "race": race,
+        **({"verification_id": verification_id} if verification_id else {}),
     })
     characters[account] = record
     CHARACTER_STORE_PATH.write_text(
@@ -649,6 +751,173 @@ def _write_character_record(account: str, record: dict) -> dict:
         encoding="utf-8",
     )
     return normalized
+
+
+def _update_character(account: str, mutate) -> dict:
+    """Apply one validated campaign mutation and persist the normalized result."""
+    characters = _load_characters()
+    if account not in characters:
+        raise ValueError("unknown character account")
+    record = _normalize_character_record(characters[account])
+    mutate(record)
+    return _write_character_record(account, record)
+
+
+def _purchase_officer(account: str, officer_id: int, *, station: int | None = None, cost: int = 14) -> dict:
+    """Purchase one currently generated officer without duplicating roster IDs."""
+    if cost < 0:
+        raise ValueError("officer cost cannot be negative")
+    def mutate(record: dict) -> None:
+        race = int(record["race"])
+        index = officer_id - 1000
+        names = _officer_names(race)[:_officer_review_limit()]
+        if not 0 <= index < len(names):
+            raise ValueError("officer is not in review")
+        if any(int(item["id"]) == officer_id for item in record["officers"]):
+            raise ValueError("officer is already assigned")
+        if int(record["prestige"]) < cost:
+            raise ValueError("insufficient prestige")
+        record["prestige"] -= cost
+        record["officers"].append({
+            "id": officer_id,
+            "name": names[index],
+            "station": int(station if station is not None else OFFICER_STATIONS[index % len(OFFICER_STATIONS)]),
+            "worth": cost,
+        })
+    return _update_character(account, mutate)
+
+
+def _purchase_supplies(account: str, *, shuttles: int = 0, marines: int = 0, mines: int = 0) -> dict:
+    """Persist Supply Dock quantities and deduct the server-kit unit prices."""
+    requested = {"shuttles": shuttles, "marines": marines, "mines": mines}
+    if any(not isinstance(value, int) or value < 0 for value in requested.values()):
+        raise ValueError("supply quantities must be non-negative integers")
+    def mutate(record: dict) -> None:
+        defaults = _character_ship_defaults(record)
+        maxima = {"shuttles": defaults["shuttles"][2], "marines": defaults["marines"][2], "mines": defaults["mines"][2]}
+        costs = {"shuttles": 4, "marines": 4, "mines": 4}
+        total = sum(requested[name] * costs[name] for name in requested)
+        if int(record["prestige"]) < total:
+            raise ValueError("insufficient prestige")
+        stores = record.setdefault("stores", {})
+        for name, amount in requested.items():
+            current = int(stores.get(name, defaults[name][0]))
+            if current + amount > maxima[name]:
+                raise ValueError(f"{name} exceeds ship capacity")
+        record["prestige"] -= total
+        for name, amount in requested.items():
+            stores[name] = int(stores.get(name, defaults[name][0])) + amount
+    return _update_character(account, mutate)
+
+
+def _save_refit(account: str, loadout_name: str, items: list[str], *, cost: int = 0) -> dict:
+    """Persist a client-selected retail loadout after resolving it from stock specs."""
+    if cost < 0 or not loadout_name or any(not isinstance(item, str) for item in items):
+        raise ValueError("invalid refit")
+    def mutate(record: dict) -> None:
+        if int(record["prestige"]) < cost:
+            raise ValueError("insufficient prestige")
+        root = ASSET_ROOT
+        if root is None:
+            raise RuntimeError("SFC3_ASSET_ROOT is required")
+        specs = root / "Specs"
+        if not specs.is_dir():
+            specs = root / "Spec"
+        defaults = _load_ship_defaults(specs / "DefaultCore.txt", specs / "DefaultLoadOut.txt", loadout_name)
+        record["prestige"] -= cost
+        record["ship"]["class_name"] = defaults["ui_name"]
+        record["ship"]["loadout_name"] = defaults["sub_name"]
+        record["ship"]["class_type"] = _ship_class_id(defaults["class_code"])
+        record["refit"] = {"loadout_name": defaults["sub_name"], "items": list(items)}
+    return _update_character(account, mutate)
+
+
+def _publish_news(text: str, *, channel: str = "system", priority: str = "med", turn: int | None = None) -> dict:
+    """Retain a bounded, persistent campaign news feed using News.gf's limit."""
+    if not text or len(text) > 2048:
+        raise ValueError("invalid news text")
+    source = find_structured_asset("ServerProfiles/News.gf", server_asset_root=SERVER_ASSET_ROOT, retail_asset_root=ASSET_ROOT)
+    limit = max(1, int(parse_gf(source.path).get("General", {}).get("MaximumItemsAtOnce", 30)))
+    state = _load_campaign_clock()
+    items = state.setdefault("news", [])
+    item = {"id": int(state.get("next_news_id", 1)), "turn": _campaign_turn() if turn is None else int(turn), "channel": channel, "priority": priority, "text": text}
+    state["next_news_id"] = item["id"] + 1
+    items.append(item)
+    del items[:-limit]
+    _write_campaign_state(state)
+    return item
+
+
+def _offer_mission(account: str, title: str, *, mission_type: str = "patrol", reward: int = 10) -> dict:
+    """Create the first persistent mission lifecycle independently of wire routing."""
+    if not title or reward < 0:
+        raise ValueError("invalid mission")
+    state = _load_campaign_clock()
+    mission = {"id": int(state.get("next_mission_id", 1)), "account": account, "title": title, "type": mission_type, "reward": reward, "status": "offered", "turn": _campaign_turn()}
+    state["next_mission_id"] = mission["id"] + 1
+    state.setdefault("missions", []).append(mission)
+    _write_campaign_state(state)
+    return mission
+
+
+def _set_mission_status(account: str, mission_id: int, status: str) -> dict:
+    allowed = {"accepted", "launched", "completed", "declined"}
+    if status not in allowed:
+        raise ValueError("invalid mission status")
+    state = _load_campaign_clock()
+    mission = next((item for item in state.setdefault("missions", []) if int(item["id"]) == mission_id and item["account"] == account), None)
+    if mission is None:
+        raise ValueError("unknown mission")
+    transitions = {"offered": {"accepted", "declined"}, "accepted": {"launched"}, "launched": {"completed"}}
+    if status not in transitions.get(mission["status"], set()):
+        raise ValueError("invalid mission transition")
+    mission["status"] = status
+    if status == "completed":
+        _update_character(account, lambda record: record.__setitem__("prestige", int(record["prestige"]) + int(mission["reward"])))
+    _write_campaign_state(state)
+    return dict(mission)
+
+
+def _verification_policy() -> str:
+    policy = os.environ.get("SFC3_CDKEY_POLICY", "permissive").strip().casefold()
+    if policy not in {"permissive", "registered", "strict"}:
+        raise ValueError("SFC3_CDKEY_POLICY must be permissive, registered, or strict")
+    return policy
+
+
+def _verification_identifier(private_identity: bytes) -> str:
+    """Return a non-reversible operator-local identity; never persist its source bytes."""
+    secret = os.environ.get("SFC3_IDENTITY_HMAC_SECRET", "")
+    if not secret:
+        raise RuntimeError("SFC3_IDENTITY_HMAC_SECRET is required outside permissive mode")
+    return hmac.new(secret.encode("utf-8"), private_identity, hashlib.sha256).hexdigest()
+
+
+def _verification_identity_bytes(request: bytes) -> bytes:
+    """Select the recovered identity field without decoding, logging, or storing it."""
+    offset_text = os.environ.get("SFC3_CDKEY_ID_OFFSET", "")
+    length_text = os.environ.get("SFC3_CDKEY_ID_LENGTH", "")
+    if not offset_text or not length_text:
+        if _verification_policy() == "permissive":
+            return request[13:]
+        raise RuntimeError(
+            "registered/strict CD-key policy requires SFC3_CDKEY_ID_OFFSET and SFC3_CDKEY_ID_LENGTH"
+        )
+    offset, length = int(offset_text), int(length_text)
+    if offset < 13 or length <= 0 or offset + length > len(request):
+        raise ValueError("configured CD-key identity field is outside the verification request")
+    return request[offset : offset + length]
+
+
+def _verification_allowed(private_identity: bytes) -> bool:
+    policy = _verification_policy()
+    if policy == "permissive":
+        return bool(private_identity)
+    identifier = _verification_identifier(private_identity)
+    registered = {value.strip().casefold() for value in os.environ.get("SFC3_REGISTERED_KEY_IDS", "").split(",") if value.strip()}
+    if policy == "registered":
+        return bool(identifier)
+    return identifier in registered
 
 
 def _parse_move_request(payload: bytes) -> tuple[tuple[int, int, int], int, tuple[int, int]]:
@@ -978,10 +1247,11 @@ def _full_ship_payload(
     )
 
 
-def _supply_dock_payload(race: int, asset_root: Path | None = None) -> bytes:
+def _supply_dock_payload(race: int, asset_root: Path | None = None, *, record: dict | None = None) -> bytes:
     """Build tGetSupplyDockInfoReq::tRep from installed defaults, never capture data."""
-    defaults = _starter_ship_defaults(race, asset_root)
-    _class_name, ship_name, _class_type = _starting_ship_for_race(race)
+    defaults = _character_ship_defaults(record, asset_root) if record else _starter_ship_defaults(race, asset_root)
+    _class_name, starter_name, _class_type = _starting_ship_for_race(race)
+    ship_name = str(record["ship"].get("name", starter_name)) if record else starter_name
     ship = _full_ship_payload(race=race, ship_name=ship_name, defaults=defaults)
     return (
         b"\x01"
@@ -1008,9 +1278,10 @@ def _character_ship_config_payload(
     ship_id: int = SHIP_DATABASE_ID,
     economic_scalar: float = 1.0,
     prestige: int = 0,
+    record: dict | None = None,
 ) -> bytes:
     """Build tGetCharacterShipConfigReq::tRep from installed starter defaults."""
-    defaults = _starter_ship_defaults(race, asset_root)
+    defaults = _character_ship_defaults(record, asset_root) if record else _starter_ship_defaults(race, asset_root)
     tng_ship = _tng_ship_payload(
         _default_ship_core_payload(defaults), defaults["loadout_fields"]
     )
@@ -1031,15 +1302,35 @@ def _parse_officers_to_review_request(
     return _parse_callback(payload), struct.unpack_from("<I", payload, 12)[0]
 
 
+def _parse_purchase_officers_request(
+    payload: bytes,
+) -> tuple[tuple[int, int, int], int, dict[int, int]]:
+    """Parse channel 39: callback, character ID, map<officer ID, station>."""
+    if len(payload) < 21 or payload[0] != 1:
+        raise ValueError("truncated purchase-officers request")
+    callback = _parse_async_return(payload)
+    character_id, count = struct.unpack_from("<II", payload, 13)
+    if len(payload) != 21 + count * 8:
+        raise ValueError("invalid purchase-officers map length")
+    assignments = {
+        officer_id: station
+        for officer_id, station in struct.iter_unpack("<II", payload[21:])
+    }
+    if len(assignments) != count:
+        raise ValueError("duplicate officer ID")
+    return callback, character_id, assignments
+
+
 def _officers_to_review_payload(
     race: int,
     asset_root: Path | None = None,
     *,
     prestige: int = 0,
     economic_scalar: float = 1.0,
+    record: dict | None = None,
 ) -> bytes:
     """Build tGetOfficersToReviewReq::tRep from server-kit officer rules."""
-    defaults = _starter_ship_defaults(race, asset_root)
+    defaults = _character_ship_defaults(record, asset_root) if record else _starter_ship_defaults(race, asset_root)
     tng_ship = _tng_ship_payload(
         _default_ship_core_payload(defaults), defaults["loadout_fields"]
     )
@@ -1177,22 +1468,32 @@ def _auction_item_payload(
     ship_id: int,
     bid_factor: float,
     turns_until_close: int,
+    current_turn: int = 0,
+    current_bid: int | None = None,
+    bid_owner_id: int = 0,
+    turn_bid_made: int = 0,
+    bid_maximum: int = 0,
+    escrow: int = 0,
+    bidding_started: bool = False,
+    closing: bool = False,
 ) -> bytes:
     """Serialize tAuctionItem in the recovered ServerPlatform StreamOut order."""
     rating = int(defaults["hull_cost"])
-    current_bid = max(1, int(rating * bid_factor))
+    minimum_bid = max(1, int(rating * bid_factor))
+    displayed_bid = minimum_bid if current_bid is None else int(current_bid)
+    turn_to_close = (turn_bid_made + turns_until_close) if bidding_started else (current_turn + turns_until_close)
     return (
         struct.pack("<II", auction_id, 0)       # tDatabaseObject
-        + b"\x00"                               # bidding has begun
+        + bytes((int(bidding_started),))
         # The client passes this description directly to Vessel Library.
         + _pack_str(defaults["ui_name"])
         + struct.pack("<I", ship_id)           # item ID
         + struct.pack("<II", rating, rating)
-        + struct.pack("<dII", bid_factor, 0, turns_until_close)
-        + b"\x00"                               # closing
-        + struct.pack("<I", current_bid)
-        + struct.pack("<I", 0)                 # hidden/no bid owner
-        + struct.pack("<III", 0, 0, 0)         # bid turn, maximum, escrow
+        + struct.pack("<dII", bid_factor, current_turn, turn_to_close)
+        + bytes((int(closing),))
+        + struct.pack("<I", displayed_bid)
+        + struct.pack("<I", bid_owner_id)
+        + struct.pack("<III", turn_bid_made, bid_maximum, escrow)
         + struct.pack("<I", 1)                 # item-detail map
         + _pack_str("IsBase")
         + _pack_str("No")
@@ -1214,14 +1515,24 @@ def _parse_get_auction_ships_request(
     return callback, character_id, scalar, modifiers
 
 
-def _auction_ships_payload(race: int, asset_root: Path | None = None) -> bytes:
+def _auction_ships_payload(
+    race: int,
+    asset_root: Path | None = None,
+    *,
+    now: float | None = None,
+) -> bytes:
     """Build the client shipyard catalog from stock specs and kit economy rules."""
     bid_factor, turns_until_close, limit = _economy_ship_auction_settings()
     ships = _shipyard_defaults(race, asset_root)[:limit]
+    _settle_shipyard_bids(now=now)
+    current_turn = _campaign_turn(now)
+    state = _load_campaign_clock(now)
+    auctions = state.get("auctions", {})
     entries = []
     for index, defaults in enumerate(ships):
         auction_id = AUCTION_DATABASE_ID_BASE + index
         ship_id = AUCTION_DATABASE_ID_BASE + 1000 + index
+        saved = auctions.get(str(ship_id), {})
         entries.append(
             # The stock database routine indexes this map by GetItemID(), not
             # by the tAuctionItem database object's own ID. The client uses
@@ -1233,11 +1544,158 @@ def _auction_ships_payload(race: int, asset_root: Path | None = None) -> bytes:
                 ship_id=ship_id,
                 bid_factor=bid_factor,
                 turns_until_close=turns_until_close,
+                current_turn=current_turn,
+                current_bid=saved.get("current_bid"),
+                bid_owner_id=CHARACTER_DATABASE_ID if saved.get("bid_owner") else 0,
+                turn_bid_made=int(saved.get("turn_bid_made", 0)),
+                bid_maximum=int(saved.get("bid_maximum", 0)),
+                escrow=int(saved.get("escrow", 0)),
+                bidding_started=bool(saved.get("bid_owner")),
+                closing=bool(saved.get("closing", False)),
             )
         )
     # Unlike the IPL panel replies, this stored-procedure response inherits
     # nSwitch::tResponse, whose success value is serialized as an unsigned long.
     return struct.pack("<II", 1, len(entries)) + b"".join(entries)
+
+
+def _parse_bid_request(
+    payload: bytes,
+) -> tuple[tuple[int, int, int], int, int, int, int, float, tuple[float, ...]]:
+    """Parse nStoredProcedureArguments::tBidRequest for Economy channel 3."""
+    if len(payload) < 41 or payload[0] != 1:
+        raise ValueError("truncated Shipyard bid request")
+    callback = _parse_async_return(payload)
+    auction_item_id, bidder_id, bid_mode, value = struct.unpack_from("<IIII", payload, 13)
+    maximum_bid, modifier_count = struct.unpack_from("<dI", payload, 29)
+    expected = 41 + modifier_count * 4
+    if len(payload) != expected:
+        raise ValueError("invalid Shipyard bid request length")
+    modifiers = (
+        struct.unpack_from(f"<{modifier_count}f", payload, 41) if modifier_count else ()
+    )
+    return callback, auction_item_id, bidder_id, bid_mode, value, maximum_bid, modifiers
+
+
+def _place_shipyard_bid(
+    race: int,
+    account: str,
+    ship_id: int,
+    maximum_bid: int,
+    *,
+    now: float | None = None,
+) -> tuple[bytes, int]:
+    """Persist one proxy-style maximum bid and return updated item/result."""
+    ships = _shipyard_defaults(race)
+    index = ship_id - (AUCTION_DATABASE_ID_BASE + 1000)
+    if index < 0 or index >= len(ships):
+        raise ValueError("unknown Shipyard item ID")
+    defaults = ships[index]
+    bid_factor, turns_until_close, _limit = _economy_ship_auction_settings()
+    current_turn = _campaign_turn(now)
+    state = _load_campaign_clock(now)
+    auctions = state.setdefault("auctions", {})
+    saved = dict(auctions.get(str(ship_id), {}))
+    minimum = max(1, int(defaults["hull_cost"] * bid_factor))
+    current = int(saved.get("current_bid", minimum))
+    prior_owner = str(saved.get("bid_owner", ""))
+    prior_maximum = int(saved.get("bid_maximum", 0))
+    if (prior_owner and maximum_bid <= current) or (not prior_owner and maximum_bid < minimum):
+        result = 0
+    elif prior_owner and prior_owner != account and maximum_bid < prior_maximum:
+        saved["current_bid"] = maximum_bid + 1
+        auctions[str(ship_id)] = saved
+        _write_campaign_state(state)
+        result = 1
+    else:
+        displaced_maximum = prior_maximum if prior_owner and prior_owner != account else 0
+        saved.update(
+            current_bid=(
+                minimum
+                if not prior_owner
+                else min(maximum_bid, max(current + 1, prior_maximum + 1))
+            ),
+            bid_owner=account,
+            turn_bid_made=current_turn,
+            bid_maximum=maximum_bid,
+            escrow=maximum_bid,
+            closing=False,
+        )
+        auctions[str(ship_id)] = saved
+        _write_campaign_state(state)
+        prior_maximum = displaced_maximum
+        result = 2
+    item = _auction_item_payload(
+        defaults,
+        auction_id=AUCTION_DATABASE_ID_BASE + index,
+        ship_id=ship_id,
+        bid_factor=bid_factor,
+        turns_until_close=turns_until_close,
+        current_turn=current_turn,
+        current_bid=saved.get("current_bid", current),
+        bid_owner_id=CHARACTER_DATABASE_ID if saved.get("bid_owner") else 0,
+        turn_bid_made=int(saved.get("turn_bid_made", 0)),
+        bid_maximum=int(saved.get("bid_maximum", 0)),
+        escrow=int(saved.get("escrow", 0)),
+        bidding_started=bool(saved.get("bid_owner")),
+    )
+    # success, updated auction, displaced bidder, bid result, released escrow
+    return struct.pack("<I", 1) + item + struct.pack("<III", 0, result, prior_maximum), result
+
+
+def _settle_shipyard_bids(*, now: float | None = None) -> tuple[dict, ...]:
+    """Close due auctions and atomically award their ships to stored characters."""
+    current_turn = _campaign_turn(now)
+    _factor, turns_until_close, _limit = _economy_ship_auction_settings()
+    state = _load_campaign_clock(now)
+    auctions = state.setdefault("auctions", {})
+    characters = _load_characters()
+    settlements = state.setdefault("auction_settlements", [])
+    completed = []
+    for ship_id_text, bid in list(auctions.items()):
+        owner = str(bid.get("bid_owner", ""))
+        if not owner or current_turn < int(bid.get("turn_bid_made", 0)) + turns_until_close:
+            continue
+        record = characters.get(owner)
+        if record is None:
+            del auctions[ship_id_text]
+            continue
+        ship_id = int(ship_id_text)
+        catalog = _shipyard_defaults(int(record["race"]))
+        index = ship_id - (AUCTION_DATABASE_ID_BASE + 1000)
+        if not 0 <= index < len(catalog):
+            del auctions[ship_id_text]
+            continue
+        defaults = catalog[index]
+        price = int(bid.get("current_bid", defaults["hull_cost"]))
+        record["prestige"] = max(0, int(record.get("prestige", 0)) - price)
+        record["ship"] = {
+            "id": SHIP_DATABASE_ID,
+            "class_name": defaults["ui_name"],
+            "loadout_name": defaults["sub_name"],
+            "name": str(record.get("ship", {}).get("name", "USS Venture")),
+            "class_type": _ship_class_id(defaults["class_code"]),
+            "bpv": int(defaults["hull_cost"]),
+            "damage": 1.0,
+            "flags": 0,
+        }
+        characters[owner] = _normalize_character_record(record)
+        settlement = {
+            "account": owner,
+            "ship_id": ship_id,
+            "class_name": defaults["ui_name"],
+            "price": price,
+            "turn": current_turn,
+        }
+        settlements.append(settlement)
+        completed.append(settlement)
+        del auctions[ship_id_text]
+    if completed:
+        CHARACTER_STORE_PATH.write_text(
+            json.dumps(characters, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        _write_campaign_state(state)
+    return tuple(completed)
 
 
 def _parse_ids(value: str, prefix: str) -> tuple[int, ...]:
@@ -1311,6 +1769,24 @@ def _starter_ship_defaults(race: int, asset_root: Path | None = None) -> dict:
     )
 
 
+def _character_ship_defaults(record: dict, asset_root: Path | None = None) -> dict:
+    """Resolve the persisted loadout, falling back to the race's starter ship."""
+    record = _normalize_character_record(record)
+    root = asset_root or ASSET_ROOT
+    if root is None:
+        raise RuntimeError("SFC3_ASSET_ROOT must point to the installed SFC3 Assets directory")
+    specs = root / "Specs"
+    if not specs.is_dir():
+        specs = root / "Spec"
+    model_name = str(record["ship"].get("loadout_name") or record["ship"]["class_name"])
+    try:
+        return _load_ship_defaults(
+            specs / "DefaultCore.txt", specs / "DefaultLoadOut.txt", model_name
+        )
+    except ValueError:
+        return _starter_ship_defaults(int(record["race"]), root)
+
+
 def _stored_character_payload(account: str, record: dict) -> bytes:
     record = _normalize_character_record(record)
     return b"\x01" + _default_client_character_payload(
@@ -1323,6 +1799,8 @@ def _stored_character_payload(account: str, record: dict) -> bytes:
         current_position=tuple(record["position"]),
         homeworld=tuple(record["homeworld"]),
         destination=tuple(record["destination"]),
+        prestige=int(record["prestige"]),
+        ship=record["ship"],
     ) + struct.pack("<I", 0)
 
 
@@ -1557,6 +2035,7 @@ class DynamicSecurityClient:
         self.sw_id = random.randint(1, 0xFFFFFFFE)
         self.current_character = None
         self.current_record = None
+        self.verification_id = ""
         self.player_relay_address = None
         self.viewport_relay_address = None
 
@@ -1652,6 +2131,17 @@ class DynamicSecurityClient:
             manifest_count,
         )
 
+        identity = _verification_identity_bytes(verification)
+        if not _verification_allowed(identity):
+            self.writer.write(_nswitch_frame(
+                verify_return[0], verify_return[1], verify_return[2], struct.pack("<I", 0)
+            ))
+            await self.writer.drain()
+            self._log("warning", "-> security check rejected by configured CD-key policy")
+            return
+        if _verification_policy() != "permissive":
+            self.verification_id = _verification_identifier(identity)
+
         self.writer.write(_nswitch_frame(
             verify_return[0],
             verify_return[1],
@@ -1693,6 +2183,16 @@ class DynamicSecurityClient:
         )
 
         stored_character = _load_characters().get(account)
+        if (
+            stored_character is not None
+            and self.verification_id
+            and stored_character.get("verification_id") not in (None, self.verification_id)
+        ):
+            self._log("warning", "verification identity does not match account binding")
+            return
+        if stored_character is not None and self.verification_id and not stored_character.get("verification_id"):
+            stored_character["verification_id"] = self.verification_id
+            stored_character = _write_character_record(account, stored_character)
         if stored_character is None:
             character_reply = _character_not_found_payload()
         else:
@@ -1840,7 +2340,9 @@ class DynamicSecurityClient:
                     response = b"\x00"
                 else:
                     try:
-                        response = _supply_dock_payload(self.current_character[3])
+                        response = _supply_dock_payload(
+                            self.current_character[3], record=self.current_record
+                        )
                     except (OSError, RuntimeError, ValueError) as exc:
                         self._log("warning", "Supply Dock defaults unavailable: %s", exc)
                         response = b"\x00"
@@ -1866,6 +2368,56 @@ class DynamicSecurityClient:
                 await self.writer.drain()
                 self._log("info", "-> retail shipyard auction catalog")
                 continue
+            if (sw, obj, ch) == (0, 19, 3):
+                (
+                    callback,
+                    ship_id,
+                    bidder_id,
+                    _bid_mode,
+                    _value,
+                    maximum_bid,
+                    _modifiers,
+                ) = _parse_bid_request(payload)
+                if (
+                    bidder_id != CHARACTER_DATABASE_ID
+                    or self.current_character is None
+                ):
+                    response = struct.pack("<I", 0)
+                else:
+                    try:
+                        response, result = _place_shipyard_bid(
+                            self.current_character[3],
+                            self.current_character[0],
+                            ship_id,
+                            int(maximum_bid),
+                        )
+                    except (KeyError, OSError, RuntimeError, ValueError) as exc:
+                        self._log("warning", "Shipyard bid rejected: %s", exc)
+                        response = struct.pack("<I", 0)
+                        result = 0
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> Shipyard bid result=%d", result)
+                continue
+            if (sw, obj, ch) == (0, 6, 28):
+                callback = _parse_callback(payload)
+                if len(payload) != 16:
+                    raise ValueError("invalid open-Shipyard-bids request length")
+                # tGetCharacterOpenBidShipIDsReq::tRep: success plus vector<tID>.
+                account = self.current_character[0] if self.current_character else ""
+                state = _load_campaign_clock()
+                open_ids = tuple(
+                    int(ship_id)
+                    for ship_id, bid in state.get("auctions", {}).items()
+                    if bid.get("bid_owner") == account and not bid.get("closing", False)
+                )
+                response = b"\x01" + struct.pack("<I", len(open_ids)) + b"".join(
+                    struct.pack("<I", ship_id) for ship_id in open_ids
+                )
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> %d open Shipyard bid IDs", len(open_ids))
+                continue
             if (sw, obj, ch) == (0, 6, 20):
                 callback, character_id, _for_update = (
                     _parse_character_ship_config_request(payload)
@@ -1874,7 +2426,11 @@ class DynamicSecurityClient:
                     response = b"\x00"
                 else:
                     try:
-                        response = _character_ship_config_payload(self.current_character[3])
+                        response = _character_ship_config_payload(
+                            self.current_character[3],
+                            prestige=int(self.current_record.get("prestige", 0)),
+                            record=self.current_record,
+                        )
                     except (OSError, RuntimeError, ValueError) as exc:
                         self._log("warning", "Ship config defaults unavailable: %s", exc)
                         response = b"\x00"
@@ -1888,13 +2444,33 @@ class DynamicSecurityClient:
                     response = b"\x00"
                 else:
                     try:
-                        response = _officers_to_review_payload(self.current_character[3])
+                        response = _officers_to_review_payload(
+                            self.current_character[3],
+                            prestige=int(self.current_record.get("prestige", 0)),
+                            record=self.current_record,
+                        )
                     except (OSError, RuntimeError, ValueError) as exc:
                         self._log("warning", "Officer-review defaults unavailable: %s", exc)
                         response = b"\x00"
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
                 self._log("info", "-> server-kit officer review with current ship config")
+                continue
+            if (sw, obj, ch) == (0, 6, 39):
+                callback, character_id, assignments = _parse_purchase_officers_request(payload)
+                response = b"\x00"
+                if character_id == CHARACTER_DATABASE_ID and self.current_character is not None:
+                    try:
+                        for officer_id, station in assignments.items():
+                            self.current_record = _purchase_officer(
+                                self.current_character[0], officer_id, station=station
+                            )
+                        response = b"\x01"
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        self._log("warning", "Officer purchase rejected: %s", exc)
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> officer purchase result=%d", response[0])
                 continue
             if (sw, obj, ch) == (0, 40, 41):
                 callback, _character_id, destination = _parse_move_request(payload)
@@ -2023,6 +2599,7 @@ class DynamicSecurityClient:
                     character_name,
                     create_address,
                     race,
+                    self.verification_id,
                 )
                 self._log(
                     "info",
