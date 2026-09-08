@@ -129,6 +129,25 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 self.assertTrue(server._verification_allowed(b"identity"))
                 self.assertFalse(server._verification_allowed(b"different"))
 
+    def test_verification_identity_excludes_challenges(self):
+        envelope = b"\x01" + struct.pack("<III", 9, 8, 7)
+        character = server._default_client_character_payload(include_ship=False)
+        def request(challenge: str) -> bytes:
+            blob = b"stable-private-proof"
+            return (
+                envelope + struct.pack("<I", 0) + server._pack_str("reply-" + challenge)
+                + character + server._pack_str(challenge) + server._pack_str("login")
+                + b"\x01\x00" + struct.pack("<I", len(blob)) + blob
+            )
+        first = server._parse_verification_request(request("one"))
+        self.assertEqual(first["access_name"], "login")
+        self.assertEqual(first["access_blob"], b"stable-private-proof")
+        with mock.patch.dict(server.os.environ, {"SFC3_CDKEY_POLICY": "registered"}, clear=False):
+            self.assertEqual(
+                server._verification_identity_bytes(request("one")),
+                server._verification_identity_bytes(request("two")),
+            )
+
     def test_mission_lifecycle_is_persistent(self):
         old_campaign = server.CAMPAIGN_STATE_PATH
         old_characters = server.CHARACTER_STORE_PATH
@@ -195,6 +214,36 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual(server._parse_news_request(request), ((9, 8, 7), 1))
         self.assertEqual(server._news_response_payload(), struct.pack("<II", 1, 0))
 
+    def test_news_story_response_uses_server_profile_color(self):
+        old_server_root = server.SERVER_ASSET_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                profile = root / "ServerProfiles"
+                profile.mkdir()
+                (profile / "News.gf").write_text(
+                    "[General]\nMaximumItemsAtOnce=30\n"
+                    "[Channel/Color/System/Med]\nRed=0.5\nGreen=0.25\nBlue=1.0\n",
+                    encoding="ascii",
+                )
+                server.SERVER_ASSET_ROOT = root
+                item = {
+                    "id": 12, "text": "Campaign online", "channel": "system",
+                    "priority": "med", "timestamp": 100, "sequence": 4,
+                }
+                payload = server._news_response_payload((item,))
+                self.assertEqual(struct.unpack_from("<II", payload), (1, 1))
+                self.assertEqual(struct.unpack_from("<II", payload, 8), (12, 0))
+                self.assertEqual(payload[16:19], bytes((3, 3, 0)))
+                count = struct.unpack_from("<I", payload, 19)[0]
+                self.assertEqual(count, 1)
+                text_length = struct.unpack_from("<I", payload, 23)[0]
+                self.assertEqual(payload[27 : 27 + text_length], b"Campaign online")
+                tail = 27 + text_length
+                self.assertEqual(struct.unpack_from("<iiI", payload, tail), (100, 4, 0xFF4080))
+        finally:
+            server.SERVER_ASSET_ROOT = old_server_root
+
     def test_mission_match_request_shapes(self):
         envelope = b"\x01" + struct.pack("<III", 9, 8, 7)
         self.assertEqual(
@@ -205,6 +254,20 @@ class DynamicSecurityWireTests(unittest.TestCase):
             server._parse_verify_mission_request(envelope + struct.pack("<I", 1)),
             ((9, 8, 7), 1),
         )
+
+    def test_choose_mission_request_shape(self):
+        envelope = b"\x01" + struct.pack("<III", 9, 8, 7)
+        hail = server._pack_str_vector(("Patrol this sector",)) + struct.pack("<II", 44, 2) + b"\x01"
+        battle = struct.pack("<I", 3) + hail + struct.pack("<IIIIII", 10, 11, 12, 13, 14, 15) + struct.pack("<d", 2.5) + b"\x01"
+        callback, character_id, decoded = server._parse_choose_mission_request(
+            envelope + struct.pack("<I", server.CHARACTER_DATABASE_ID) + battle
+        )
+        self.assertEqual((callback, character_id), ((9, 8, 7), server.CHARACTER_DATABASE_ID))
+        self.assertEqual(decoded["state"], 3)
+        self.assertEqual(decoded["hail"]["texts"], ["Patrol this sector"])
+        self.assertEqual(decoded["fields"], (10, 11, 12, 13, 14, 15))
+        self.assertEqual(decoded["rating"], 2.5)
+        self.assertTrue(decoded["enabled"])
 
     def test_clock_snapshot_shape(self):
         old_path = server.CAMPAIGN_STATE_PATH

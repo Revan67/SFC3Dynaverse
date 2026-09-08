@@ -843,7 +843,14 @@ def _publish_news(text: str, *, channel: str = "system", priority: str = "med", 
     limit = max(1, int(parse_gf(source.path).get("General", {}).get("MaximumItemsAtOnce", 30)))
     state = _load_campaign_clock()
     items = state.setdefault("news", [])
-    item = {"id": int(state.get("next_news_id", 1)), "turn": _campaign_turn() if turn is None else int(turn), "channel": channel, "priority": priority, "text": text}
+    item = {
+        "id": int(state.get("next_news_id", 1)),
+        "turn": _campaign_turn() if turn is None else int(turn),
+        "timestamp": int(time.time()),
+        "channel": channel,
+        "priority": priority,
+        "text": text,
+    }
     state["next_news_id"] = item["id"] + 1
     items.append(item)
     del items[:-limit]
@@ -858,9 +865,43 @@ def _parse_news_request(payload: bytes) -> tuple[tuple[int, int, int], int]:
     return _parse_async_return(payload), struct.unpack_from("<I", payload, 13)[0]
 
 
-def _news_response_payload() -> bytes:
-    """Return a valid empty tGetNewsResponse until tNewsStory is fully validated."""
-    return struct.pack("<II", 1, 0)
+NEWS_CATEGORIES = {"system": 0, "empire": 1, "player": 2, "playerspecific": 2}
+NEWS_PRIORITIES = {"ultra": 0, "top": 1, "high": 2, "med": 3, "low": 4, "verylow": 5}
+
+
+def _news_color(channel: str, priority: str) -> int:
+    source = find_structured_asset(
+        "ServerProfiles/News.gf",
+        server_asset_root=SERVER_ASSET_ROOT,
+        retail_asset_root=ASSET_ROOT,
+    )
+    channel_name = {"system": "System", "empire": "Empire", "player": "PlayerSpecific", "playerspecific": "PlayerSpecific"}.get(channel.casefold(), "System")
+    priority_name = {"ultra": "Ultra", "top": "Top", "high": "High", "med": "Med", "low": "Low", "verylow": "VeryLow"}.get(priority.casefold(), "Med")
+    values = parse_gf(source.path).get(f"Channel/Color/{channel_name}/{priority_name}", {})
+    components = [max(0, min(255, round(float(values.get(name, 0.75)) * 255))) for name in ("Red", "Green", "Blue")]
+    return components[0] | components[1] << 8 | components[2] << 16
+
+
+def _news_story_payload(item: dict) -> bytes:
+    """Serialize tNewsStory in recovered field order."""
+    timestamp = int(item.get("timestamp", item.get("turn", 0)))
+    sequence = int(item.get("sequence", item["id"]))
+    channel = str(item.get("channel", "system")).casefold()
+    priority = str(item.get("priority", "med")).casefold()
+    return (
+        struct.pack("<II", int(item["id"]), 0)
+        + bytes((int(item.get("persistence", 3)), NEWS_PRIORITIES.get(priority, 3), NEWS_CATEGORIES.get(channel, 0)))
+        + _pack_str_vector((str(item["text"]),))
+        + struct.pack("<iiI", timestamp, sequence, _news_color(channel, priority))
+    )
+
+
+def _news_response_payload(items=()) -> bytes:
+    """Serialize tGetNewsResponse as success plus list<tNewsStory>."""
+    items = tuple(items)
+    return struct.pack("<II", 1, len(items)) + b"".join(
+        _news_story_payload(item) for item in items
+    )
 
 
 def _offer_mission(account: str, title: str, *, mission_type: str = "patrol", reward: int = 10) -> dict:
@@ -887,6 +928,55 @@ def _parse_verify_mission_request(payload: bytes) -> tuple[tuple[int, int, int],
     if len(payload) != 17 or payload[0] != 1:
         raise ValueError("invalid verify-mission request")
     return _parse_async_return(payload), struct.unpack_from("<I", payload, 13)[0]
+
+
+def _parse_battle_item(payload: bytes, offset: int) -> tuple[dict, int]:
+    """Parse tBattleItem using the recovered retail StreamIn field order."""
+    if offset + 4 > len(payload):
+        raise ValueError("truncated battle state")
+    state = struct.unpack_from("<I", payload, offset)[0]
+    offset += 4
+    if offset + 4 > len(payload):
+        raise ValueError("truncated hail idiom")
+    text_count = struct.unpack_from("<I", payload, offset)[0]
+    offset += 4
+    texts = []
+    for _ in range(text_count):
+        value, offset = _unpack_string(payload, offset)
+        texts.append(value)
+    # tHail: tIdiom, tID, unsigned long, bool.
+    if offset + 9 > len(payload):
+        raise ValueError("truncated hail")
+    hail_id, hail_type = struct.unpack_from("<II", payload, offset)
+    hail_human = payload[offset + 8] != 0
+    offset += 9
+    # Remaining tBattleItem fields: six unsigned longs, double, bool.
+    if offset + 33 > len(payload):
+        raise ValueError("truncated battle item")
+    fields = struct.unpack_from("<IIIIII", payload, offset)
+    offset += 24
+    rating = struct.unpack_from("<d", payload, offset)[0]
+    offset += 8
+    enabled = payload[offset] != 0
+    offset += 1
+    return {
+        "state": state,
+        "hail": {"texts": texts, "id": hail_id, "type": hail_type, "human": hail_human},
+        "fields": fields,
+        "rating": rating,
+        "enabled": enabled,
+    }, offset
+
+
+def _parse_choose_mission_request(payload: bytes) -> tuple[tuple[int, int, int], int, dict]:
+    """Parse MissionMatcher channel 12: callback, character ID, tBattleItem."""
+    if len(payload) < 17 or payload[0] != 1:
+        raise ValueError("invalid choose-mission request")
+    character_id = struct.unpack_from("<I", payload, 13)[0]
+    battle, offset = _parse_battle_item(payload, 17)
+    if offset != len(payload):
+        raise ValueError("trailing choose-mission data")
+    return _parse_async_return(payload), character_id, battle
 
 
 def _set_mission_status(account: str, mission_id: int, status: str) -> dict:
@@ -923,19 +1013,94 @@ def _verification_identifier(private_identity: bytes) -> str:
 
 
 def _verification_identity_bytes(request: bytes) -> bytes:
-    """Select the recovered identity field without decoding, logging, or storing it."""
+    """Select the stable access package, excluding per-session challenges."""
     offset_text = os.environ.get("SFC3_CDKEY_ID_OFFSET", "")
     length_text = os.environ.get("SFC3_CDKEY_ID_LENGTH", "")
-    if not offset_text or not length_text:
+    if offset_text and length_text:
+        offset, length = int(offset_text), int(length_text)
+        if offset < 13 or length <= 0 or offset + length > len(request):
+            raise ValueError("configured CD-key identity field is outside the verification request")
+        return request[offset : offset + length]
+    try:
+        parsed = _parse_verification_request(request)
+    except ValueError:
         if _verification_policy() == "permissive":
             return request[13:]
-        raise RuntimeError(
-            "registered/strict CD-key policy requires SFC3_CDKEY_ID_OFFSET and SFC3_CDKEY_ID_LENGTH"
-        )
-    offset, length = int(offset_text), int(length_text)
-    if offset < 13 or length <= 0 or offset + length > len(request):
-        raise ValueError("configured CD-key identity field is outside the verification request")
-    return request[offset : offset + length]
+        raise
+    return (
+        parsed["access_name"].encode("ascii")
+        + bytes((parsed["access_success"], parsed["access_flag"]))
+        + parsed["access_blob"]
+    )
+
+
+def _skip_client_character(payload: bytes, offset: int) -> int:
+    """Skip the tClientCharacter embedded in a verification request."""
+    _value, offset = _unpack_string(payload, offset)  # client address
+    _value, offset = _unpack_string(payload, offset)  # account
+    if offset + 4 > len(payload):
+        raise ValueError("truncated verification character ID")
+    offset += 4
+    _value, offset = _unpack_string(payload, offset)  # character name
+    offset += 8 * 4 + 6 * 4
+    if offset + 4 > len(payload):
+        raise ValueError("truncated verification ship-cache count")
+    ship_count = struct.unpack_from("<I", payload, offset)[0]
+    offset += 4
+    for _ in range(ship_count):
+        offset += 3 * 4
+        _value, offset = _unpack_string(payload, offset)
+        offset += 4
+        _value, offset = _unpack_string(payload, offset)
+        offset += 4
+    # tMetaMapHex plus vector<medal>, AI flag, fleet flag.
+    offset += 62
+    if offset + 4 > len(payload):
+        raise ValueError("truncated verification medal count")
+    medal_count = struct.unpack_from("<I", payload, offset)[0]
+    offset += 4 + medal_count * 4 + 2
+    if offset > len(payload):
+        raise ValueError("truncated verification character")
+    return offset
+
+
+def _parse_verification_request(request: bytes) -> dict:
+    """Parse tVerifyClientRequest using the recovered StreamOut member order."""
+    if len(request) < 17 or request[0] != 1:
+        raise ValueError("invalid verification request")
+    callback = _parse_async_return(request)
+    offset = 13
+    manifest_count = struct.unpack_from("<I", request, offset)[0]
+    offset += 4
+    for _ in range(manifest_count):
+        _path, offset = _unpack_string(request, offset)
+        if offset + 4 > len(request):
+            raise ValueError("truncated verification checksum vector")
+        checksum_count = struct.unpack_from("<I", request, offset)[0]
+        offset += 4 + checksum_count * 4
+        if offset > len(request):
+            raise ValueError("truncated verification checksums")
+    challenge_reply, offset = _unpack_string(request, offset)
+    offset = _skip_client_character(request, offset)
+    challenge, offset = _unpack_string(request, offset)
+    access_name, offset = _unpack_string(request, offset)
+    if offset + 6 > len(request):
+        raise ValueError("truncated access package")
+    access_success, access_flag = request[offset], request[offset + 1]
+    blob_length = struct.unpack_from("<I", request, offset + 2)[0]
+    offset += 6
+    if offset + blob_length != len(request):
+        raise ValueError("invalid access-package blob length")
+    return {
+        "callback": callback,
+        "manifest_count": manifest_count,
+        "challenge_reply": challenge_reply,
+        "challenge": challenge,
+        "access_name": access_name,
+        "access_success": access_success,
+        "access_flag": access_flag,
+        "access_blob": request[offset:],
+    }
 
 
 def _verification_allowed(private_identity: bytes) -> bool:
@@ -2636,14 +2801,15 @@ class DynamicSecurityClient:
                 continue
             if (sw, obj, ch) == (0, 27, 2):
                 callback, character_id = _parse_news_request(payload)
-                response = (
-                    _news_response_payload()
-                    if character_id == CHARACTER_DATABASE_ID and self.current_character is not None
-                    else struct.pack("<I", 0)
-                )
+                stories = ()
+                if character_id == CHARACTER_DATABASE_ID and self.current_character is not None:
+                    stories = tuple(_load_campaign_clock().get("news", ()))
+                    response = _news_response_payload(stories)
+                else:
+                    response = struct.pack("<I", 0)
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
-                self._log("info", "-> News request (%d serialized stories)", 0)
+                self._log("info", "-> News request (%d serialized stories)", len(stories))
                 continue
             if (sw, obj, ch) == (0, 24, 10):
                 callback, character_id, match_mode = _parse_mission_match_request(payload)
@@ -2678,6 +2844,28 @@ class DynamicSecurityClient:
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
                 self._log("info", "-> mission-choice eligibility response")
+                continue
+            if (sw, obj, ch) == (0, 24, 12):
+                callback, character_id, battle = _parse_choose_mission_request(payload)
+                response = b"\x00"
+                if character_id == CHARACTER_DATABASE_ID and self.current_character is not None:
+                    state = _load_campaign_clock()
+                    offered = next(
+                        (
+                            mission for mission in state.get("missions", [])
+                            if mission.get("account") == self.current_character[0]
+                            and mission.get("status") == "offered"
+                        ),
+                        None,
+                    )
+                    if offered is not None:
+                        offered["battle"] = battle
+                        offered["status"] = "accepted"
+                        _write_campaign_state(state)
+                        response = b"\x01\x00"
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> mission-choice result=%d", response[0])
                 continue
             if (sw, obj, ch) == (0, 40, 41):
                 callback, _character_id, destination = _parse_move_request(payload)

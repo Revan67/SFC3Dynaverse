@@ -43,7 +43,7 @@ The only viable path is a replacement server that owns both layers.
 - [x] Add persistent state engines for officer purchases, supplies, refits, news, and missions
 - [x] Add one-command Windows launcher for account/profile and Dynaverse services
 - [x] Add permissive-by-default CD-key policy with registered/strict HMAC identifier modes
-- [ ] Client-validate mutation replies and recover remaining news/mission wire serializers
+- [ ] Client-validate mutation replies and complete mission-assignment publication
 - [ ] Dynaverse game simulation (economy, AI, missions, auctions, officers, news, and turn system)
 - [ ] In-game chat (GameSpy Peerchat / IRC protocol)
 
@@ -57,7 +57,8 @@ player marker, immediate homeworld facilities, Supply Dock, Refit editor, genera
 and retail Shipyard auction catalog are now verified against the client. Shipyard selection, bid
 increments, and Vessel Library previews resolve the selected retail hull correctly. Persistent
 campaign time, auction settlement, and the offline state engines for officers, supplies, refits,
-news, and missions are implemented; their remaining client mutation wire paths need validation.
+news, and missions are implemented. Retained news and mission selection are now wired; their client
+behavior and the remaining mission-assignment publication path need validation.
 
 The implementation will:
 
@@ -312,25 +313,26 @@ accepted). These locally installed files supply ship defaults and are never copi
 server-kit settings take precedence over matching retail data; retail files are the fallback,
 and packet captures are used only for wire formats or behavior absent from the distributed files.
 `SFC3_CDKEY_POLICY` accepts `permissive` (default), `registered`, or `strict`. Non-permissive modes
-also require `SFC3_IDENTITY_HMAC_SECRET`, `SFC3_CDKEY_ID_OFFSET`, and `SFC3_CDKEY_ID_LENGTH`;
-approved HMAC identifiers are comma-separated in `SFC3_REGISTERED_KEY_IDS`. Keep all of these in the
-ignored private environment file, never in source control.
+require `SFC3_IDENTITY_HMAC_SECRET`; approved strict-mode HMAC identifiers are comma-separated in
+`SFC3_REGISTERED_KEY_IDS`. The recovered parser isolates the stable access package automatically.
+`SFC3_CDKEY_ID_OFFSET` and `SFC3_CDKEY_ID_LENGTH` remain optional overrides for client variants.
+Keep these values in the ignored private environment file, never in source control.
 The post-login idle timeout is currently fixed at 15 minutes and will become configurable with the
 planned server UI.
 
 The security handler defaults to permissive verification because no authoritative retail-key
-registry survives. Registered and strict modes compare only server-secret HMAC identifiers and
-require explicitly configured, recovered identity-field boundaries; raw private verification bytes
-are never logged or stored. Campaign relay registration, account persistence, character
+registry survives. Registered and strict modes compare only server-secret HMAC identifiers derived
+from the structurally isolated access package; raw private verification bytes are never logged or
+stored. Campaign relay registration, account persistence, character
 persistence, campaign UI entry, clock initialization, the retail multiplayer map baseline,
 race-specific starting regions, starter-ship display, and persistent adjacent-hex movement are
 working and client-validated. Generated starter-ship Supply Dock and Refit state, officer candidates,
 and the retail Shipyard browsing catalog are also client-validated. Campaign turns and Shipyard bid
 settlement are implemented but await live validation. Officer, Supply Dock, Refit, news, and mission
 state engines are persistent and tested. Officer channel 39, Supply Dock channel 13, and Refit
-channel 38 are wired but await live validation. News channel 2 safely returns an empty list, and
-mission matching/eligibility channels 10 and 11 are acknowledged; full `tNewsStory`, mission
-`tBattleItem`, and mission-assignment serialization remain the next reverse-engineering boundary.
+channel 38 are wired but await live validation. News channel 2 serializes the retained campaign feed.
+Mission matching/eligibility channels 10 and 11 are acknowledged, and channel 12 parses and persists
+the chosen `tBattleItem`; mission-assignment publication is the remaining reverse-engineering boundary.
 
 ## Development
 

@@ -11,17 +11,19 @@ Ordered after the client-validated retail Shipyard browsing milestone.
    deduction, persistence, and updated-ship response.
 5. **Wired; client validation pending:** Refit channel 38 parsing, validation against retail specs,
    same-hull enforcement, and persistent ship configuration.
-6. **Partially wired:** News retention/publication uses `News.gf` limits; channel 2 now returns a
-   valid empty list. `tNewsStory` serialization remains before retained stories can be displayed.
-7. **Policy implemented; field boundary validation pending:** configurable CD-key handling:
+6. **Wired; client validation pending:** News retention/publication uses `News.gf` limits and colors;
+   channel 2 serializes the retained feed as recovered `tNewsStory` records.
+7. **Implemented; client validation pending:** configurable CD-key handling:
    `permissive` by default, with optional `registered` and `strict` policies. Never log or store raw
    keys or reusable proofs. Where stable key material is available, retain only a server-secret HMAC
    identifier unless an operator explicitly enables reversible storage.
-   Non-permissive operation additionally requires the recovered identity field offset/length; the
-   server refuses to guess those boundaries. Raw verification bytes are never logged or stored.
+   The recovered structural parser isolates the stable access package from both session challenges
+   before calculating the identifier. Manual offset/length overrides remain available for variants.
+   Raw verification bytes are never logged or stored.
 8. **Partially wired:** First mission offer, acceptance, launch, completion, and reward path has
-   guarded persistent transitions. Channels 10 and 11 now create/acknowledge matching and eligibility;
-   channel 12 `tBattleItem` selection and client assignment publication remain.
+   guarded persistent transitions. Channels 10 and 11 create/acknowledge matching and eligibility;
+   channel 12 parses the recovered `tBattleItem`, persists the chosen battle, and acknowledges it.
+   Publishing the actual mission assignment to the client remains.
 
 Server-kit and retail data take precedence over packet-derived values. Each state-changing feature
 requires serializer tests and persistent-state tests before client validation.
