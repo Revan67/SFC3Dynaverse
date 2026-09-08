@@ -851,6 +851,18 @@ def _publish_news(text: str, *, channel: str = "system", priority: str = "med", 
     return item
 
 
+def _parse_news_request(payload: bytes) -> tuple[tuple[int, int, int], int]:
+    """Parse News relay channel 2 (request-with-response plus character ID)."""
+    if len(payload) != 17 or payload[0] != 1:
+        raise ValueError("invalid news request")
+    return _parse_async_return(payload), struct.unpack_from("<I", payload, 13)[0]
+
+
+def _news_response_payload() -> bytes:
+    """Return a valid empty tGetNewsResponse until tNewsStory is fully validated."""
+    return struct.pack("<II", 1, 0)
+
+
 def _offer_mission(account: str, title: str, *, mission_type: str = "patrol", reward: int = 10) -> dict:
     """Create the first persistent mission lifecycle independently of wire routing."""
     if not title or reward < 0:
@@ -861,6 +873,20 @@ def _offer_mission(account: str, title: str, *, mission_type: str = "patrol", re
     state.setdefault("missions", []).append(mission)
     _write_campaign_state(state)
     return mission
+
+
+def _parse_mission_match_request(payload: bytes) -> tuple[tuple[int, int, int], int, int]:
+    """Parse MissionMatcher channel 10: callback, character ID, match mode."""
+    if len(payload) != 21 or payload[0] != 1:
+        raise ValueError("invalid mission-match request")
+    return _parse_async_return(payload), *struct.unpack_from("<II", payload, 13)
+
+
+def _parse_verify_mission_request(payload: bytes) -> tuple[tuple[int, int, int], int]:
+    """Parse MissionMatcher channel 11: callback and character ID."""
+    if len(payload) != 17 or payload[0] != 1:
+        raise ValueError("invalid verify-mission request")
+    return _parse_async_return(payload), struct.unpack_from("<I", payload, 13)[0]
 
 
 def _set_mission_status(account: str, mission_id: int, status: str) -> dict:
@@ -2607,6 +2633,51 @@ class DynamicSecurityClient:
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
                 self._log("info", "-> Refit purchase result=%d", response[0])
+                continue
+            if (sw, obj, ch) == (0, 27, 2):
+                callback, character_id = _parse_news_request(payload)
+                response = (
+                    _news_response_payload()
+                    if character_id == CHARACTER_DATABASE_ID and self.current_character is not None
+                    else struct.pack("<I", 0)
+                )
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> News request (%d serialized stories)", 0)
+                continue
+            if (sw, obj, ch) == (0, 24, 10):
+                callback, character_id, match_mode = _parse_mission_match_request(payload)
+                response = b"\x00"
+                if character_id == CHARACTER_DATABASE_ID and self.current_character is not None:
+                    state = _load_campaign_clock()
+                    active = next(
+                        (
+                            mission for mission in state.get("missions", [])
+                            if mission.get("account") == self.current_character[0]
+                            and mission.get("status") in {"offered", "accepted", "launched"}
+                        ),
+                        None,
+                    )
+                    if active is None:
+                        _offer_mission(
+                            self.current_character[0],
+                            "Patrol the current sector",
+                            mission_type=f"patrol:{match_mode}",
+                        )
+                    response = b"\x01"
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> mission-match request acknowledged")
+                continue
+            if (sw, obj, ch) == (0, 24, 11):
+                callback, character_id = _parse_verify_mission_request(payload)
+                # eCanChooseMissionResponses value zero is the successful/default enum.
+                response = b"\x01\x00" if (
+                    character_id == CHARACTER_DATABASE_ID and self.current_character is not None
+                ) else b"\x00"
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> mission-choice eligibility response")
                 continue
             if (sw, obj, ch) == (0, 40, 41):
                 callback, _character_id, destination = _parse_move_request(payload)

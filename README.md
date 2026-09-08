@@ -327,8 +327,10 @@ race-specific starting regions, starter-ship display, and persistent adjacent-he
 working and client-validated. Generated starter-ship Supply Dock and Refit state, officer candidates,
 and the retail Shipyard browsing catalog are also client-validated. Campaign turns and Shipyard bid
 settlement are implemented but await live validation. Officer, Supply Dock, Refit, news, and mission
-state engines are persistent and tested; their client mutation/request serializers remain the next
-reverse-engineering boundary.
+state engines are persistent and tested. Officer channel 39, Supply Dock channel 13, and Refit
+channel 38 are wired but await live validation. News channel 2 safely returns an empty list, and
+mission matching/eligibility channels 10 and 11 are acknowledged; full `tNewsStory`, mission
+`tBattleItem`, and mission-assignment serialization remain the next reverse-engineering boundary.
 
 ## Development
 

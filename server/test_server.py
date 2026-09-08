@@ -190,6 +190,22 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual(config["loadout_fields"][2], "Norway")
         self.assertEqual(config["revision"], 4)
 
+    def test_news_request_and_empty_response_shapes(self):
+        request = b"\x01" + struct.pack("<III", 9, 8, 7) + struct.pack("<I", 1)
+        self.assertEqual(server._parse_news_request(request), ((9, 8, 7), 1))
+        self.assertEqual(server._news_response_payload(), struct.pack("<II", 1, 0))
+
+    def test_mission_match_request_shapes(self):
+        envelope = b"\x01" + struct.pack("<III", 9, 8, 7)
+        self.assertEqual(
+            server._parse_mission_match_request(envelope + struct.pack("<II", 1, 3)),
+            ((9, 8, 7), 1, 3),
+        )
+        self.assertEqual(
+            server._parse_verify_mission_request(envelope + struct.pack("<I", 1)),
+            ((9, 8, 7), 1),
+        )
+
     def test_clock_snapshot_shape(self):
         old_path = server.CAMPAIGN_STATE_PATH
         old_server_root = server.SERVER_ASSET_ROOT
