@@ -824,6 +824,9 @@ def _save_refit(account: str, loadout_name: str, items: list[str], *, cost: int 
         if not specs.is_dir():
             specs = root / "Spec"
         defaults = _load_ship_defaults(specs / "DefaultCore.txt", specs / "DefaultLoadOut.txt", loadout_name)
+        current_defaults = _character_ship_defaults(record, root)
+        if defaults["ui_name"] != current_defaults["ui_name"]:
+            raise ValueError("refit cannot change hull class")
         record["prestige"] -= cost
         record["ship"]["class_name"] = defaults["ui_name"]
         record["ship"]["loadout_name"] = defaults["sub_name"]
@@ -1326,6 +1329,55 @@ def _character_ship_config_payload(
         + tng_ship
         + struct.pack("<fI", economic_scalar, prestige)
     )
+
+
+def _parse_tng_ship(payload: bytes, offset: int = 0) -> tuple[dict, int]:
+    """Parse the recovered tTNGShip envelope sufficiently to validate a refit."""
+    if offset + 2 > len(payload) or payload[offset : offset + 2] != b"\x01\x01":
+        raise ValueError("invalid tTNGShip initialization markers")
+    cursor = offset + 2
+    for _ in range(6):
+        if cursor + 4 > len(payload):
+            raise ValueError("truncated tTNGShip hardpoint vector")
+        count = struct.unpack_from("<I", payload, cursor)[0]
+        cursor += 4 + count * 4
+        if cursor > len(payload):
+            raise ValueError("truncated tTNGShip hardpoint data")
+    cursor += 8 * 4
+    class_name, cursor = _unpack_string(payload, cursor)
+    model_name, cursor = _unpack_string(payload, cursor)
+    if cursor + 4 > len(payload):
+        raise ValueError("truncated tTNGShip attributes")
+    attribute_count = struct.unpack_from("<I", payload, cursor)[0]
+    cursor += 4
+    attributes = []
+    for _ in range(attribute_count):
+        value, cursor = _unpack_string(payload, cursor)
+        attributes.append(value)
+    cursor += (7 + 4) * 4
+    loadout, cursor = _unpack_string(payload, cursor)
+    if cursor + 4 > len(payload):
+        raise ValueError("truncated tTNGShip revision")
+    revision = struct.unpack_from("<I", payload, cursor)[0]
+    return {
+        "class_name": class_name,
+        "model_name": model_name,
+        "attributes": tuple(attributes),
+        "loadout_fields": tuple(loadout.split("\t")),
+        "revision": revision,
+    }, cursor + 4
+
+
+def _parse_purchase_config_request(payload: bytes) -> tuple[tuple[int, int, int], int, int, dict]:
+    """Parse Character relay channel 38: character, ship, and replacement tTNGShip."""
+    if len(payload) < 23 or payload[0] != 1:
+        raise ValueError("truncated purchase-config request")
+    callback = _parse_async_return(payload)
+    character_id, ship_id = struct.unpack_from("<II", payload, 13)
+    config, end = _parse_tng_ship(payload, 21)
+    if end != len(payload):
+        raise ValueError("unexpected purchase-config trailing data")
+    return callback, character_id, ship_id, config
 
 
 def _parse_officers_to_review_request(
@@ -2533,6 +2585,28 @@ class DynamicSecurityClient:
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
                 self._log("info", "-> officer purchase result=%d", response[0])
+                continue
+            if (sw, obj, ch) == (0, 6, 38):
+                callback, character_id, ship_id, config = _parse_purchase_config_request(payload)
+                response = b"\x00"
+                if (
+                    character_id == CHARACTER_DATABASE_ID
+                    and ship_id == SHIP_DATABASE_ID
+                    and self.current_character is not None
+                ):
+                    try:
+                        fields = config["loadout_fields"]
+                        if len(fields) < 7:
+                            raise ValueError("refit loadout has too few fields")
+                        self.current_record = _save_refit(
+                            self.current_character[0], fields[2], list(fields[6:])
+                        )
+                        response = b"\x01"
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        self._log("warning", "Refit purchase rejected: %s", exc)
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> Refit purchase result=%d", response[0])
                 continue
             if (sw, obj, ch) == (0, 40, 41):
                 callback, _character_id, destination = _parse_move_request(payload)

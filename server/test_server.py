@@ -173,6 +173,23 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual(decoded["mines"], (2, 4, 4))
         self.assertEqual(decoded["marines"], (1, 4, 4))
 
+    def test_purchase_config_request_round_trip(self):
+        core = server._ship_core_payload(
+            ((1,), (4,), (2,), (5,), (3,), (6,)),
+            (1,) * 8, "Fed-Destroyer", "Norway", (2,) * 7, (3,) * 4,
+            ("cloak",),
+        )
+        tng = server._tng_ship_payload(
+            core,
+            ("Federation", "Fed-Destroyer", "Norway", "Norway", "1", "", "Phaser IX"),
+            4,
+        )
+        payload = b"\x01" + struct.pack("<III", 9, 8, 7) + struct.pack("<II", server.CHARACTER_DATABASE_ID, server.SHIP_DATABASE_ID) + tng
+        callback, character_id, ship_id, config = server._parse_purchase_config_request(payload)
+        self.assertEqual((callback, character_id, ship_id), ((9, 8, 7), 1, 2))
+        self.assertEqual(config["loadout_fields"][2], "Norway")
+        self.assertEqual(config["revision"], 4)
+
     def test_clock_snapshot_shape(self):
         old_path = server.CAMPAIGN_STATE_PATH
         old_server_root = server.SERVER_ASSET_ROOT
