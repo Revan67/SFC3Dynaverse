@@ -161,6 +161,18 @@ class DynamicSecurityWireTests(unittest.TestCase):
             ((9, 8, 7), server.CHARACTER_DATABASE_ID, {1000: 0x60, 1001: 0x61}),
         )
 
+    def test_update_stores_request_shape(self):
+        stores = server._stores_state_payload(
+            shuttle_counts=(3, 4, 2), mine_counts=(2, 4, 4),
+            marine_counts=(1, 4, 4), spare_counts=(0, 0, 1),
+        )
+        payload = b"\x01" + struct.pack("<III", 9, 8, 7) + struct.pack("<I", server.SHIP_DATABASE_ID) + server._pack_str("captain") + stores
+        callback, ship_id, account, decoded = server._parse_update_stores_request(payload)
+        self.assertEqual((callback, ship_id, account), ((9, 8, 7), server.SHIP_DATABASE_ID, "captain"))
+        self.assertEqual(decoded["shuttles"], (3, 4, 2))
+        self.assertEqual(decoded["mines"], (2, 4, 4))
+        self.assertEqual(decoded["marines"], (1, 4, 4))
+
     def test_clock_snapshot_shape(self):
         old_path = server.CAMPAIGN_STATE_PATH
         old_server_root = server.SERVER_ASSET_ROOT

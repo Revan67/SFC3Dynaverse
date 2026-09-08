@@ -1209,6 +1209,7 @@ def _full_ship_payload(
     owner_id: int = CHARACTER_DATABASE_ID,
     epv: int = 250,
     turn_created: int = 0,
+    stores: dict | None = None,
 ) -> bytes:
     """Serialize the complete top-level tShip in recovered StreamOut order."""
     core = _default_ship_core_payload(defaults)
@@ -1238,9 +1239,9 @@ def _full_ship_payload(
             hardpoint_maximum=(100,) * 25,
         )
         + _stores_state_payload(
-            shuttle_counts=defaults["shuttles"],
-            mine_counts=defaults["mines"],
-            marine_counts=defaults["marines"],
+            shuttle_counts=(int((stores or {}).get("shuttles", defaults["shuttles"][0])), defaults["shuttles"][1], defaults["shuttles"][2]),
+            mine_counts=(int((stores or {}).get("mines", defaults["mines"][0])), defaults["mines"][1], defaults["mines"][2]),
+            marine_counts=(int((stores or {}).get("marines", defaults["marines"][0])), defaults["marines"][1], defaults["marines"][2]),
             spare_counts=(0, 0, 0),
         )
         + struct.pack("<II", 0, defaults["hull_cost"])
@@ -1252,13 +1253,47 @@ def _supply_dock_payload(race: int, asset_root: Path | None = None, *, record: d
     defaults = _character_ship_defaults(record, asset_root) if record else _starter_ship_defaults(race, asset_root)
     _class_name, starter_name, _class_type = _starting_ship_for_race(race)
     ship_name = str(record["ship"].get("name", starter_name)) if record else starter_name
-    ship = _full_ship_payload(race=race, ship_name=ship_name, defaults=defaults)
+    ship = _full_ship_payload(race=race, ship_name=ship_name, defaults=defaults, stores=(record or {}).get("stores"))
     return (
         b"\x01"
         + ship
         + _id_double_map_payload(((SHIP_DATABASE_ID, 1.0),))
         + _id_double_map_payload(((SHIP_DATABASE_ID, 0.5),))
         + _id_item_rates_map_payload(((SHIP_DATABASE_ID, (1.0, (2.0, 4.0, 4.0))),))
+    )
+
+
+def _parse_update_stores_request(payload: bytes) -> tuple[tuple[int, int, int], int, str, dict]:
+    """Parse Ship relay channel 13 and the fixed portion of tStoresState."""
+    if len(payload) < 21 or payload[0] != 1:
+        raise ValueError("truncated update-stores request")
+    callback = _parse_async_return(payload)
+    ship_id = struct.unpack_from("<I", payload, 13)[0]
+    account, offset = _unpack_string(payload, 17)
+    if offset + 7 > len(payload):
+        raise ValueError("truncated stores state")
+    shuttles = tuple(payload[offset : offset + 3])
+    transporter_count = struct.unpack_from("<I", payload, offset + 3)[0]
+    tail = offset + 7 + transporter_count * 4 + 25 * 4
+    if tail + 9 != len(payload):
+        raise ValueError("invalid stores-state length")
+    final = payload[tail : tail + 9]
+    return callback, ship_id, account, {
+        "shuttles": shuttles,
+        "mines": (final[0], final[3], final[6]),
+        "marines": (final[1], final[4], final[7]),
+        "spares": (final[2], final[5], final[8]),
+    }
+
+
+def _updated_ship_payload(record: dict) -> bytes:
+    defaults = _character_ship_defaults(record)
+    ship = record["ship"]
+    return _full_ship_payload(
+        race=int(record["race"]),
+        ship_name=str(ship["name"]),
+        defaults=defaults,
+        stores=record.get("stores"),
     )
 
 
@@ -2351,6 +2386,33 @@ class DynamicSecurityClient:
                 ))
                 await self.writer.drain()
                 self._log("info", "-> generated Supply Dock ship state")
+                continue
+            if (sw, obj, ch) == (0, 22, 13):
+                callback, ship_id, account, desired = _parse_update_stores_request(payload)
+                response = b"\x00"
+                if (
+                    self.current_character is not None
+                    and account == self.current_character[0]
+                    and ship_id == SHIP_DATABASE_ID
+                ):
+                    try:
+                        defaults = _character_ship_defaults(self.current_record)
+                        current = self.current_record.get("stores", {})
+                        increments = {
+                            name: desired[name][0] - int(current.get(name, defaults[name][0]))
+                            for name in ("shuttles", "marines", "mines")
+                        }
+                        if any(value < 0 for value in increments.values()):
+                            raise ValueError("Supply Dock cannot reduce stores")
+                        self.current_record = _purchase_supplies(
+                            account, **increments
+                        )
+                        response = b"\x01" + _updated_ship_payload(self.current_record) + b"\x01"
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        self._log("warning", "Supply Dock update rejected: %s", exc)
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> Supply Dock update result=%d", response[0])
                 continue
             if (sw, obj, ch) == (0, 19, 2):
                 callback, character_id, _scalar, _modifiers = (
