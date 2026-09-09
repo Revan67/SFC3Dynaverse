@@ -1,0 +1,27 @@
+Name="Dynaverse3"
+Description="REMEMBER! Change the Name and the Description BEFORE starting a server with this kit.  Thanks!"
+EarlyMapName="MediumMultiMap.mvm"
+MidMapName="MediumMultiMap.mvm"
+LateMapName="MediumMultiMap.mvm"
+DifficultyLevel=2
+Era=0
+TriggerMission=""
+TriggerPrestige=0
+
+[Missions]
+1="Meta_Scan.scr"
+2="Meta_DistressCall.scr"
+3="Meta_SupriseR.scr"
+4="Meta_Delivery.scr"
+5="Meta_Escort.scr"
+6="Meta_SunMission.scr"
+7="Meta_Monster.scr"
+8="Meta_Casino.scr"
+9="Meta_Derelict.scr"
+10="Meta_Rescue.scr"
+
+[Races]
+0=0
+1=1
+2=2
+3=3

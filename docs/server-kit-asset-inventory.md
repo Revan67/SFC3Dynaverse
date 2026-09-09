@@ -1,27 +1,29 @@
 # Server-kit asset inventory
 
-Reviewed 2026-09-07. These are local research inputs and are not automatically redistributed.
+Reviewed 2026-09-08. The publicly released server-kit assets are vendored under
+`assets/server-kit` and are the server's sole runtime asset source. Commercial retail assets
+are neither copied into nor loaded by the project.
 
 ## Source precedence
 
-1. Dedicated-server kit files for server rules and generated campaign content.
-2. Stock retail files when the kit has no corresponding asset or for client-facing definitions.
-3. Static analysis for behavior not expressed by either distributed data set.
-4. Packet captures for wire shape, sequencing, and values unavailable from files or static analysis.
+1. Dedicated-server kit files for runtime rules and generated campaign content.
+2. Static analysis for behavior not expressed by the distributed server-kit data.
+3. Packet captures for wire shape, sequencing, and values unavailable from files or static analysis.
+4. Retail files only as external comparison evidence; never as a runtime fallback.
 
-Captured campaign content must not override an available retail or server-kit definition. The
-loader in `server/asset_sources.py` enforces server-kit-before-retail resolution for structured files.
+Captured campaign content must not override an available server-kit definition. Runtime loaders
+resolve only from `assets/server-kit`; the retail installation is a research and client input.
 
 ## Immediately useful structured inputs
 
 | Area | Canonical local path | Likely use |
 |---|---|---|
-| Strategic maps | `C:\Utilities\SFC3Server\Assets\Maps\*.mvm` | Map geometry, regions, terrain, economy, defense, planets, and bases |
-| Officer names | `C:\Utilities\SFC3Server\Assets\CommonSettings\OfficerNames.gf` | Race-specific generated officer names |
-| Ship names | `C:\Utilities\SFC3Server\Assets\CommonSettings\ShipNames.gf` | Race-specific generated vessel names |
+| Strategic maps | `assets/server-kit/Maps/*.mvm` | Map geometry, regions, terrain, economy, defense, planets, and bases |
+| Officer names | `assets/server-kit/CommonSettings/OfficerNames.gf` | Race-specific generated officer names |
+| Ship names | `assets/server-kit/CommonSettings/ShipNames.gf` | Race-specific generated vessel names |
 | Races and ranks | `...\CommonSettings\RaceNames.gf`, `Rank.gf` | Display names and progression labels |
 | Item catalogs | `...\CommonSettings\BridgeItems.gf`, `HullItems.gf`, `PowerItems.gf`, `ShieldItem.gf`, `WeaponItems.gf` | Refit, supply, generated loadouts, costs, and item metadata |
-| Ship cores/loadouts | `C:\Utilities\SFC3Server\Assets\Spec\DefaultCore.txt`, `DefaultLoadOut.txt` | Ship inventory, stock configurations, hardpoints, and systems |
+| Ship cores/loadouts | `assets/server-kit/Spec/DefaultCore.txt`, `DefaultLoadOut.txt` | Ship inventory, stock configurations, hardpoints, and systems |
 | Character rules | `...\ServerProfiles\Character.gf` | Starting ships, officer generation, prestige, and character limits |
 | Economy rules | `...\ServerProfiles\Economy.gf` | Supply, repair, refit, officer, and auction pricing/timing |
 | Ship rules | `...\ServerProfiles\Ship.gf` | Ship generation and auction timing |
@@ -29,12 +31,13 @@ loader in `server/asset_sources.py` enforces server-kit-before-retail resolution
 | Map rules | `...\ServerProfiles\MetaMap.gf`, `HexValues.gf` | Movement, political behavior, and client value tiers |
 | News rules | `...\ServerProfiles\News.gf` | News retention and publication settings |
 | Mission rules | `...\ServerProfiles\MissionMatching.gf`, `MissionGoals.gf`, `Goal.gf` | Mission selection and campaign goals |
-| Campaign template | `C:\Utilities\SFC3Server\Assets\Scripts\Campaigns\Campaign 1.mct` | Default map selection, races, era, and mission list |
+| Campaign template | `assets/server-kit/Scripts/Campaigns/Campaign 1.mct` | Default map selection, races, era, and mission list |
 | Database schema | `C:\Utilities\SFC3Server\SQL\CreateTables.sql` | Original entities, fields, and relationships |
 
-The client installation contains corresponding stock assets under
-`D:\Games\GOG\Star Trek SFC3\Assets` and `D:\Games\GOG\Star Trek SFC3\MetaAssets`.
-Comparing client and server-kit copies can identify server-only settings and version drift.
+The verified clean E: GOG installation remains an external research reference when a controlled
+comparison is needed; it is not a runtime dependency. The server-kit `DefaultCore.txt` matches the
+retail file byte-for-byte. Its `DefaultLoadOut.txt` differs only in the Scimitar row: retail includes
+the `NS` flag after the `scimitar` model name, while the server-kit field is empty.
 
 ## Maps
 

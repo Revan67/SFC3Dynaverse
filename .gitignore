@@ -22,6 +22,18 @@ memory/
 reference/private/
 reference/ghidra/
 
+# Large third-party mission API research package and any local extraction.
+reference/SFC_programing_APIs_Y2020.rar
+reference/SFC_programing_APIs_Y2020/
+
 Saves/
 LiveSFC3.exe
 SFCLauncher FadedSpark Custom.exe
+# Commercial client binary included as a server-kit validation input; never distribute it.
+assets/server-kit/ValidatedClientFiles/SFC3.exe
+# Public forum reference mirror (locally reproducible; do not commit raw pages).
+reference/forum-archive/hotandspicy/raw/
+reference/forum-archive/hotandspicy/crawl-state.json
+reference/forum-archive/hotandspicy/manifest.jsonl
+reference/forum-archive/hotandspicy/external-links.txt
+reference/forum-archive/hotandspicy/media-links.txt

@@ -104,7 +104,7 @@ capture. The local direct callback response is accepted by the client and starts
 the viewport completion notification is what should end that state. Final confirmation requires one
 client move after restarting onto the current code.
 
-## Supply Dock (capture-confirmed, not implemented)
+## Supply Dock and character refresh (capture-confirmed)
 
 The same session provides a complete initial Supply Dock transaction:
 
@@ -135,5 +135,70 @@ The top-level `tShip` order is also capture-aligned: database ID/reference count
 flag, race, class, EPV, class name, ship name, creation turn, `tTNGShip`, damage state, stores state,
 flags, and raw hull cost. Channel 7 now returns a wholly generated ship followed by three empty rate
 maps. Missing or invalid local specs produce a normal failure response rather than terminating the
-session. This path is ready for client validation; damage maxima, item rates, and economy-backed
-store contents remain prototype defaults.
+session.
+
+The 2026-09-08 controlled live mutation capture adds the complete post-purchase sequence:
+
+- `tShipRelayS` object 22/channel 13 carries a plain 12-byte callback, character ID, ship name,
+  and the desired absolute `tStoresState`.
+- Its reply is success, a complete updated `tShip`, and the final update-success byte.
+- The client then requests Character object 6/channel 13 and Ship object 22/channel 7 again.
+- Character channel 13 is `tGetCharacterPrestigeReq`; its nine-byte reply is success, current
+  prestige, and lifetime prestige. Ignoring this refresh leaves the client on its intermediary
+  black screen even though the purchase has already persisted.
+- Retail itself briefly shows that black transition while applying a purchase, so only a transition
+  that does not return is erroneous.
+
+Replacement-server validation subsequently confirmed that shuttle, marine, and mine counts and
+prestige changes persist across the transaction/re-entry path. The remaining defect is UI completion:
+the local client can remain on the black intermediary screen after either buying or selling. In the
+observed failing local sequence it re-requested Ship object 22/channel 7 but did not issue the live
+server's Character object 6/channel 13 prestige request. One marine purchase also ended in abnormal
+client termination. This distinguishes a response/state-transition defect from an economy mutation
+or persistence defect.
+
+The generated response now uses the installed capacities and server-kit rates. Damage maxima and
+the full economy remain prototype values.
+
+## Refit and Officers mutations (capture-confirmed)
+
+The same 2026-09-08 capture establishes the non-mission mutation envelopes:
+
+- Refit save is Character object 6/channel 38. Unlike asynchronous requests with a marker byte,
+  this request begins directly with the 12-byte callback, followed by character ID, ship ID, and
+  `tTNGShip`. Retail replies with two success bytes (`01 01`), then services the normal prestige and ship
+  refresh requests. The final `tTNGShip` scalar is a float and was `1.0` in the live request.
+- Freeing/cancelling an officer review is Character channel 8 and returns one success byte.
+- Purchasing/transferring reviewed officers is Character channel 39: a plain 12-byte callback,
+  character ID, then a map of officer database IDs to station enums. There is no leading async
+  marker; a single assignment is exactly 28 bytes. It returns two success bytes (`01 01`) before the
+  prestige/full-ship refresh sequence.
+
+The replacement implements these envelopes and persistence models, but the 2026-09-08 client run did
+not validate the mutation paths. The replacement now uses the captured two-byte replies and commits
+officer exchanges atomically with outgoing-officer credit. The separate officer-review cancel/free
+path is client-validated: it returns to the campaign view without disabling the facility buttons.
+
+News object 27/channel 2 carries a requested story ID after its callback, not a character ID. The
+reply is a four-byte success value followed directly by one `tNewsStory`; there is no list-count word.
+
+MissionMatcher object 24/channel 11 returns a four-byte success value followed by the one-byte
+`eCanChooseMissionResponses` enum (`01 00 00 00 00` for the observed allowed case). Channel 12's
+callback completes with one success byte. Before that completion, retail publishes an approximately
+2.8 KiB mission assignment on the client relay at object 15/channel 2; it embeds the selected battle,
+current character, and ship state. That publication—not merely the channel 11 eligibility reply—is
+the remaining requirement for enabling the Missions button. Captured database IDs must be rebuilt
+from the active session rather than replayed.
+
+## Campaign clock and Shipyard settlement observations
+
+Local Shipyard selection, preview, bid increments, bid persistence, closing, and hull award are now
+client-observed. A bid on the Sovereign survived relogging and settled after further campaign moves;
+the character then loaded with the Sovereign and the updated trade-in value. Settlement therefore
+works even though the client-facing clock is suspect. The stardate initially appeared not to advance
+and later rendered as `219.1342177` instead of the expected `2159.xx`, indicating a clock serializer
+or numeric-format mismatch rather than proof that turns failed to advance.
+
+Multi-hex movement also needs regression coverage. One two-hex diagonal attempt appeared to stall,
+while a later three-hex move completed after a short calculation delay. Treat this as intermittent or
+path-dependent until packet logs identify whether completion publication was omitted.

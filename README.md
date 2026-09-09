@@ -1,192 +1,72 @@
 # SFC3 Dynaverse Server Revival
 
-Reverse engineering and reimplementation effort to restore Star Trek: Starfleet Command III Dynaverse multiplayer on private hardware, without any dependency on the original server software or GameSpy infrastructure.
+A clean-room Python replacement for the retired Star Trek: Starfleet Command III
+Dynaverse and GameSpy services. The goal is to let an unmodified retail client
+host and join persistent private campaigns without the original online services
+or `ServerPlatform.exe`.
 
-## Background
+## Current status
 
-The official Taldren/Activision Dynaverse servers went offline around 2004–2008. The original `ServerPlatform.exe` server kit was later released, but it cannot be made to work: it requires GameSpy online services (offline since 2014) and contains an unfixable auth dispatch bug. This project builds a clean-room Python replacement that speaks the native SFC3 wire protocol directly.
+The unmodified GOG client can currently:
 
-## The Core Problem
+- create and log into a local account;
+- create, persist, and rejoin a character;
+- discover the server and enter the campaign;
+- render the stock 51x34 server-kit map and faction homeworld;
+- display and recenter on the player marker;
+- move and retain position across reconnects;
+- browse Supply Dock, Refit, Officers, and the server-kit Shipyard catalog;
+- select and preview Shipyard vessels, place persistent bids, and receive a
+  winning vessel;
+- display the welcome news item.
 
-SFC3 multiplayer has two hard dependencies that are both permanently broken:
+Current work is focused on one authoritative serialized `tShip` across Supply
+Dock, Refit, Officers, persistence, and relog; the five-field campaign clock;
+and the mission launch/result lifecycle. Known client-visible defects and their
+evidence are tracked in
+[`docs/investigation-evidence-matrix.md`](docs/investigation-evidence-matrix.md).
 
-1. **GameSpy infrastructure** — CD key validation, peerchat, and directory services all ran on `*.gamespy.com`. Those servers shut down in 2014. The server binary phones home at startup; without a substitute, it aborts.
+## Requirements
 
-2. **`ServerPlatform.exe` auth dispatch bug** — Even with GameSpy bypassed, the binary has a code bug where `SecurityServer` never claims the `tAccessRelayS` object published by connecting clients. The client gets stuck waiting for `ServerChallengeRequest` and never authenticates. This happens in both single-process and split-process configurations. No config change fixes it; the bug is in compiled code.
+- Windows 11 is the currently tested host platform.
+- Python 3.10 or newer; the server uses only the standard library.
+- PowerShell 5.1 or newer for the combined launcher.
+- A legitimately owned SFC3 installation containing `SFC3.exe`.
+- The GT2 protocol key extracted privately from that executable.
+- The publicly released SFC3 server-kit data under `assets/server-kit`.
+- Administrator access to configure hostname redirection and, for LAN or
+  internet hosting, Windows Firewall and router forwarding.
 
-The only viable path is a replacement server that owns both layers.
+The game, retail client, serial/CD keys, private account data, captures, and
+logs are not distributed. The server does not load assets from a retail
+installation at runtime.
 
-## Status (reviewed 2026-09-07)
+## Setup
 
-- [x] Official server kit binaries archived (builds 464, 504, 531, 534, 534b)
-- [x] Server binary runs on Windows 11 (XP SP3 compat mode)
-- [x] All 16 sub-servers initialize and reach "made public" state
-- [x] GameSpy account/profile request formats captured
-- [x] GT2 ASCII handshake protocol fully documented and implemented
-- [x] GT2 response hash reverse engineered from SFC3.exe (FUN_007e7580) — secret key confirmed
-- [x] Full connection sequence captured with Wireshark; all frame formats confirmed
-- [x] Client binary hello, nSwitch setup, and relay publications all working
-- [x] Server-side `tAccessRelayS` claim and factory trigger confirmed
-- [x] Live directory flow observed through a dynamically assigned game port
-- [x] TCP 28900 compact directory and UDP 27633 status services implemented
-- [x] Unmodified client verified from local account login through Dynaverse campaign UI entry
-- [x] Character lookup, creation, local persistence, and restart/re-login verified end to end
-- [x] Capture and decode a successful `tSecurityRelayS` challenge/response on the dynamic game port
-- [x] Implement the minimal dynamic-port security exchange through `tCharacterRelayS`
-- [x] Decode compact hex records and client-validate the stock 51x34 `Multi.mvm` map with race-specific starts
-- [x] Persist adjacent-hex movement and publish completion/position updates without reconnecting
-- [x] Initialize friendly-base facilities immediately at login and after movement
-- [x] Generate the starter ship from installed specs for Supply Dock and Refit
-- [x] Render Supply Dock stores/rates, the Refit editor, and generated officer candidates
-- [x] Generate the retail faction Shipyard catalog with working bids and Vessel Library previews
-- [x] Persist campaign turns and Shipyard bids; close and settle auctions on server-kit timing
-- [x] Add persistent state engines for officer purchases, supplies, refits, news, and missions
-- [x] Add one-command Windows launcher for account/profile and Dynaverse services
-- [x] Add permissive-by-default CD-key policy with registered/strict HMAC identifier modes
-- [ ] Client-validate mutation replies and complete mission-assignment publication
-- [ ] Dynaverse game simulation (economy, AI, missions, auctions, officers, news, and turn system)
-- [ ] In-game chat (GameSpy Peerchat / IRC protocol)
+Copy the released server-kit asset folders into:
 
-## Approach
-
-A Python asyncio replacement that implements the bootstrap relay on port 26100, GameSpy directory
-and status discovery, and the security/character flow on game port 27632. GameSpy account/profile
-compatibility remains in `server/probe.py`. The unmodified client can create a local account and
-character, rejoin after a restart, and enter the campaign UI. The retail map, persistent movement,
-player marker, immediate homeworld facilities, Supply Dock, Refit editor, generated officer list,
-and retail Shipyard auction catalog are now verified against the client. Shipyard selection, bid
-increments, and Vessel Library previews resolve the selected retail hull correctly. Persistent
-campaign time, auction settlement, and the offline state engines for officers, supplies, refits,
-news, and missions are implemented. Retained news and mission selection are now wired; their client
-behavior and the remaining mission-assignment publication path need validation.
-
-The implementation will:
-
-- Speak the GT2 ASCII negotiation handshake natively
-- Compute the correct GT2 challenge/response hash
-- Handle the nSwitch binary framing used for all post-handshake traffic
-- Accept structurally valid CD-key verification by default, with optional registered/strict policies
-- Eventually serve the full Dynaverse campaign simulation
-
-## Protocol Reference
-
-### GT2 ASCII Negotiation (port 26100)
-
-Framing: `0x80  uint16_LE(payload_len_including_null)  <ASCII>  0x00`
-
-```
-S→C:  \challenge\<32 random chars>\final\
-C→S:  \response\<32-char hash>\challenge\<32 random chars>\port\<port>\data\
-S→C:  \accept\1\response\<32-char hash>\port\27100\final\
+```text
+assets/server-kit/
+  CommonSettings/
+  Maps/
+  Scripts/
+  ServerProfiles/
+  Spec/
 ```
 
-The 32-char hash is computed with a custom algorithm (FUN_007e7580 in SFC3.exe) using a key embedded in the binary at `DAT_0099d6b8`. Each side hashes the *other* side's challenge. Extract the key from your own SFC3.exe installation.
+Do not copy or commit the retail executable from `ValidatedClientFiles`.
 
-### nSwitch Binary Phase (same TCP connection, after accept)
+Extract the GT2 protocol key from your own client into the ignored
+`server/.env` file:
 
-All frames: `uint16_BE(payload_len)  <payload>`
-
-```
-C→S:  00 0c  fe ff ff ff ff ff ff ff  02 00 00 00          (client hello)
-S→C:  00 14  ff ff ff ff 00 00 00 00  00 00 00 00  04 00 00 00  01 00 00 00   (ASSIGN_SWITCH_ID)
-S→C:  00 1c  ff ff ff ff 00 00 00 00  01 00 00 00  0c 00 00 00  ec 9f 00 00  00 00 00 00  01 00 00 00
-S→C:  00 0c  fe ff ff ff ff ff ff ff  03 00 00 00          (REGISTERED)
+```powershell
+python .\server\extract_gt2_key.py "E:\Games\GOG\Star Trek SFC3\SFC3.exe" .\server\.env
 ```
 
-### Client Publication Sequence
+The GT2 protocol key is distinct from an individual serial/CD key. Do not print,
+publish, or commit either one.
 
-After nSwitch setup the client publishes two objects:
-
-**Relay name** (GT2-framed nSwitch, chan 0):
-```
-nSwitch(switch=0, obj=1, chan=0, plen=59)
-  uint32_LE(47) + "ClientConnectRelayNameC_<id>_<ip>"  +  [1]  [2]
-```
-
-**tAccessRelayS** (GT2-framed nSwitch, chan 2 — the auth trigger):
-```
-nSwitch(switch=0, obj=1, chan=2, plen=42)
-  01  [1]  [1]  [3]  uint32_LE(25)  " *~Server~* tAccessRelayS"
-```
-
-The server-side claim format and subsequent factory trigger are confirmed. See
-[`docs/protocol-findings.md`](docs/protocol-findings.md) for the complete bootstrap sequence.
-
-### Historical ServerChallengeRequest hypothesis
-
-Static analysis originally suggested this raw serialization:
-```
-uint32_LE(40)         ← total content length
-uint32_LE(timestamp)  ← Unix time
-uint32_LE(32)         ← challenge string length
-[32 bytes]            ← random challenge
-```
-
-The 2026-09-02 live capture supersedes that hypothesis. It establishes the asynchronous return
-envelope, 29-byte challenge, verification-request prefix, successful response, and transition to
-`tCharacterRelayS`. See [`docs/dynamic-security-protocol.md`](docs/dynamic-security-protocol.md).
-
-### Intended Auth Exchange
-
-```
-S→C:  ServerChallengeRequest
-C→S:  VerifyClientRequest     (challenge reply + CD key from registry + WON login name)
-S→C:  auth accept / reject
-```
-
-The CD key is read from `HKLM\SOFTWARE\WOW6432Node\Activision\Star Trek Starfleet Command III\KEY`.
-Because no authoritative retail-key registry survives, the replacement defaults to permissive
-verification. Optional registered/strict policies may bind a non-reversible, server-secret HMAC
-identifier to an account; raw keys and reusable proofs must never be logged or stored. The WON login
-name (typed at the game's login screen) becomes the player's display name.
-
-## Key Ghidra Symbols (SFC3.exe)
-
-| Address | Symbol |
-|---------|--------|
-| `007e7580` | `FUN_007e7580` — GT2 response hash function |
-| `007e54b0` | GT2 challenge handler (client side) |
-| `00948c7c` | `tAccessRelayS` string literal |
-| `009865e0` | `tServerChallengeRequest` RTTI |
-| `00986580` | `tServerChallengeResponse` RTTI |
-| `00986620` | `tVerifyClientRequest` RTTI |
-| `0099d6b8` | GT2 secret key (32-byte string — extract from binary) |
-
-## Key Ghidra Symbols (ServerPlatform.exe build 534b)
-
-| Address | Symbol |
-|---------|--------|
-| `0052327d` | `tChallengeClient::OnChallengeClient` — fires on tAccessRelayS publish |
-| `005b16fe` | `tServerChallengeResponse::StreamOut` |
-| `00521b93` | `tSecurityRelayS::AllocChallengeClient` |
-| `0056c60e` | `tInterfacePacket::StreamOut` |
-
-## Repository Structure
-
-```
-docs/           Protocol documentation and findings
-server/         Experimental replacement server and multi-port probe
-```
-
-## Requirements and Current Setup
-
-The current prototype has been tested on Windows 11 with an unmodified SFC3 client. It requires:
-
-- Python 3.10 or newer. There are no third-party Python dependencies; the server uses only the
-  standard library.
-- A legitimately owned and working Star Trek: Starfleet Command III installation containing
-  `SFC3.exe`. The game, its assets, a serial/CD key, and any launcher or modern-Windows client fixes
-  are not distributed by this repository.
-- The GT2 protocol key extracted from that `SFC3.exe`. This is distinct from the game's serial/CD
-  key and must remain private.
-- Administrator access once to edit the Windows hosts file. Administrator access is also required
-  to add firewall rules when clients connect from another machine.
-- PowerShell 5.1 or newer for the combined launcher. The account and Dynaverse services remain
-  separate processes, but the launcher starts them together.
-
-The client must resolve the retired service names to the replacement server. For a client and
-server on the same PC, add these entries to
-`C:\Windows\System32\drivers\etc\hosts` from an elevated editor or PowerShell session:
+Redirect these retired hostnames on each client to the replacement server:
 
 ```text
 127.0.0.1 access1.sfc3.activision.com
@@ -195,169 +75,95 @@ server on the same PC, add these entries to
 127.0.0.1 master.gamespy.com
 ```
 
-For a client on another computer, replace `127.0.0.1` in that client's hosts file with the server's
-stable Ethernet IPv4 address. Avoid a VPN, virtual adapter, or changing Wi-Fi address unless that is
-also the address bound and advertised below.
+Use the server's stable LAN address instead of `127.0.0.1` for a different
+client computer. The stock GOG executable does not honor SFC Launcher's
+`[Gamespy]` INI overrides; those require its modified client.
 
-### Private GT2 key
+## Running the server
 
-Extract the key into the ignored `server/.env` file without printing it. Substitute the path to
-your own installation:
+From the repository root:
 
 ```powershell
-python .\server\extract_gt2_key.py "D:\Games\GOG\Star Trek SFC3\SFC3.exe" .\server\.env
+.\Start-SFC3Server.ps1 -ServerAddress '127.0.0.1'
 ```
 
-`server/.env` is intentionally untracked. `server/server.py` does not load it automatically yet,
-so import it into the current PowerShell process before starting the Dynaverse service:
+For LAN hosting, pass the server computer's stable Ethernet address:
 
 ```powershell
-$keyLine = Get-Content .\server\.env | Where-Object { $_ -like 'SFC3_GT2_KEY=*' } | Select-Object -First 1
-$env:SFC3_GT2_KEY = $keyLine.Substring('SFC3_GT2_KEY='.Length)
+.\Start-SFC3Server.ps1 -ServerAddress '192.168.0.55'
 ```
 
-Never commit or publish `server/.env`, the extracted GT2 key, account data, character data, private
-protocol bodies, packet captures, or server logs. The repository's `.gitignore` covers the known
-local files.
-
-### Run on one PC
-
-From the repository root, start the local GameSpy-compatible account and profile services in the
-first PowerShell window:
+The launcher reads `server/.env`, validates the server-kit assets, starts all
+components, checks for occupied ports, and writes logs beneath the ignored
+`server/logs` directory. Override paths when needed:
 
 ```powershell
-$env:SFC3_SERVER_HOST = '127.0.0.1'
-python .\server\probe.py 29900 29901
-```
-
-In a second PowerShell window, load the private key as shown above and start the Dynaverse service:
-
-```powershell
-$env:SFC3_SERVER_HOST = '127.0.0.1'
-$env:SFC3_BIND_HOSTS = '127.0.0.1'
-$env:SFC3_ADVERTISE_HOST = '127.0.0.1'
-$env:SFC3_ASSET_ROOT = 'D:\Games\GOG\Star Trek SFC3\Assets'
-$env:SFC3_SERVER_ASSET_ROOT = 'C:\Utilities\SFC3Server\Assets'
-python .\server\server.py
-```
-
-Leave both processes running, launch SFC3, and use its Online Campaign login. Account and character
-records are created locally in the ignored `server/accounts.local.json` and
-`server/characters.local.json` files.
-
-### Run for LAN clients
-
-Replace `<server-ip>` with the server computer's stable physical-Ethernet IPv4 address. The account
-service accepts only one bind address, while the Dynaverse service accepts a comma-separated list:
-
-```powershell
-# Account/profile terminal
-$env:SFC3_SERVER_HOST = '<server-ip>'
-python .\server\probe.py 29900 29901
-```
-
-```powershell
-# Dynaverse terminal, after loading SFC3_GT2_KEY
-$env:SFC3_SERVER_HOST = '<server-ip>'
-$env:SFC3_BIND_HOSTS = '127.0.0.1,<server-ip>'
-$env:SFC3_ADVERTISE_HOST = '<server-ip>'
-$env:SFC3_ASSET_ROOT = 'D:\Games\GOG\Star Trek SFC3\Assets'
-$env:SFC3_SERVER_ASSET_ROOT = 'C:\Utilities\SFC3Server\Assets'
-python .\server\server.py
-```
-
-Permit these inbound ports through Windows Firewall for LAN use:
-
-| Protocol | Port | Current role |
-|---|---:|---|
-| TCP | 29900 | GameSpy account creation and login (GPCM) |
-| TCP | 29901 | GameSpy profile lookup (GPSP) |
-| TCP | 28900 | GameSpy-compatible server directory |
-| UDP | 27633 | Server-browser status query |
-| TCP | 26100 | SFC3 bootstrap relay |
-| TCP | 27632 | Advertised game, security, character, and campaign session |
-
-### Combined Windows launcher
-
-For the current development machine, start every component in hidden background processes from the
-repository root:
-
-```powershell
-.\Start-SFC3Server.ps1
-```
-
-The launcher loads the ignored `server\.env`, validates the installed ship specs, starts GameSpy
-account/profile listeners on both loopback and the LAN address, and starts the Dynaverse service on
-both addresses. Component logs are written beneath the ignored `server\logs` directory. It refuses
-to start over occupied ports and stops any components it launched if another component fails.
-
-The current defaults use `192.168.0.55` and `D:\Games\GOG\Star Trek SFC3\Assets`. Override them
-when necessary:
-
-```powershell
-.\Start-SFC3Server.ps1 -ServerAddress '192.168.0.55' `
-    -AssetRoot 'D:\Games\GOG\Star Trek SFC3\Assets' `
-    -ServerAssetRoot 'C:\Utilities\SFC3Server\Assets' `
+.\Start-SFC3Server.ps1 `
+    -ServerAddress '192.168.0.55' `
+    -ServerAssetRoot '.\assets\server-kit' `
     -PythonPath 'C:\Program Files\Python314\python.exe'
 ```
 
-Running `server.py` without the launcher or environment overrides binds only to loopback and is
-therefore not reachable from the LAN.
-Port numbers can be changed with `SFC3_RELAY_PORT`, `SFC3_GAME_PORT`, `SFC3_DIRECTORY_PORT`, and
-`SFC3_STATUS_PORT`; client redirection and discovery must agree with any changes. `SFC3_SERVER_NAME`
-changes the browser name, and `SFC3_CHARACTER_STORE` changes the character database path. The
-`SFC3_ASSET_ROOT` path must contain the installed `Specs\DefaultCore.txt` and
-`Specs\DefaultLoadOut.txt` files (the dedicated-server kit's singular `Spec` directory is also
-accepted). These locally installed files supply ship defaults and are never copied into the repo.
-`SFC3_SERVER_ASSET_ROOT` identifies the dedicated-server kit's `Assets` directory. Structured
-server-kit settings take precedence over matching retail data; retail files are the fallback,
-and packet captures are used only for wire formats or behavior absent from the distributed files.
-`SFC3_CDKEY_POLICY` accepts `permissive` (default), `registered`, or `strict`. Non-permissive modes
-require `SFC3_IDENTITY_HMAC_SECRET`; approved strict-mode HMAC identifiers are comma-separated in
-`SFC3_REGISTERED_KEY_IDS`. The recovered parser isolates the stable access package automatically.
-`SFC3_CDKEY_ID_OFFSET` and `SFC3_CDKEY_ID_LENGTH` remain optional overrides for client variants.
-Keep these values in the ignored private environment file, never in source control.
-The post-login idle timeout is currently fixed at 15 minutes and will become configurable with the
-planned server UI.
+Required listeners:
 
-The security handler defaults to permissive verification because no authoritative retail-key
-registry survives. Registered and strict modes compare only server-secret HMAC identifiers derived
-from the structurally isolated access package; raw private verification bytes are never logged or
-stored. Campaign relay registration, account persistence, character
-persistence, campaign UI entry, clock initialization, the retail multiplayer map baseline,
-race-specific starting regions, starter-ship display, and persistent adjacent-hex movement are
-working and client-validated. Generated starter-ship Supply Dock and Refit state, officer candidates,
-and the retail Shipyard browsing catalog are also client-validated. Campaign turns and Shipyard bid
-settlement are implemented but await live validation. Officer, Supply Dock, Refit, news, and mission
-state engines are persistent and tested. Officer channel 39, Supply Dock channel 13, and Refit
-channel 38 are wired but await live validation. News channel 2 serializes the retained campaign feed.
-Mission matching/eligibility channels 10 and 11 are acknowledged, and channel 12 parses and persists
-the chosen `tBattleItem`; mission-assignment publication is the remaining reverse-engineering boundary.
+| Protocol | Port | Role |
+|---|---:|---|
+| TCP | 29900 | Account login/creation |
+| TCP | 29901 | Profile lookup |
+| TCP | 28900 | Server directory |
+| UDP | 27633 | Server-browser status |
+| TCP | 26100 | SFC3 bootstrap relay |
+| TCP | 27632 | Security, character, and campaign session |
+
+Client redirection, firewall rules, advertised address, and router forwarding
+must agree. The future operator GUI will distinguish local listening, firewall
+permission, and externally verified reachability.
+
+## Configuration and data policy
+
+The replacement defaults to permissive CD-key verification because no
+authoritative retail-key registry survives. `SFC3_CDKEY_POLICY` supports:
+
+- `permissive` — accept structurally valid clients;
+- `registered` — derive and retain server-secret HMAC identifiers;
+- `strict` — allow only configured HMAC identifiers.
+
+Non-permissive modes require `SFC3_IDENTITY_HMAC_SECRET`; strict identifiers are
+listed in `SFC3_REGISTERED_KEY_IDS`. Raw key material and reusable proofs must
+never be logged or stored.
+
+Local accounts and campaign state are written to ignored JSON files beneath
+`server/`. Password reset—not password recovery—and a mod-overlay directory are
+planned operator features. Baseline files under `assets/server-kit` should remain
+unchanged; future overrides will take precedence by relative path.
 
 ## Development
 
-Run the focused protocol tests with:
+Run the test suite with:
 
 ```powershell
 python -m unittest discover -s server -p "test_*.py" -v
 ```
 
-Current status and capture procedure:
+Current documentation:
 
-- [`docs/project-status.md`](docs/project-status.md)
-- [`docs/capture-plan.md`](docs/capture-plan.md)
-- [`docs/gamespy-protocol.md`](docs/gamespy-protocol.md)
-- [`docs/reverse-engineering.md`](docs/reverse-engineering.md)
-- [`docs/architecture-plan.md`](docs/architecture-plan.md)
-- [`docs/original-server-findings.md`](docs/original-server-findings.md)
+- [Project status](docs/project-status.md)
+- [Investigation evidence matrix](docs/investigation-evidence-matrix.md)
+- [Implementation roadmap](docs/implementation-roadmap.md)
+- [Protocol findings](docs/protocol-findings.md)
+- [Dynamic security protocol](docs/dynamic-security-protocol.md)
+- [GameSpy protocol](docs/gamespy-protocol.md)
+- [Reverse-engineering notes](docs/reverse-engineering.md)
+- [Server-kit asset inventory](docs/server-kit-asset-inventory.md)
+- [Architecture plan](docs/architecture-plan.md)
+- [Capture procedure](docs/capture-plan.md)
+
+Raw packet captures, Ghidra exports, forum mirrors, credentials, account
+databases, and extracted archives are local research inputs and are ignored.
 
 ## Legal
 
-This project is a clean-room interoperability implementation under **17 U.S.C. § 1201(f)** (DMCA interoperability exception). Reverse engineering was performed solely to achieve interoperability with the SFC3 client for the purpose of private server hosting. No game assets, executable code, or proprietary data are distributed. A legitimate purchase of Star Trek: Starfleet Command III is required to run the client.
-
-The original game and server kit are the property of their respective rights holders (Taldren/Activision/current successors). This project is not affiliated with or endorsed by any of them.
-
-## References
-
-- [SFC Launcher by D4v1ks](https://github.com/D4v1ks/SFC-Launcher) — replaces GameSpy directory/Peerchat; still requires ServerPlatform.exe and does not fix the auth dispatch bug
-- GameSpy GT2 SDK (circa 2002) — protocol basis for all SFC3 multiplayer transport
+This is a clean-room interoperability project under 17 U.S.C. § 1201(f). It is
+not affiliated with or endorsed by Taldren, Activision, GameSpy, GOG, or their
+successors. Users must supply a legitimately owned game client and the publicly
+released server-kit inputs themselves.

@@ -8,6 +8,26 @@ Ghidra-generated unless a debug symbol supplied a class or method name.
 The compatibility target is the unmodified GOG SFC3 client. `LiveSFC3.exe` is a reference build
 used to study the surviving live service; it is not the target executable.
 
+### Verified local retail baseline
+
+As of 2026-09-08, the authoritative clean/retail client executable is the GOG installation at
+`E:\Games\GOG\Star Trek™_ Starfleet Command III\SFC3.exe`:
+
+```text
+Size:    6,418,500 bytes
+SHA-256: 1717552A3033356BB3BAE095F9CBD358658BEE8839FA94895EE06B4A33A274ED
+```
+
+The executable at `D:\Games\GOG\Star Trek SFC3\SFC3.exe` has the same hash. The copy under the
+Downloads folder named `Starfleet Command 3 CLEAN` is **not clean**: its SHA-256 is
+`BBB5ECFE0AC22CC2799FC8C0153FB11EE5A1DCF756769933C98193F99D035DCE`, and it contains the clustered
+strings `arcade`, `master`, `gpcm`, and `gpsp` that are absent as standalone configuration keys in
+the verified retail executable. Treat that Downloads copy as launcher-modified and never use it
+as the retail reverse-engineering baseline.
+
+Consequently, the stock GOG client does not natively support the launcher's `[Gamespy]` endpoint
+overrides merely by adding them to `sfc.ini`; that behavior depends on the modified executable.
+
 For the analyzed 32-bit client, the observed flat mapping is:
 
 ```text

@@ -126,12 +126,16 @@ CAMPAIGN_STATE_PATH = Path(
         str(Path(__file__).with_name("campaign.local.json")),
     )
 )
-ASSET_ROOT = Path(os.environ.get("SFC3_ASSET_ROOT", "")) if os.environ.get(
-    "SFC3_ASSET_ROOT"
-) else None
-SERVER_ASSET_ROOT = Path(os.environ.get("SFC3_SERVER_ASSET_ROOT", "")) if os.environ.get(
-    "SFC3_SERVER_ASSET_ROOT"
-) else None
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SERVER_ASSET_ROOT = Path(
+    os.environ.get(
+        "SFC3_SERVER_ASSET_ROOT", PROJECT_ROOT / "assets" / "server-kit"
+    )
+)
+# Ship definitions are part of the publicly released server kit. Keep this
+# alias while the ship serializers still accept the older generic asset-root
+# argument, but do not load commercial retail installation assets at runtime.
+ASSET_ROOT = SERVER_ASSET_ROOT
 
 # ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -293,8 +297,8 @@ def _campaign_turn(now: float | None = None) -> int:
 def _clock_snapshot_payload(now: float | None = None) -> bytes:
     """Build tCurrentTime using persistent time and server-kit cadence."""
     turns_per_year, milliseconds_per_turn = _clock_settings()
-    # 2159 is the capture-compatible client display epoch. Time.gf's
-    # StartingDate/BaseYear is a distinct internal stardate representation.
+    # The client-facing year is not Time.gf's internal BaseYear (56200).
+    # Supplying that value produces malformed displays such as "219.1".
     return b"\x01" + struct.pack(
         "<IIIII",
         _campaign_turn(now),
@@ -651,9 +655,11 @@ def _parse_relay_request(payload: bytes) -> tuple[tuple[int, int, int], bytes]:
 
 
 def _character_logon_payload(
-    account: str, character_name: str, client_address: str, race: int
+    account: str, character_name: str, client_address: str, race: int,
+    record: dict | None = None,
 ) -> bytes:
     """Build tCharacterRequest::tCharacterResponse for channel 2."""
+    record = _normalize_character_record(record or {"race": race})
     return struct.pack("<I", 0) + _default_client_character_payload(
         client_address=client_address,
         account=account,
@@ -661,6 +667,11 @@ def _character_logon_payload(
         race=race,
         database_id=1,
         rank=0,
+        current_position=tuple(record["position"]),
+        homeworld=tuple(record["homeworld"]),
+        destination=tuple(record["destination"]),
+        prestige=int(record["prestige"]),
+        ship=record["ship"],
     )
 
 
@@ -763,28 +774,87 @@ def _update_character(account: str, mutate) -> dict:
     return _write_character_record(account, record)
 
 
-def _purchase_officer(account: str, officer_id: int, *, station: int | None = None, cost: int = 14) -> dict:
-    """Purchase one currently generated officer without duplicating roster IDs."""
-    if cost < 0:
-        raise ValueError("officer cost cannot be negative")
+def _purchase_officers(
+    account: str,
+    assignments: dict[int, int],
+    *,
+    incoming_cost: int = 14,
+    default_outgoing_worth: int = 114,
+) -> dict:
+    """Atomically exchange officers and persist the resulting ship roster."""
+    if incoming_cost < 0 or default_outgoing_worth < 0:
+        raise ValueError("officer costs cannot be negative")
+    if not assignments:
+        raise ValueError("officer assignment is empty")
+
     def mutate(record: dict) -> None:
         race = int(record["race"])
-        index = officer_id - 1000
         names = _officer_names(race)[:_officer_review_limit()]
-        if not 0 <= index < len(names):
-            raise ValueError("officer is not in review")
-        if any(int(item["id"]) == officer_id for item in record["officers"]):
-            raise ValueError("officer is already assigned")
-        if int(record["prestige"]) < cost:
+        defaults = _character_ship_defaults(record)
+        items = list(defaults["items"])
+        existing_by_station = {int(item["station"]): item for item in record["officers"]}
+        prepared = []
+        seen_ids = set()
+        outgoing_credit = 0
+        for officer_id, assigned_station in assignments.items():
+            officer_id = int(officer_id)
+            assigned_station = int(assigned_station)
+            index = officer_id - 1000
+            if not 0 <= index < len(names):
+                raise ValueError("officer is not in review")
+            if officer_id in seen_ids or any(
+                int(item["id"]) == officer_id for item in record["officers"]
+            ):
+                raise ValueError("officer is already assigned")
+            if assigned_station not in OFFICER_STATIONS:
+                raise ValueError("invalid officer station")
+            station_name = OFFICER_STATION_NAMES[assigned_station]
+            prefix = f"OFFICER:{station_name}:"
+            replacement_index = next(
+                (item_index for item_index, item in enumerate(items) if item.startswith(prefix)), None
+            )
+            if replacement_index is None:
+                raise ValueError("ship has no officer slot for station")
+            fields = items[replacement_index].split(":")
+            # Stock player loadouts intentionally use empty three-field slots,
+            # e.g. OFFICER:ENGINEER:. Populated officers carry the longer
+            # profile tail, but replacing the name only requires field 2.
+            if len(fields) < 3:
+                raise ValueError("invalid officer loadout item")
+            outgoing = existing_by_station.get(assigned_station)
+            outgoing_credit += int(outgoing.get("worth", default_outgoing_worth)) if outgoing else default_outgoing_worth
+            prepared.append((officer_id, assigned_station, names[index], replacement_index, fields))
+            seen_ids.add(officer_id)
+
+        new_prestige = int(record["prestige"]) + outgoing_credit - incoming_cost * len(prepared)
+        if new_prestige < 0:
             raise ValueError("insufficient prestige")
-        record["prestige"] -= cost
-        record["officers"].append({
-            "id": officer_id,
-            "name": names[index],
-            "station": int(station if station is not None else OFFICER_STATIONS[index % len(OFFICER_STATIONS)]),
-            "worth": cost,
-        })
+        replaced_stations = {item[1] for item in prepared}
+        record["prestige"] = new_prestige
+        record["officers"] = [
+            item for item in record["officers"]
+            if int(item.get("station", -1)) not in replaced_stations
+        ]
+        for officer_id, assigned_station, name, replacement_index, fields in prepared:
+            items[replacement_index] = _officer_loadout_item(name, assigned_station)
+            record["officers"].append({
+                "id": officer_id, "name": name, "station": assigned_station,
+                "worth": incoming_cost,
+            })
+        record["refit"] = {
+            "loadout_name": defaults["sub_name"],
+            "items": items,
+        }
     return _update_character(account, mutate)
+
+
+def _purchase_officer(account: str, officer_id: int, *, station: int | None = None, cost: int = 14) -> dict:
+    """Compatibility wrapper for a single officer exchange."""
+    index = officer_id - 1000
+    assigned_station = int(
+        station if station is not None else OFFICER_STATIONS[index % len(OFFICER_STATIONS)]
+    )
+    return _purchase_officers(account, {officer_id: assigned_station}, incoming_cost=cost)
 
 
 def _purchase_supplies(account: str, *, shuttles: int = 0, marines: int = 0, mines: int = 0) -> dict:
@@ -810,6 +880,38 @@ def _purchase_supplies(account: str, *, shuttles: int = 0, marines: int = 0, min
     return _update_character(account, mutate)
 
 
+def _update_supplies(account: str, desired: dict[str, int]) -> dict:
+    """Apply absolute Supply Dock counts, charging buys and crediting sales."""
+    if set(desired) != {"shuttles", "marines", "mines"}:
+        raise ValueError("incomplete supply state")
+    if any(not isinstance(value, int) or value < 0 for value in desired.values()):
+        raise ValueError("invalid supply count")
+    buy_rates = {"shuttles": 1, "marines": 2, "mines": 4}
+    sell_factor = 0.5
+
+    def mutate(record: dict) -> None:
+        defaults = _character_ship_defaults(record)
+        current = {
+            name: int(record.setdefault("stores", {}).get(name, defaults[name][2]))
+            for name in desired
+        }
+        for name, count in desired.items():
+            if count > int(defaults[name][1]) + 1:
+                raise ValueError(f"{name} exceeds ship capacity")
+        buys = sum(max(0, desired[name] - current[name]) * buy_rates[name] for name in desired)
+        sales = sum(
+            max(0, current[name] - desired[name])
+            * max(1, int(buy_rates[name] * sell_factor))
+            for name in desired
+        )
+        if int(record["prestige"]) + sales < buys:
+            raise ValueError("insufficient prestige")
+        record["prestige"] = int(record["prestige"]) - buys + sales
+        record["stores"].update(desired)
+
+    return _update_character(account, mutate)
+
+
 def _save_refit(account: str, loadout_name: str, items: list[str], *, cost: int = 0) -> dict:
     """Persist a client-selected retail loadout after resolving it from stock specs."""
     if cost < 0 or not loadout_name or any(not isinstance(item, str) for item in items):
@@ -819,7 +921,7 @@ def _save_refit(account: str, loadout_name: str, items: list[str], *, cost: int 
             raise ValueError("insufficient prestige")
         root = ASSET_ROOT
         if root is None:
-            raise RuntimeError("SFC3_ASSET_ROOT is required")
+            raise RuntimeError("server-kit asset root is required")
         specs = root / "Specs"
         if not specs.is_dir():
             specs = root / "Spec"
@@ -896,12 +998,23 @@ def _news_story_payload(item: dict) -> bytes:
     )
 
 
-def _news_response_payload(items=()) -> bytes:
-    """Serialize tGetNewsResponse as success plus list<tNewsStory>."""
-    items = tuple(items)
-    return struct.pack("<II", 1, len(items)) + b"".join(
-        _news_story_payload(item) for item in items
-    )
+def _news_response_payload(item: dict | None = None) -> bytes:
+    """Serialize one live-compatible tGetNewsResponse story."""
+    if item is None:
+        return struct.pack("<I", 0)
+    return struct.pack("<I", 1) + _news_story_payload(item)
+
+
+def _welcome_news_story(story_id: int) -> dict:
+    return {
+        "id": max(1, int(story_id)),
+        "text": "Welcome to the SFC3 Dynaverse campaign server.",
+        "channel": "system",
+        "priority": "med",
+        "persistence": 3,
+        "turn": _campaign_turn(),
+        "sequence": 1,
+    }
 
 
 def _offer_mission(account: str, title: str, *, mission_type: str = "patrol", reward: int = 10) -> dict:
@@ -1126,7 +1239,26 @@ def _parse_move_request(payload: bytes) -> tuple[tuple[int, int, int], int, tupl
 def _is_adjacent_hex(current: tuple[int, int], destination: tuple[int, int]) -> bool:
     dx = destination[0] - current[0]
     dy = destination[1] - current[1]
-    return (dx, dy) in {(0, -1), (1, 0), (1, 1), (0, 1), (-1, 0), (-1, -1)}
+    # Multi.mvm uses odd-column offset coordinates. The diagonal Y offsets
+    # alternate by column; treating them as axial coordinates rejects every
+    # other visually adjacent diagonal move.
+    diagonals = {(1, 0), (1, 1), (-1, 0), (-1, 1)} if current[0] & 1 else {
+        (1, -1), (1, 0), (-1, -1), (-1, 0)
+    }
+    return (dx, dy) in diagonals | {(0, -1), (0, 1)}
+
+
+def _hex_distance(current: tuple[int, int], destination: tuple[int, int]) -> int:
+    """Return distance between odd-column offset coordinates from Multi.mvm."""
+    def cube(position: tuple[int, int]) -> tuple[int, int, int]:
+        column, row = position
+        x = column
+        z = row - (column - (column & 1)) // 2
+        return x, -x - z, z
+
+    start = cube(current)
+    end = cube(destination)
+    return max(abs(end[index] - start[index]) for index in range(3))
 
 
 def _move_response_payload(accepted: bool, duration_seconds: int = 1) -> bytes:
@@ -1201,13 +1333,13 @@ def _stores_state_payload(
     transporter_ids=(),
     item_current=(),
     item_maximum=(),
-    mine_counts=(4, 4, 4),
-    marine_counts=(2, 2, 2),
-    spare_counts=(2, 2, 2),
+    misc_maximum=(4, 4, 4),
+    misc_current=(2, 2, 2),
+    misc_desired=(2, 2, 2),
 ) -> bytes:
     """Serialize tStoresState using its recovered field-level StreamOut order."""
     if not all(len(values) == 3 for values in (
-        shuttle_counts, mine_counts, marine_counts, spare_counts
+        shuttle_counts, misc_maximum, misc_current, misc_desired
     )):
         raise ValueError("store count groups require three values")
     current = tuple(item_current) or (-1,) * 25
@@ -1219,7 +1351,7 @@ def _stores_state_payload(
     for current_value, maximum_value in zip(current, maximum):
         payload += struct.pack("<hh", current_value, maximum_value)
     for index in range(3):
-        payload += bytes((mine_counts[index], marine_counts[index], spare_counts[index]))
+        payload += bytes((misc_maximum[index], misc_current[index], misc_desired[index]))
     return bytes(payload)
 
 
@@ -1283,12 +1415,12 @@ def _ship_core_payload(
 def _tng_ship_payload(
     core_payload: bytes,
     loadout_fields,
-    configuration_revision: int = 0,
+    configuration_scalar: float = 1.0,
 ) -> bytes:
     """Serialize tTNGShip from generated core and DefaultLoadOut fields."""
     loadout = "\t".join(str(field) for field in loadout_fields)
     return b"\x01\x01" + core_payload + _pack_str(loadout) + struct.pack(
-        "<I", configuration_revision
+        "<f", configuration_scalar
     )
 
 
@@ -1433,10 +1565,22 @@ def _full_ship_payload(
             hardpoint_maximum=(100,) * 25,
         )
         + _stores_state_payload(
-            shuttle_counts=(int((stores or {}).get("shuttles", defaults["shuttles"][0])), defaults["shuttles"][1], defaults["shuttles"][2]),
-            mine_counts=(int((stores or {}).get("mines", defaults["mines"][0])), defaults["mines"][1], defaults["mines"][2]),
-            marine_counts=(int((stores or {}).get("marines", defaults["marines"][0])), defaults["marines"][1], defaults["marines"][2]),
-            spare_counts=(0, 0, 0),
+            shuttle_counts=(
+                int((stores or {}).get("shuttles", defaults["shuttles"][2])),
+                defaults["shuttles"][1] + 1,
+                int((stores or {}).get("shuttles", defaults["shuttles"][2])),
+            ),
+            misc_maximum=(defaults["marines"][1] + 1, defaults["mines"][1] + 1, 4),
+            misc_current=(
+                int((stores or {}).get("marines", defaults["marines"][2])),
+                int((stores or {}).get("mines", defaults["mines"][2])),
+                2,
+            ),
+            misc_desired=(
+                int((stores or {}).get("marines", defaults["marines"][2])),
+                int((stores or {}).get("mines", defaults["mines"][2])),
+                2,
+            ),
         )
         + struct.pack("<II", 0, defaults["hull_cost"])
     )
@@ -1458,25 +1602,31 @@ def _supply_dock_payload(race: int, asset_root: Path | None = None, *, record: d
 
 
 def _parse_update_stores_request(payload: bytes) -> tuple[tuple[int, int, int], int, str, dict]:
-    """Parse Ship relay channel 13 and the fixed portion of tStoresState."""
-    if len(payload) < 21 or payload[0] != 1:
+    """Parse Ship channel 13: callback, character ID, ship name, and tStoresState."""
+    if len(payload) < 20:
         raise ValueError("truncated update-stores request")
-    callback = _parse_async_return(payload)
-    ship_id = struct.unpack_from("<I", payload, 13)[0]
-    account, offset = _unpack_string(payload, 17)
+    callback = _parse_callback(payload)
+    character_id = struct.unpack_from("<I", payload, 12)[0]
+    ship_name, offset = _unpack_string(payload, 16)
     if offset + 7 > len(payload):
         raise ValueError("truncated stores state")
     shuttles = tuple(payload[offset : offset + 3])
     transporter_count = struct.unpack_from("<I", payload, offset + 3)[0]
-    tail = offset + 7 + transporter_count * 4 + 25 * 4
+    items_offset = offset + 7 + transporter_count * 4
+    tail = items_offset + 25 * 4
     if tail + 9 != len(payload):
         raise ValueError("invalid stores-state length")
+    item_pairs = tuple(
+        struct.unpack_from("<hh", payload, items_offset + index * 4)
+        for index in range(25)
+    )
     final = payload[tail : tail + 9]
-    return callback, ship_id, account, {
+    return callback, character_id, ship_name, {
         "shuttles": shuttles,
-        "mines": (final[0], final[3], final[6]),
-        "marines": (final[1], final[4], final[7]),
-        "spares": (final[2], final[5], final[8]),
+        "items": item_pairs,
+        "misc_maximum": (final[0], final[3], final[6]),
+        "misc_current": (final[1], final[4], final[7]),
+        "misc_desired": (final[2], final[5], final[8]),
     }
 
 
@@ -1498,6 +1648,18 @@ def _parse_character_ship_config_request(
     if len(payload) != 17:
         raise ValueError("invalid character ship-config request length")
     return _parse_callback(payload), struct.unpack_from("<I", payload, 12)[0], bool(payload[16])
+
+
+def _character_prestige_payload(record: dict | None) -> bytes:
+    """Build tGetCharacterPrestigeReq::tRep(current, lifetime, success)."""
+    if record is None:
+        return struct.pack("<BII", 0, 0, 0)
+    return struct.pack(
+        "<BII",
+        1,
+        int(record.get("prestige", 0)),
+        int(record.get("lifetime_prestige", 0)),
+    )
 
 
 def _character_ship_config_payload(
@@ -1549,23 +1711,27 @@ def _parse_tng_ship(payload: bytes, offset: int = 0) -> tuple[dict, int]:
     loadout, cursor = _unpack_string(payload, cursor)
     if cursor + 4 > len(payload):
         raise ValueError("truncated tTNGShip revision")
-    revision = struct.unpack_from("<I", payload, cursor)[0]
+    configuration_scalar = struct.unpack_from("<f", payload, cursor)[0]
     return {
         "class_name": class_name,
         "model_name": model_name,
         "attributes": tuple(attributes),
         "loadout_fields": tuple(loadout.split("\t")),
-        "revision": revision,
+        "configuration_scalar": configuration_scalar,
     }, cursor + 4
 
 
 def _parse_purchase_config_request(payload: bytes) -> tuple[tuple[int, int, int], int, int, dict]:
     """Parse Character relay channel 38: character, ship, and replacement tTNGShip."""
-    if len(payload) < 23 or payload[0] != 1:
+    # Unlike several other Character mutations this request uses a plain
+    # 12-byte callback envelope; the tTNGShip's own two initialization bytes
+    # immediately follow the character and ship IDs.  This layout is confirmed
+    # by the retail server's channel-38 request.
+    if len(payload) < 22:
         raise ValueError("truncated purchase-config request")
-    callback = _parse_async_return(payload)
-    character_id, ship_id = struct.unpack_from("<II", payload, 13)
-    config, end = _parse_tng_ship(payload, 21)
+    callback = _parse_callback(payload)
+    character_id, ship_id = struct.unpack_from("<II", payload, 12)
+    config, end = _parse_tng_ship(payload, 20)
     if end != len(payload):
         raise ValueError("unexpected purchase-config trailing data")
     return callback, character_id, ship_id, config
@@ -1580,19 +1746,32 @@ def _parse_officers_to_review_request(
     return _parse_callback(payload), struct.unpack_from("<I", payload, 12)[0]
 
 
+def _parse_free_officers_request(
+    payload: bytes,
+) -> tuple[tuple[int, int, int], int]:
+    """Parse Character channel 8 (FreeOfficersInReview)."""
+    if len(payload) != 16:
+        raise ValueError("invalid free-officers request length")
+    return _parse_callback(payload), struct.unpack_from("<I", payload, 12)[0]
+
+
 def _parse_purchase_officers_request(
     payload: bytes,
 ) -> tuple[tuple[int, int, int], int, dict[int, int]]:
     """Parse channel 39: callback, character ID, map<officer ID, station>."""
-    if len(payload) < 21 or payload[0] != 1:
+    # Retail uses the same plain 12-byte callback envelope as channel 38;
+    # there is no leading asynchronous-return marker. A one-officer transfer
+    # is therefore exactly 28 bytes: callback (12), character/count (8), and
+    # one officer/station map entry (8).
+    if len(payload) < 20:
         raise ValueError("truncated purchase-officers request")
-    callback = _parse_async_return(payload)
-    character_id, count = struct.unpack_from("<II", payload, 13)
-    if len(payload) != 21 + count * 8:
+    callback = _parse_callback(payload)
+    character_id, count = struct.unpack_from("<II", payload, 12)
+    if len(payload) != 20 + count * 8:
         raise ValueError("invalid purchase-officers map length")
     assignments = {
         officer_id: station
-        for officer_id, station in struct.iter_unpack("<II", payload[21:])
+        for officer_id, station in struct.iter_unpack("<II", payload[20:])
     }
     if len(assignments) != count:
         raise ValueError("duplicate officer ID")
@@ -1612,7 +1791,14 @@ def _officers_to_review_payload(
     tng_ship = _tng_ship_payload(
         _default_ship_core_payload(defaults), defaults["loadout_fields"]
     )
-    officers = _generated_officers(race)
+    officers = _generated_officers(
+        race,
+        (
+            item.get("id")
+            for item in (record or {}).get("officers", ())
+            if isinstance(item, dict) and "id" in item
+        ),
+    )
     return b"\x01" + struct.pack("<I", len(officers)) + b"".join(officers) + tng_ship + struct.pack(
         "<If", prestige, economic_scalar
     )
@@ -1624,6 +1810,10 @@ OFFICER_NAME_SECTIONS = {
     RACE_ROMULAN: "Romulan",
 }
 OFFICER_STATIONS = tuple(range(0x60, 0x66))
+OFFICER_STATION_NAMES = dict(zip(
+    OFFICER_STATIONS,
+    ("HELM", "OPS", "MEDICAL", "ENGINEER", "SECURITY", "TACTICAL"),
+))
 
 
 def _officer_names(race: int) -> tuple[str, ...]:
@@ -1650,6 +1840,18 @@ def _officer_review_limit() -> int:
     return max(0, min(32, int(value)))
 
 
+def _officer_loadout_item(name: str, station: int) -> str:
+    """Build the textual DefaultLoadOut officer form for a generated candidate."""
+    station_index = station - OFFICER_STATIONS[0]
+    skills = ["1. Basic"] * 18
+    for index in range(station_index * 3, station_index * 3 + 3):
+        skills[index] = "2. Trained"
+    return ":".join((
+        "OFFICER", OFFICER_STATION_NAMES[station], name,
+        "10", "10", "20", "Rookie", *skills, "",
+    ))
+
+
 def _officer_item_payload(name: str, race: int, station: int) -> bytes:
     """Serialize tOfficerItem through its adjusted tStreamable base."""
     skills = [0] * 18
@@ -1673,12 +1875,14 @@ def _officer_payload(database_id: int, name: str, race: int, station: int) -> by
     )
 
 
-def _generated_officers(race: int) -> tuple[bytes, ...]:
+def _generated_officers(race: int, excluded_ids=()) -> tuple[bytes, ...]:
     names = _officer_names(race)
     limit = min(_officer_review_limit(), len(names))
+    excluded = {int(officer_id) for officer_id in excluded_ids}
     return tuple(
         _officer_payload(1000 + index, names[index], race, OFFICER_STATIONS[index % 6])
         for index in range(limit)
+        if 1000 + index not in excluded
     )
 
 
@@ -1689,12 +1893,34 @@ SHIP_POLITICAL_BASES = {
     RACE_BORG: "Borg",
 }
 
+# Bare player-facing templates are suitable catalog identities but a few are
+# not usable configurations. Award a known stock configured variant while
+# preserving the displayed hull class and auction row.
+SHIPYARD_AWARD_VARIANTS = {
+    "Sovereign": "Sovereign A",
+}
+
+
+def _shipyard_award_defaults(defaults: dict, asset_root: Path | None = None) -> dict:
+    variant = SHIPYARD_AWARD_VARIANTS.get(str(defaults["sub_name"]))
+    if variant is None:
+        return defaults
+    root = asset_root or ASSET_ROOT
+    if root is None:
+        return defaults
+    specs = root / "Specs"
+    if not specs.is_dir():
+        specs = root / "Spec"
+    return _load_ship_defaults(
+        specs / "DefaultCore.txt", specs / "DefaultLoadOut.txt", variant
+    )
+
 
 def _shipyard_defaults(race: int, asset_root: Path | None = None) -> tuple[dict, ...]:
     """Load the stock, player-facing ship classes for one empire."""
     root = asset_root or ASSET_ROOT
     if root is None:
-        raise RuntimeError("SFC3_ASSET_ROOT must point to the installed SFC3 Assets directory")
+        raise RuntimeError("server-kit asset root is required for ship definitions")
     specs = root / "Specs"
     if not specs.is_dir():
         specs = root / "Spec"
@@ -1844,15 +2070,33 @@ def _parse_bid_request(
     if len(payload) < 41 or payload[0] != 1:
         raise ValueError("truncated Shipyard bid request")
     callback = _parse_async_return(payload)
-    auction_item_id, bidder_id, bid_mode, value = struct.unpack_from("<IIII", payload, 13)
-    maximum_bid, modifier_count = struct.unpack_from("<dI", payload, 29)
+    auction_item_id, bidder_id, auction_type, bid_mode = struct.unpack_from("<IIII", payload, 13)
+    scalar, modifier_count = struct.unpack_from("<dI", payload, 29)
     expected = 41 + modifier_count * 4
     if len(payload) != expected:
         raise ValueError("invalid Shipyard bid request length")
     modifiers = (
         struct.unpack_from(f"<{modifier_count}f", payload, 41) if modifier_count else ()
     )
-    return callback, auction_item_id, bidder_id, bid_mode, value, maximum_bid, modifiers
+    return callback, auction_item_id, bidder_id, auction_type, bid_mode, scalar, modifiers
+
+
+def _shipyard_bid_maximum(current_bid: int, bid_mode: int) -> int:
+    """Apply the retail tAuctionItem bid-button increment to a displayed bid."""
+    # The stock GetBidModeValue routine uses enum values 2 and 3 for the two
+    # fixed ship-auction buttons and 9 and 10 for their percentage partners.
+    # __ftol truncates the percentage result before it is added to the bid.
+    if bid_mode == 2:
+        increment = 5
+    elif bid_mode in {3, 4, 5, 6, 7}:
+        increment = 10
+    elif bid_mode == 9:
+        increment = max(1, int(current_bid * 0.05))
+    elif bid_mode == 10:
+        increment = max(1, int(current_bid * 0.10))
+    else:
+        increment = 1
+    return current_bid + increment
 
 
 def _place_shipyard_bid(
@@ -1944,7 +2188,7 @@ def _settle_shipyard_bids(*, now: float | None = None) -> tuple[dict, ...]:
         if not 0 <= index < len(catalog):
             del auctions[ship_id_text]
             continue
-        defaults = catalog[index]
+        defaults = _shipyard_award_defaults(catalog[index])
         price = int(bid.get("current_bid", defaults["hull_cost"]))
         record["prestige"] = max(0, int(record.get("prestige", 0)) - price)
         record["ship"] = {
@@ -2036,7 +2280,7 @@ def _load_ship_defaults(core_path: Path, loadout_path: Path, model_name: str) ->
 def _starter_ship_defaults(race: int, asset_root: Path | None = None) -> dict:
     root = asset_root or ASSET_ROOT
     if root is None:
-        raise RuntimeError("SFC3_ASSET_ROOT must point to the installed SFC3 Assets directory")
+        raise RuntimeError("server-kit asset root is required for ship definitions")
     model_name, _ship_name, _class_type = _starting_ship_for_race(race)
     specs = root / "Specs"
     if not specs.is_dir():
@@ -2052,17 +2296,24 @@ def _character_ship_defaults(record: dict, asset_root: Path | None = None) -> di
     record = _normalize_character_record(record)
     root = asset_root or ASSET_ROOT
     if root is None:
-        raise RuntimeError("SFC3_ASSET_ROOT must point to the installed SFC3 Assets directory")
+        raise RuntimeError("server-kit asset root is required for ship definitions")
     specs = root / "Specs"
     if not specs.is_dir():
         specs = root / "Spec"
     model_name = str(record["ship"].get("loadout_name") or record["ship"]["class_name"])
     try:
-        return _load_ship_defaults(
+        defaults = _load_ship_defaults(
             specs / "DefaultCore.txt", specs / "DefaultLoadOut.txt", model_name
         )
     except ValueError:
-        return _starter_ship_defaults(int(record["race"]), root)
+        defaults = _starter_ship_defaults(int(record["race"]), root)
+    refit = record.get("refit", {})
+    items = refit.get("items") if isinstance(refit, dict) else None
+    if isinstance(items, list) and all(isinstance(item, str) for item in items):
+        defaults = dict(defaults)
+        defaults["items"] = tuple(item for item in items if item)
+        defaults["loadout_fields"] = tuple(defaults["loadout_fields"][:6]) + tuple(items)
+    return defaults
 
 
 def _stored_character_payload(account: str, record: dict) -> bytes:
@@ -2316,6 +2567,8 @@ class DynamicSecurityClient:
         self.verification_id = ""
         self.player_relay_address = None
         self.viewport_relay_address = None
+        self.clock_subscribers: set[tuple[int, int, int]] = set()
+        self.clock_task: asyncio.Task | None = None
 
     def _log(self, level, msg, *args, **kwargs):
         getattr(log, level)(
@@ -2326,6 +2579,7 @@ class DynamicSecurityClient:
 
     async def run(self):
         self._log("info", "CONNECT sw_id=0x%08x", self.sw_id)
+        self.clock_task = asyncio.create_task(self._clock_loop())
         try:
             await self._handle()
         except asyncio.IncompleteReadError:
@@ -2335,11 +2589,34 @@ class DynamicSecurityClient:
         except Exception as exc:
             self._log("error", "error: %s", exc, exc_info=True)
         finally:
+            if self.clock_task is not None:
+                self.clock_task.cancel()
             self.writer.close()
             try:
                 await self.writer.wait_closed()
             except (ConnectionError, OSError):
                 pass
+
+    async def _clock_loop(self):
+        """Deliver the retail clock relay's asynchronous turn-break updates."""
+        while True:
+            state = _load_campaign_clock()
+            _turns_per_year, milliseconds_per_turn = _clock_settings()
+            elapsed_ms = max(0.0, (time.time() - state["epoch_unix"]) * 1000.0)
+            remaining_ms = milliseconds_per_turn - (elapsed_ms % milliseconds_per_turn)
+            await asyncio.sleep(max(0.05, remaining_ms / 1000.0))
+            if not self.clock_subscribers:
+                continue
+            payload = _clock_snapshot_payload()
+            for callback in tuple(self.clock_subscribers):
+                self.writer.write(_nswitch_frame(*callback, payload))
+            await self.writer.drain()
+            self._log(
+                "info",
+                "-> campaign turn break turn=%d subscribers=%d",
+                _campaign_turn(),
+                len(self.clock_subscribers),
+            )
 
     async def _handle(self):
         if not await self._gt2_handshake():
@@ -2549,7 +2826,7 @@ class DynamicSecurityClient:
                     callback[0],
                     callback[1],
                     2,
-                    _character_logon_payload(*self.current_character),
+                    _character_logon_payload(*self.current_character, self.current_record),
                 ))
                 await self.writer.drain()
                 self._log(
@@ -2577,6 +2854,7 @@ class DynamicSecurityClient:
                 self._log("warning", "unknown relay request name_len=%d", len(relay_name))
             if (sw, obj, ch) == (0, 4, 2):
                 callback = _parse_callback(payload)
+                self.clock_subscribers.add(callback)
                 self.writer.write(_nswitch_frame(
                     callback[0], callback[1], callback[2], _clock_snapshot_payload()
                 ))
@@ -2631,28 +2909,41 @@ class DynamicSecurityClient:
                 self._log("info", "-> generated Supply Dock ship state")
                 continue
             if (sw, obj, ch) == (0, 22, 13):
-                callback, ship_id, account, desired = _parse_update_stores_request(payload)
-                response = b"\x00"
-                if (
-                    self.current_character is not None
-                    and account == self.current_character[0]
-                    and ship_id == SHIP_DATABASE_ID
-                ):
-                    try:
+                callback = _parse_callback(payload)
+                response = (
+                    b"\x01" + _updated_ship_payload(self.current_record) + b"\x00"
+                    if self.current_record is not None else b"\x00"
+                )
+                try:
+                    _callback, character_id, ship_name, desired = _parse_update_stores_request(payload)
+                    if (
+                        self.current_character is not None
+                        and character_id == CHARACTER_DATABASE_ID
+                        and ship_name == str(self.current_record["ship"]["name"])
+                    ):
                         defaults = _character_ship_defaults(self.current_record)
-                        current = self.current_record.get("stores", {})
-                        increments = {
-                            name: desired[name][0] - int(current.get(name, defaults[name][0]))
-                            for name in ("shuttles", "marines", "mines")
+                        requested = {
+                            "shuttles": int(desired["shuttles"][2]),
+                            "marines": int(desired["misc_desired"][0]),
+                            "mines": int(desired["misc_desired"][1]),
                         }
-                        if any(value < 0 for value in increments.values()):
-                            raise ValueError("Supply Dock cannot reduce stores")
-                        self.current_record = _purchase_supplies(
-                            account, **increments
+                        self._log(
+                            "info",
+                            "Supply Dock decoded groups=%s requested counts=%s current=%s maxima=%s",
+                            desired,
+                            requested,
+                            {
+                                name: int(self.current_record.get("stores", {}).get(name, defaults[name][2]))
+                                for name in requested
+                            },
+                            {name: int(defaults[name][1]) + 1 for name in requested},
+                        )
+                        self.current_record = _update_supplies(
+                            self.current_character[0], requested
                         )
                         response = b"\x01" + _updated_ship_payload(self.current_record) + b"\x01"
-                    except (OSError, RuntimeError, ValueError) as exc:
-                        self._log("warning", "Supply Dock update rejected: %s", exc)
+                except (KeyError, OSError, RuntimeError, ValueError) as exc:
+                    self._log("warning", "Supply Dock update rejected: %s", exc)
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
                 self._log("info", "-> Supply Dock update result=%d", response[0])
@@ -2678,11 +2969,20 @@ class DynamicSecurityClient:
                     callback,
                     ship_id,
                     bidder_id,
-                    _bid_mode,
-                    _value,
-                    maximum_bid,
+                    auction_type,
+                    bid_mode,
+                    scalar,
                     _modifiers,
                 ) = _parse_bid_request(payload)
+                self._log(
+                    "info",
+                    "Shipyard bid decoded item=%d bidder=%d type=%d mode=%d scalar=%s",
+                    ship_id,
+                    bidder_id,
+                    auction_type,
+                    bid_mode,
+                    scalar,
+                )
                 if (
                     bidder_id != CHARACTER_DATABASE_ID
                     or self.current_character is None
@@ -2690,6 +2990,20 @@ class DynamicSecurityClient:
                     response = struct.pack("<I", 0)
                 else:
                     try:
+                        bid_factor, _turns, _limit = _economy_ship_auction_settings()
+                        defaults = _shipyard_defaults(self.current_character[3])
+                        index = ship_id - (AUCTION_DATABASE_ID_BASE + 1000)
+                        if not 0 <= index < len(defaults):
+                            raise ValueError("unknown Shipyard item ID")
+                        state = _load_campaign_clock()
+                        saved = state.get("auctions", {}).get(str(ship_id), {})
+                        displayed_bid = int(
+                            saved.get(
+                                "current_bid",
+                                max(1, int(defaults[index]["hull_cost"] * bid_factor * scalar)),
+                            )
+                        )
+                        maximum_bid = _shipyard_bid_maximum(displayed_bid, bid_mode)
                         response, result = _place_shipyard_bid(
                             self.current_character[3],
                             self.current_character[0],
@@ -2704,7 +3018,7 @@ class DynamicSecurityClient:
                 await self.writer.drain()
                 self._log("info", "-> Shipyard bid result=%d", result)
                 continue
-            if (sw, obj, ch) == (0, 6, 28):
+            if (sw, obj, ch) == (0, 6, 11):
                 callback = _parse_callback(payload)
                 if len(payload) != 16:
                     raise ValueError("invalid open-Shipyard-bids request length")
@@ -2722,6 +3036,23 @@ class DynamicSecurityClient:
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
                 self._log("info", "-> %d open Shipyard bid IDs", len(open_ids))
+                continue
+            if (sw, obj, ch) == (0, 6, 28):
+                callback = _parse_callback(payload)
+                if len(payload) != 16:
+                    raise ValueError("invalid friendly-base request length")
+                character_id = struct.unpack_from("<I", payload, 12)[0]
+                at_friendly_base = False
+                if character_id == CHARACTER_DATABASE_ID and self.current_record is not None:
+                    at_friendly_base = _at_friendly_base_or_planet(
+                        tuple(self.current_record["position"]),
+                        int(self.current_record["race"]),
+                    )
+                # tIsCharacterAtFriendlyBaseReq::tRep(atBase, success, reason).
+                response = bytes((int(at_friendly_base), 1, 0))
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> friendly-base status=%d", at_friendly_base)
                 continue
             if (sw, obj, ch) == (0, 6, 20):
                 callback, character_id, _for_update = (
@@ -2761,16 +3092,39 @@ class DynamicSecurityClient:
                 await self.writer.drain()
                 self._log("info", "-> server-kit officer review with current ship config")
                 continue
+            if (sw, obj, ch) == (0, 6, 8):
+                callback, character_id = _parse_free_officers_request(payload)
+                # tFreeOfficersInReviewReq::tRep is a single success byte.
+                response = b"\x01" if (
+                    character_id == CHARACTER_DATABASE_ID
+                    and self.current_character is not None
+                ) else b"\x00"
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> freed officer-review reservation")
+                continue
+            if (sw, obj, ch) == (0, 6, 13):
+                callback = _parse_callback(payload)
+                if len(payload) != 16:
+                    raise ValueError("invalid character-prestige request length")
+                character_id = struct.unpack_from("<I", payload, 12)[0]
+                response = _character_prestige_payload(
+                    self.current_record
+                    if character_id == CHARACTER_DATABASE_ID else None
+                )
+                self.writer.write(_nswitch_frame(*callback, response))
+                await self.writer.drain()
+                self._log("info", "-> current and lifetime character prestige")
+                continue
             if (sw, obj, ch) == (0, 6, 39):
                 callback, character_id, assignments = _parse_purchase_officers_request(payload)
-                response = b"\x00"
+                response = b"\x00\x00"
                 if character_id == CHARACTER_DATABASE_ID and self.current_character is not None:
                     try:
-                        for officer_id, station in assignments.items():
-                            self.current_record = _purchase_officer(
-                                self.current_character[0], officer_id, station=station
-                            )
-                        response = b"\x01"
+                        self.current_record = _purchase_officers(
+                            self.current_character[0], assignments
+                        )
+                        response = b"\x01\x01"
                     except (OSError, RuntimeError, ValueError) as exc:
                         self._log("warning", "Officer purchase rejected: %s", exc)
                 self.writer.write(_nswitch_frame(*callback, response))
@@ -2779,7 +3133,7 @@ class DynamicSecurityClient:
                 continue
             if (sw, obj, ch) == (0, 6, 38):
                 callback, character_id, ship_id, config = _parse_purchase_config_request(payload)
-                response = b"\x00"
+                response = b"\x00\x00"
                 if (
                     character_id == CHARACTER_DATABASE_ID
                     and ship_id == SHIP_DATABASE_ID
@@ -2792,7 +3146,7 @@ class DynamicSecurityClient:
                         self.current_record = _save_refit(
                             self.current_character[0], fields[2], list(fields[6:])
                         )
-                        response = b"\x01"
+                        response = b"\x01\x01"
                     except (OSError, RuntimeError, ValueError) as exc:
                         self._log("warning", "Refit purchase rejected: %s", exc)
                 self.writer.write(_nswitch_frame(*callback, response))
@@ -2800,16 +3154,20 @@ class DynamicSecurityClient:
                 self._log("info", "-> Refit purchase result=%d", response[0])
                 continue
             if (sw, obj, ch) == (0, 27, 2):
-                callback, character_id = _parse_news_request(payload)
-                stories = ()
-                if character_id == CHARACTER_DATABASE_ID and self.current_character is not None:
+                callback, requested_story_id = _parse_news_request(payload)
+                story = None
+                if self.current_character is not None:
                     stories = tuple(_load_campaign_clock().get("news", ()))
-                    response = _news_response_payload(stories)
+                    story = next(
+                        (item for item in stories if int(item.get("id", -1)) == requested_story_id),
+                        stories[0] if stories else _welcome_news_story(requested_story_id),
+                    )
+                    response = _news_response_payload(story)
                 else:
                     response = struct.pack("<I", 0)
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
-                self._log("info", "-> News request (%d serialized stories)", len(stories))
+                self._log("info", "-> News request story=%s", story and story["id"])
                 continue
             if (sw, obj, ch) == (0, 24, 10):
                 callback, character_id, match_mode = _parse_mission_match_request(payload)
@@ -2838,9 +3196,9 @@ class DynamicSecurityClient:
             if (sw, obj, ch) == (0, 24, 11):
                 callback, character_id = _parse_verify_mission_request(payload)
                 # eCanChooseMissionResponses value zero is the successful/default enum.
-                response = b"\x01\x00" if (
+                response = struct.pack("<IB", 1, 0) if (
                     character_id == CHARACTER_DATABASE_ID and self.current_character is not None
-                ) else b"\x00"
+                ) else struct.pack("<I", 0)
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
                 self._log("info", "-> mission-choice eligibility response")
@@ -2862,7 +3220,7 @@ class DynamicSecurityClient:
                         offered["battle"] = battle
                         offered["status"] = "accepted"
                         _write_campaign_state(state)
-                        response = b"\x01\x00"
+                        response = b"\x01"
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
                 self._log("info", "-> mission-choice result=%d", response[0])
@@ -2872,12 +3230,13 @@ class DynamicSecurityClient:
                 if self.current_character is None or self.current_record is None:
                     raise ValueError("move request preceded character logon")
                 current = tuple(self.current_record["position"])
+                distance = _hex_distance(current, destination)
                 accepted = (
                     _character_id == CHARACTER_DATABASE_ID
                     and self.viewport_relay_address is not None
                     and 0 <= destination[0] < CAMPAIGN_MAP_WIDTH
                     and 0 <= destination[1] < CAMPAIGN_MAP_HEIGHT
-                    and _is_adjacent_hex(current, destination)
+                    and distance > 0
                 )
                 if accepted:
                     self.current_record["position"] = list(destination)
@@ -2886,7 +3245,8 @@ class DynamicSecurityClient:
                         self.current_character[0], self.current_record
                     )
                 self.writer.write(_nswitch_frame(
-                    callback[0], callback[1], callback[2], _move_response_payload(accepted)
+                    callback[0], callback[1], callback[2],
+                    _move_response_payload(accepted, max(1, distance))
                 ))
                 await self.writer.drain()
                 if accepted and self.viewport_relay_address is not None:
@@ -2903,7 +3263,7 @@ class DynamicSecurityClient:
                         ),
                     ))
                     await self.writer.drain()
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(max(1, distance))
                     self.writer.write(_nswitch_frame(
                         viewport_switch,
                         viewport_object,
@@ -2916,10 +3276,11 @@ class DynamicSecurityClient:
                     self._log("info", "-> viewport movement start/completion")
                 self._log(
                     "info",
-                    "-> movement %s destination=(%d,%d)",
+                    "-> movement %s destination=(%d,%d) distance=%d",
                     "accepted" if accepted else "rejected",
                     destination[0],
                     destination[1],
+                    distance,
                 )
                 continue
             if (sw, obj, ch) == (0, 6, 12):

@@ -73,6 +73,12 @@ class DynamicSecurityWireTests(unittest.TestCase):
             ((9, 8, 7), 3002, server.CHARACTER_DATABASE_ID, 1, 0, 1300.0, (1.0, 0.5)),
         )
 
+    def test_shipyard_bid_buttons_compute_retail_increments(self):
+        self.assertEqual(server._shipyard_bid_maximum(2800, 2), 2805)
+        self.assertEqual(server._shipyard_bid_maximum(2800, 3), 2810)
+        self.assertEqual(server._shipyard_bid_maximum(2800, 9), 2940)
+        self.assertEqual(server._shipyard_bid_maximum(2800, 10), 3080)
+
     def test_shipyard_bid_persists_and_accepts_initial_minimum(self):
         defaults = {
             "hull_cost": 1250,
@@ -170,8 +176,7 @@ class DynamicSecurityWireTests(unittest.TestCase):
 
     def test_purchase_officers_request_shape(self):
         payload = (
-            b"\x01"
-            + struct.pack("<III", 9, 8, 7)
+            struct.pack("<III", 9, 8, 7)
             + struct.pack("<II", server.CHARACTER_DATABASE_ID, 2)
             + struct.pack("<IIII", 1000, 0x60, 1001, 0x61)
         )
@@ -180,17 +185,133 @@ class DynamicSecurityWireTests(unittest.TestCase):
             ((9, 8, 7), server.CHARACTER_DATABASE_ID, {1000: 0x60, 1001: 0x61}),
         )
 
+    def test_purchase_officers_single_assignment_is_retail_28_byte_shape(self):
+        payload = (
+            struct.pack("<III", 9, 8, 7)
+            + struct.pack("<II", server.CHARACTER_DATABASE_ID, 1)
+            + struct.pack("<II", 1000, 0x60)
+        )
+        self.assertEqual(len(payload), 28)
+        self.assertEqual(
+            server._parse_purchase_officers_request(payload),
+            ((9, 8, 7), server.CHARACTER_DATABASE_ID, {1000: 0x60}),
+        )
+
+    def test_purchase_officers_rejects_marker_prefixed_or_truncated_shape(self):
+        retail_payload = (
+            struct.pack("<III", 9, 8, 7)
+            + struct.pack("<II", server.CHARACTER_DATABASE_ID, 1)
+            + struct.pack("<II", 1000, 0x60)
+        )
+        with self.assertRaises(ValueError):
+            server._parse_purchase_officers_request(b"\x01" + retail_payload)
+        with self.assertRaises(ValueError):
+            server._parse_purchase_officers_request(retail_payload[:-1])
+
+    def test_purchased_officer_replaces_station_and_is_removed_from_review(self):
+        old_characters = server.CHARACTER_STORE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.CHARACTER_STORE_PATH = Path(directory) / "characters.json"
+                server.CHARACTER_STORE_PATH.write_text(json.dumps({
+                    "captain": {
+                        "race": server.RACE_FEDERATION,
+                        "character_name": "Test",
+                        "client_address": "local",
+                        "prestige": 20,
+                        "officers": [],
+                    }
+                }), encoding="utf-8")
+                defaults = {
+                    "sub_name": "Norway",
+                    "items": (
+                        "OFFICER:HELM:",
+                        "PHASER IX:1",
+                    ),
+                }
+                with (
+                    mock.patch.object(server, "_officer_names", return_value=("INCOMING",)),
+                    mock.patch.object(server, "_officer_review_limit", return_value=1),
+                    mock.patch.object(server, "_character_ship_defaults", return_value=defaults),
+                ):
+                    record = server._purchase_officer(
+                        "captain", 1000, station=server.OFFICER_STATIONS[0]
+                    )
+                self.assertEqual(record["prestige"], 120)
+                self.assertEqual(record["officers"][0]["name"], "INCOMING")
+                self.assertTrue(record["refit"]["items"][0].startswith("OFFICER:HELM:INCOMING:"))
+                with (
+                    mock.patch.object(
+                        server, "_officer_names", return_value=("INCOMING", "SECOND")
+                    ),
+                    mock.patch.object(server, "_officer_review_limit", return_value=2),
+                ):
+                    remaining = server._generated_officers(
+                        server.RACE_FEDERATION, (1000,)
+                    )
+                self.assertTrue(remaining)
+                self.assertNotIn(1000, {
+                    struct.unpack_from("<I", officer)[0] for officer in remaining
+                })
+        finally:
+            server.CHARACTER_STORE_PATH = old_characters
+
+    def test_free_officers_request_shape(self):
+        payload = struct.pack("<IIII", 9, 8, 7, server.CHARACTER_DATABASE_ID)
+        self.assertEqual(
+            server._parse_free_officers_request(payload),
+            ((9, 8, 7), server.CHARACTER_DATABASE_ID),
+        )
+
     def test_update_stores_request_shape(self):
         stores = server._stores_state_payload(
-            shuttle_counts=(3, 4, 2), mine_counts=(2, 4, 4),
-            marine_counts=(1, 4, 4), spare_counts=(0, 0, 1),
+            shuttle_counts=(3, 4, 2), misc_maximum=(2, 4, 4),
+            misc_current=(1, 4, 4), misc_desired=(0, 0, 1),
         )
-        payload = b"\x01" + struct.pack("<III", 9, 8, 7) + struct.pack("<I", server.SHIP_DATABASE_ID) + server._pack_str("captain") + stores
-        callback, ship_id, account, decoded = server._parse_update_stores_request(payload)
-        self.assertEqual((callback, ship_id, account), ((9, 8, 7), server.SHIP_DATABASE_ID, "captain"))
+        payload = struct.pack("<III", 9, 8, 7) + struct.pack("<I", server.CHARACTER_DATABASE_ID) + server._pack_str("USS Venture") + stores
+        callback, character_id, ship_name, decoded = server._parse_update_stores_request(payload)
+        self.assertEqual((callback, character_id, ship_name), ((9, 8, 7), server.CHARACTER_DATABASE_ID, "USS Venture"))
+        self.assertEqual(len(payload), 147)
         self.assertEqual(decoded["shuttles"], (3, 4, 2))
-        self.assertEqual(decoded["mines"], (2, 4, 4))
-        self.assertEqual(decoded["marines"], (1, 4, 4))
+        self.assertEqual(decoded["misc_maximum"], (2, 4, 4))
+        self.assertEqual(decoded["misc_current"], (1, 4, 4))
+        self.assertEqual(decoded["misc_desired"], (0, 0, 1))
+        self.assertEqual(len(decoded["items"]), 25)
+        self.assertEqual(decoded["items"][0], (-1, 0))
+
+    def test_supply_update_charges_buys_and_credits_sales(self):
+        old_characters = server.CHARACTER_STORE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.CHARACTER_STORE_PATH = Path(directory) / "characters.json"
+                server.CHARACTER_STORE_PATH.write_text(json.dumps({
+                    "captain": {
+                        "race": 0, "character_name": "Test", "client_address": "local",
+                        "prestige": 20, "stores": {"shuttles": 2, "marines": 2, "mines": 2},
+                    }
+                }), encoding="utf-8")
+                with mock.patch.object(server, "_character_ship_defaults", return_value={
+                    "shuttles": (2, 2, 4), "marines": (2, 4, 4), "mines": (2, 4, 4),
+                }):
+                    record = server._update_supplies(
+                        "captain", {"shuttles": 3, "marines": 1, "mines": 2}
+                    )
+                self.assertEqual(record["stores"], {"shuttles": 3, "marines": 1, "mines": 2})
+                self.assertEqual(record["prestige"], 20)
+        finally:
+            server.CHARACTER_STORE_PATH = old_characters
+
+    def test_logon_payload_includes_persistent_prestige(self):
+        with mock.patch.object(server, "_starting_prestige", return_value=200):
+            record = server._normalize_character_record({"race": 0, "prestige": 77})
+            payload = server._character_logon_payload("captain", "Test", "local", 0, record)
+        offset = 4
+        _address, offset = server._unpack_string(payload, offset)
+        _account, offset = server._unpack_string(payload, offset)
+        offset += 4
+        _name, offset = server._unpack_string(payload, offset)
+        values = struct.unpack_from("<IIIIIIII", payload, offset)
+        self.assertEqual(values[3:5], (77, 77))
 
     def test_purchase_config_request_round_trip(self):
         core = server._ship_core_payload(
@@ -203,16 +324,28 @@ class DynamicSecurityWireTests(unittest.TestCase):
             ("Federation", "Fed-Destroyer", "Norway", "Norway", "1", "", "Phaser IX"),
             4,
         )
-        payload = b"\x01" + struct.pack("<III", 9, 8, 7) + struct.pack("<II", server.CHARACTER_DATABASE_ID, server.SHIP_DATABASE_ID) + tng
+        payload = struct.pack("<III", 9, 8, 7) + struct.pack("<II", server.CHARACTER_DATABASE_ID, server.SHIP_DATABASE_ID) + tng
         callback, character_id, ship_id, config = server._parse_purchase_config_request(payload)
         self.assertEqual((callback, character_id, ship_id), ((9, 8, 7), 1, 2))
         self.assertEqual(config["loadout_fields"][2], "Norway")
-        self.assertEqual(config["revision"], 4)
+        self.assertEqual(config["configuration_scalar"], 4.0)
+
+    def test_character_prestige_reply_matches_live_channel_13_shape(self):
+        self.assertEqual(
+            server._character_prestige_payload(
+                {"prestige": 199, "lifetime_prestige": 12}
+            ),
+            struct.pack("<BII", 1, 199, 12),
+        )
+        self.assertEqual(
+            server._character_prestige_payload(None),
+            struct.pack("<BII", 0, 0, 0),
+        )
 
     def test_news_request_and_empty_response_shapes(self):
         request = b"\x01" + struct.pack("<III", 9, 8, 7) + struct.pack("<I", 1)
         self.assertEqual(server._parse_news_request(request), ((9, 8, 7), 1))
-        self.assertEqual(server._news_response_payload(), struct.pack("<II", 1, 0))
+        self.assertEqual(server._news_response_payload(), struct.pack("<I", 0))
 
     def test_news_story_response_uses_server_profile_color(self):
         old_server_root = server.SERVER_ASSET_ROOT
@@ -231,15 +364,15 @@ class DynamicSecurityWireTests(unittest.TestCase):
                     "id": 12, "text": "Campaign online", "channel": "system",
                     "priority": "med", "timestamp": 100, "sequence": 4,
                 }
-                payload = server._news_response_payload((item,))
-                self.assertEqual(struct.unpack_from("<II", payload), (1, 1))
-                self.assertEqual(struct.unpack_from("<II", payload, 8), (12, 0))
-                self.assertEqual(payload[16:19], bytes((3, 3, 0)))
-                count = struct.unpack_from("<I", payload, 19)[0]
+                payload = server._news_response_payload(item)
+                self.assertEqual(struct.unpack_from("<I", payload), (1,))
+                self.assertEqual(struct.unpack_from("<II", payload, 4), (12, 0))
+                self.assertEqual(payload[12:15], bytes((3, 3, 0)))
+                count = struct.unpack_from("<I", payload, 15)[0]
                 self.assertEqual(count, 1)
-                text_length = struct.unpack_from("<I", payload, 23)[0]
-                self.assertEqual(payload[27 : 27 + text_length], b"Campaign online")
-                tail = 27 + text_length
+                text_length = struct.unpack_from("<I", payload, 19)[0]
+                self.assertEqual(payload[23 : 23 + text_length], b"Campaign online")
+                tail = 23 + text_length
                 self.assertEqual(struct.unpack_from("<iiI", payload, tail), (100, 4, 0xFF4080))
         finally:
             server.SERVER_ASSET_ROOT = old_server_root
@@ -285,6 +418,7 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 server.SERVER_ASSET_ROOT = root
                 payload = server._clock_snapshot_payload(now=1_000.0)
                 self.assertEqual(len(payload), 21)
+                self.assertEqual(payload[0], 1)
                 self.assertEqual(
                     struct.unpack_from("<IIIII", payload, 1),
                     (0, 8, 10_000, 120_000, 2159),
@@ -448,12 +582,19 @@ class DynamicSecurityWireTests(unittest.TestCase):
             ),
         )
 
-    def test_hex_adjacency_uses_axial_neighbors(self):
-        current = (10, 10)
-        for destination in ((10, 9), (11, 10), (11, 11), (10, 11), (9, 10), (9, 9)):
-            self.assertTrue(server._is_adjacent_hex(current, destination))
-        for destination in ((10, 10), (11, 9), (9, 11), (12, 10)):
-            self.assertFalse(server._is_adjacent_hex(current, destination))
+    def test_hex_adjacency_uses_odd_column_offsets(self):
+        for destination in ((10, 9), (11, 9), (11, 10), (10, 11), (9, 10), (9, 9)):
+            self.assertTrue(server._is_adjacent_hex((10, 10), destination))
+        for destination in ((11, 9), (12, 10), (12, 11), (11, 11), (10, 10), (10, 11)):
+            self.assertTrue(server._is_adjacent_hex((11, 10), destination))
+        for destination in ((10, 10), (11, 11), (9, 11), (12, 10)):
+            self.assertFalse(server._is_adjacent_hex((10, 10), destination))
+
+    def test_hex_distance_supports_multi_hex_destinations(self):
+        self.assertEqual(server._hex_distance((25, 19), (26, 20)), 1)
+        self.assertEqual(server._hex_distance((26, 20), (27, 20)), 1)
+        self.assertEqual(server._hex_distance((27, 20), (25, 19)), 2)
+        self.assertEqual(server._hex_distance((27, 20), (27, 20)), 0)
 
     def test_federation_start_region_enables_friendly_facilities(self):
         homeworld = server.CAMPAIGN_HOMEWORLDS[server.RACE_FEDERATION]
@@ -513,11 +654,11 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual((class_name, model_name), ("Fed-Destroyer", "Norway"))
         self.assertEqual(struct.unpack_from("<I", core, offset)[0], 0)
 
-        ship = server._tng_ship_payload(core, ("Federation", "Norway", "USS Venture"), 7)
+        ship = server._tng_ship_payload(core, ("Federation", "Norway", "USS Venture"), 7.0)
         self.assertEqual(ship[:2], b"\x01\x01")
         loadout, offset = server._unpack_string(ship, 2 + len(core))
         self.assertEqual(loadout, "Federation\tNorway\tUSS Venture")
-        self.assertEqual(struct.unpack_from("<I", ship, offset)[0], 7)
+        self.assertEqual(struct.unpack_from("<f", ship, offset)[0], 7.0)
 
     def test_installed_default_parser_maps_all_starter_ships(self):
         assets = Path(r"D:\Games\GOG\Star Trek SFC3\Assets")
@@ -540,6 +681,34 @@ class DynamicSecurityWireTests(unittest.TestCase):
             self.assertEqual(len(vectors), 6)
             self.assertEqual(len(vectors[0]), len(vectors[1]))
             self.assertEqual(len(vectors[2]), len(vectors[3]))
+
+    def test_persisted_refit_items_override_stock_loadout_without_changing_baseline(self):
+        assets = Path(r"D:\Games\GOG\Star Trek SFC3\Assets")
+        if not assets.is_dir():
+            self.skipTest("local SFC3 asset install is unavailable")
+        record = server._normalize_character_record({
+            "race": server.RACE_FEDERATION,
+            "ship": {
+                "id": server.SHIP_DATABASE_ID,
+                "class_name": "Norway",
+                "loadout_name": "Norway",
+                "name": "USS Venture",
+                "class_type": 3,
+                "bpv": 250,
+                "damage": 1.0,
+                "flags": 0,
+            },
+            "refit": {"loadout_name": "Norway", "items": ["PHASER IX:1"]},
+        })
+        stock = server._load_ship_defaults(
+            assets / "Specs" / "DefaultCore.txt",
+            assets / "Specs" / "DefaultLoadOut.txt",
+            "Norway",
+        )
+        customized = server._character_ship_defaults(record, assets)
+        self.assertEqual(customized["items"], ("PHASER IX:1",))
+        self.assertEqual(customized["loadout_fields"][6:], ("PHASER IX:1",))
+        self.assertNotEqual(stock["items"], customized["items"])
 
     def test_weapon_arc_table_matches_executable_order(self):
         self.assertEqual(len(server.WEAPON_ARCS), 44)
@@ -646,7 +815,9 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual(struct.unpack("<fI", config[-8:]), (1.0, 1500))
 
         old_kit_root = server.SERVER_ASSET_ROOT
-        server.SERVER_ASSET_ROOT = Path(r"C:\Utilities\SFC3Server\Assets")
+        server.SERVER_ASSET_ROOT = (
+            Path(__file__).resolve().parent.parent / "assets" / "server-kit"
+        )
         try:
             names = server._officer_names(server.RACE_FEDERATION)[:8]
             officers = server._officers_to_review_payload(

@@ -1,8 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$ServerAddress = '192.168.0.55',
-    [string]$AssetRoot = 'D:\Games\GOG\Star Trek SFC3\Assets',
-    [string]$ServerAssetRoot = 'C:\Utilities\SFC3Server\Assets',
+    [string]$ServerAssetRoot = '',
     [string]$PythonPath = 'C:\Program Files\Python314\python.exe'
 )
 
@@ -11,6 +10,9 @@ $repoRoot = $PSScriptRoot
 $serverRoot = Join-Path $repoRoot 'server'
 $envPath = Join-Path $serverRoot '.env'
 $logRoot = Join-Path $serverRoot 'logs'
+if ([string]::IsNullOrWhiteSpace($ServerAssetRoot)) {
+    $ServerAssetRoot = Join-Path $repoRoot 'assets\server-kit'
+}
 
 if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
     throw "Python was not found at '$PythonPath'. Pass -PythonPath with the correct location."
@@ -18,11 +20,8 @@ if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
     throw "Private configuration is missing: '$envPath'. See server\.env.example."
 }
-if (-not (Test-Path -LiteralPath (Join-Path $AssetRoot 'Specs\DefaultCore.txt'))) {
-    throw "DefaultCore.txt was not found beneath '$AssetRoot'."
-}
-if (-not (Test-Path -LiteralPath (Join-Path $AssetRoot 'Specs\DefaultLoadOut.txt'))) {
-    throw "DefaultLoadOut.txt was not found beneath '$AssetRoot'."
+if (-not (Test-Path -LiteralPath (Join-Path $ServerAssetRoot 'Spec\DefaultCore.txt'))) {
+    throw "The vendored server-kit DefaultCore.txt was not found beneath '$ServerAssetRoot'."
 }
 
 # Import only SFC3 variables. Values are never echoed, especially SFC3_GT2_KEY.
@@ -38,7 +37,6 @@ if ([string]::IsNullOrWhiteSpace($env:SFC3_GT2_KEY)) {
 $env:SFC3_SERVER_HOST = $ServerAddress
 $env:SFC3_BIND_HOSTS = "127.0.0.1,$ServerAddress"
 $env:SFC3_ADVERTISE_HOST = $ServerAddress
-$env:SFC3_ASSET_ROOT = $AssetRoot
 $env:SFC3_SERVER_ASSET_ROOT = $ServerAssetRoot
 
 $requiredListeners = @(
@@ -99,7 +97,6 @@ try {
             SFC3_SERVER_HOST = $ServerAddress
             SFC3_BIND_HOSTS = "127.0.0.1,$ServerAddress"
             SFC3_ADVERTISE_HOST = $ServerAddress
-            SFC3_ASSET_ROOT = $AssetRoot
             SFC3_SERVER_ASSET_ROOT = $ServerAssetRoot
         }
 
