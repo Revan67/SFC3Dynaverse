@@ -26,20 +26,26 @@ Evidence labels used in project documentation:
 
 ## Current defects
 
-- **Canonical ship state:** Supply Dock, Refit, Officers, channel-7 refresh, and
-  relog can serialize different versions of the same ship. This is the likely
-  shared boundary behind the next three defects.
+- **Canonical ship state:** the replacement persists identity, stores, refit, and
+  transferred officers in one owned ship instance. SQL reconciliation exposed
+  that the other five client-displayed starting officers are synthesized from
+  empty template slots and have no server-owned records yet. Complete crew
+  materialization remains before this boundary is final.
 - **Supply Dock:** counts and prestige persisted in some runs, but buy/sell may
   remain on the intermediary black screen or report that stores could not be
   obtained. One marine test crashed the client.
 - **Refit:** every tested mutation reports overload, including removal. The
-  client accepts a retail remove/add/save, so the local configuration needs a
-  field-level comparison and client-validator trace.
-- **Officers:** transfers no longer crash, but replacement slots do not survive
-  relog.
-- **Clock:** internal turns advance and settle auctions, but the client has
-  displayed stale or malformed stardates. The recovered five-field structure
-  needs client validation.
+  client accepts a retail remove/add/save. Matching the retail response tail as
+  `prestige:uint32` followed by `economy:float` corrected the wire layout but did
+  not clear the overload, so the remaining configuration needs a field-level
+  comparison and client-validator trace in Ghidra.
+- **Officers:** the latest transfer committed BOWEN to the canonical ship,
+  rewrote its station slot, and survived relog. The client later crashed after a
+  subsequent review/cancel cycle, which still needs a focused reproduction.
+- **Clock:** the replacement derives the recovered five-field structure from
+  persisted campaign state and `Time.gf`. Rollover, restart, scheduling, and
+  auction-boundary tests pass; the retail client displayed the correct
+  `56200.824` stardate and received the next turn publication.
 - **Missions:** eligibility and choice replies are insufficient. The client
   requires a published battle item, full matched-mission exchange, and final
   ready-to-play message, so the button remains disabled.
@@ -54,9 +60,9 @@ Evidence labels used in project documentation:
 ## Main conclusions
 
 The project is no longer blocked on general connection or serializer discovery.
-Facility work should converge on one canonical persisted `tShip`; success bytes
-cannot compensate for disagreement between an immediate mutation reply, the
-channel-7 refresh, and the ship returned after relog.
+Facility work now shares one canonical persisted ship instance; the next gates
+are verifying its wire representation in the retail client and then completing
+each transaction-specific request/refresh sequence.
 
 Mission availability is not an unknown boolean. It requires a real battle item
 and the complete assignment/launch state machine. Tactical completion is a
@@ -84,6 +90,12 @@ structures, client decisions, and targeted captures.
 - Runtime data comes only from `assets/server-kit`; retail installations remain
   external research/client inputs.
 - Future mod overlays will override baseline assets without editing them.
+- Persistence will use a normalized, versioned SQLite schema. Retail-client wire
+  compatibility is required; compatibility with the original server binary or
+  its SQL Server schema is explicitly out of scope.
+- The pristine SQLite campaign template is generated from the effective
+  server-kit assets. First start copies it atomically to local working state;
+  subsequent starts never silently reseed an existing campaign.
 - CD-key verification remains permissive by default, with optional HMAC identity
   policies and no raw-key storage.
 - The operator GUI should cover service health, addresses, ports, firewall and

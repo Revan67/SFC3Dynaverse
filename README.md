@@ -106,6 +106,21 @@ components, checks for occupied ports, and writes logs beneath the ignored
     -PythonPath 'C:\Program Files\Python314\python.exe'
 ```
 
+### Campaign database lifecycle
+
+The pristine `server/default-campaign.sqlite3` template is generated from the
+server-kit definitions with:
+
+```powershell
+python server/build_default_database.py --force
+```
+
+On first start the server atomically copies it to the ignored local
+`server/campaign.local.sqlite3` and anchors the campaign clock. Later starts
+never replace or reseed the working database. The template contains initialized
+campaign/map state and asset provenance, but no player accounts or characters.
+Use `SFC3_DATABASE` or `SFC3_DEFAULT_DATABASE` to select alternate paths.
+
 Required listeners:
 
 | Protocol | Port | Role |
@@ -134,10 +149,11 @@ Non-permissive modes require `SFC3_IDENTITY_HMAC_SECRET`; strict identifiers are
 listed in `SFC3_REGISTERED_KEY_IDS`. Raw key material and reusable proofs must
 never be logged or stored.
 
-Local accounts and campaign state are written to ignored JSON files beneath
-`server/`. Password reset—not password recovery—and a mod-overlay directory are
-planned operator features. Baseline files under `assets/server-kit` should remain
-unchanged; future overrides will take precedence by relative path.
+Local accounts and campaign state still use ignored JSON compatibility files
+while the SQLite runtime cutover is tested. Password reset—not password
+recovery—and a mod-overlay directory are planned operator features. Baseline
+files under `assets/server-kit` should remain unchanged; future overrides will
+take precedence by relative path.
 
 ## Development
 

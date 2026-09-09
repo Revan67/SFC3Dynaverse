@@ -24,6 +24,8 @@ The project already has a working foundation:
 
 ## Milestone 1 — Canonical campaign clock
 
+**Status: implementation substantially complete; full crew persistence gap found during SQL reconciliation.**
+
 Build one clock model used by UI snapshots, auctions, missions, persistence, and
 simulation. Serialize the recovered five fields with retail semantics:
 
@@ -43,12 +45,19 @@ Work:
 
 Exit criteria:
 
-- The client displays the expected `2159.xx` progression without malformed or
+- The client displays the expected `56200.xx` progression without malformed or
   stale values.
 - Turns advance consistently without requiring player movement.
 - An auction closes on the configured turn and remains correct after restart.
 
+Automated validation now covers the recovered retail tuple, year rollover,
+unsigned field bounds, restart-stable epoch/turn state, next-turn scheduling,
+and an auction settlement exactly on its configured turn boundary. The remaining
+client validation confirmed a correct `56200.824` display and turn publication.
+
 ## Milestone 2 — Canonical `tShip` model and serializer
+
+**Status: implemented and retail-client validated.**
 
 Make one persisted ship representation authoritative for character login,
 fleet data, Supply Dock, Refit, Officers, Shipyard awards, channel-7 refresh,
@@ -70,6 +79,47 @@ Exit criteria:
 - Save/restart/relog round trips do not change loadout, stores, damage, name,
   officers, or capacities.
 - Existing starter and awarded ships still render correctly.
+
+The persistence boundary now migrates the prototype's detached stores, refit,
+and officer fields into the owned ship instance. Fleet data follows the persisted
+ship identity, class, and position; facility serializers resolve the same mutable
+loadout; and Shipyard awards create a complete configured instance. Automated
+tests cover legacy migration, restart equality, cross-facility configuration
+equality, and non-starter fleet identity. Client validation remains the exit gate.
+
+Client validation confirms the awarded Sovereign identity, Sovereign A mutable
+loadout selection, map marker/Center behavior, and stores `4/3/3` with capacities
+`7/21/25`. An officer exchange committed as BOWEN in station 100, updated the
+loadout slot, and survived relog. SQL reconciliation then proved that the other
+five client-displayed crew members were never materialized as server-owned
+officer records: only transferred officers currently persist. Complete starting
+crew materialization is therefore still required. The later client crash and
+Refit overload remain transaction-specific defects assigned to the Officers and
+Refit milestones.
+
+The released kit's `SQL/CreateTables.sql` confirms that characters, ships,
+officers, auctions, and campaign state are separate database entities and that a
+ship owns its TNG configuration, damage, and stores. A versioned SQLite schema now
+captures those relationships for the replacement server. Runtime migration from
+the prototype JSON stores will occur behind repository functions before SQLite is
+made the default; the JSON path remains active for this client-validation build.
+The complete migration scope and ordering are tracked in
+`sql-migration-inventory.md`.
+
+The recovered `Database.gf` process refined the cutover: schema migration 003
+adds campaign bootstrap metadata, the asset manifest, and persisted map records.
+`default-campaign.sqlite3` is now built from the server kit and copied atomically
+only when a working database does not exist. The current JSON stores were also
+imported transactionally and reconciled in SQLite. Runtime repository/shadow-mode
+work and complete character/crew instantiation remain separate exit gates.
+
+New-character bootstrap is now implemented in shadow mode. One canonical factory
+resolves the faction start and server-kit starter hull, creates mutable stores and
+the ordered loadout, materializes all six named officer stations, and inserts the
+account, character, ship, stores, items, and officers in one SQLite transaction.
+The same object is retained by JSON compatibility storage for client testing.
+Existing incomplete prototype characters are deliberately not changed by this
+path; they require an explicit backfill operation.
 
 ## Milestone 3 — Supply Dock transaction loop
 

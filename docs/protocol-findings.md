@@ -196,7 +196,7 @@ Local Shipyard selection, preview, bid increments, bid persistence, closing, and
 client-observed. A bid on the Sovereign survived relogging and settled after further campaign moves;
 the character then loaded with the Sovereign and the updated trade-in value. Settlement therefore
 works even though the client-facing clock is suspect. The stardate initially appeared not to advance
-and later rendered as `219.1342177` instead of the expected `2159.xx`, indicating a clock serializer
+and later rendered as `219.1342177` instead of the expected `56200.xx`, indicating a clock serializer
 or numeric-format mismatch rather than proof that turns failed to advance.
 
 Multi-hex movement also needs regression coverage. One two-hex diagonal attempt appeared to stall,

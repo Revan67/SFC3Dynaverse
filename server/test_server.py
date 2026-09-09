@@ -79,6 +79,12 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual(server._shipyard_bid_maximum(2800, 9), 2940)
         self.assertEqual(server._shipyard_bid_maximum(2800, 10), 3080)
 
+    def test_romulan_ship_uses_variant_as_player_facing_name(self):
+        defaults = server._starter_ship_defaults(server.RACE_ROMULAN)
+        self.assertEqual(defaults["sub_name"], "Falcon")
+        self.assertEqual(defaults["ui_name"], "Falcon")
+        self.assertEqual(defaults["model_name"], "RomulanFrigate")
+
     def test_shipyard_bid_persists_and_accepts_initial_minimum(self):
         defaults = {
             "hull_cost": 1250,
@@ -125,6 +131,77 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 self.assertEqual(saved["auctions"]["3000"]["bid_owner"], "leader")
         finally:
             server.CAMPAIGN_STATE_PATH = old_path
+
+    def test_auction_settlement_uses_restart_stable_clock_boundary(self):
+        old_campaign = server.CAMPAIGN_STATE_PATH
+        old_characters = server.CHARACTER_STORE_PATH
+        old_server_root = server.SERVER_ASSET_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                profile = root / "ServerProfiles"
+                profile.mkdir()
+                (profile / "Time.gf").write_text(
+                    "[Clock]\nTurnsPerYear=10000\nMilliSecondsPerTurn=1000\n"
+                    "[Clock/StartingDate]\nBaseYear=56200\n",
+                    encoding="ascii",
+                )
+                server.CAMPAIGN_STATE_PATH = root / "campaign.json"
+                server.CHARACTER_STORE_PATH = root / "characters.json"
+                server.SERVER_ASSET_ROOT = root
+                server.CAMPAIGN_STATE_PATH.write_text(json.dumps({
+                    "epoch_unix": 100.0,
+                    "initial_turn": 0,
+                    "auctions": {"3000": {
+                        "current_bid": 100,
+                        "bid_owner": "captain",
+                        "bid_maximum": 100,
+                        "turn_bid_made": 0,
+                        "escrow": 100,
+                    }},
+                }), encoding="utf-8")
+                server.CHARACTER_STORE_PATH.write_text(json.dumps({
+                    "captain": {
+                        "race": server.RACE_FEDERATION,
+                        "character_name": "Test",
+                        "client_address": "local",
+                        "prestige": 200,
+                    },
+                }), encoding="utf-8")
+                catalog = ({"hull_cost": 100, "ui_name": "Test Hull", "class_code": "DD"},)
+                award = {
+                    "hull_cost": 100,
+                    "ui_name": "Test Hull",
+                    "sub_name": "Test Loadout",
+                    "class_code": "DD",
+                    "shuttles": (1, 2, 1),
+                    "marines": (1, 2, 1),
+                    "mines": (1, 2, 1),
+                    "items": ("PHASER IX:1",),
+                }
+                with (
+                    mock.patch.object(server, "_economy_ship_auction_settings", return_value=(1.0, 3, 40)),
+                    mock.patch.object(server, "_shipyard_defaults", return_value=catalog),
+                    mock.patch.object(server, "_shipyard_award_defaults", return_value=award),
+                ):
+                    self.assertEqual(server._settle_shipyard_bids(now=102.999), ())
+                    settlements = server._settle_shipyard_bids(now=103.0)
+
+                self.assertEqual(len(settlements), 1)
+                self.assertEqual(settlements[0]["turn"], 3)
+                self.assertEqual(settlements[0]["class_name"], "Test Hull")
+                saved = json.loads(server.CAMPAIGN_STATE_PATH.read_text(encoding="utf-8"))
+                self.assertEqual(saved["epoch_unix"], 100.0)
+                self.assertEqual(saved["auctions"], {})
+                character = json.loads(
+                    server.CHARACTER_STORE_PATH.read_text(encoding="utf-8")
+                )["captain"]
+                self.assertEqual(character["prestige"], 100)
+                self.assertEqual(character["ship"]["class_name"], "Test Hull")
+        finally:
+            server.CAMPAIGN_STATE_PATH = old_campaign
+            server.CHARACTER_STORE_PATH = old_characters
+            server.SERVER_ASSET_ROOT = old_server_root
 
     def test_verification_policies_do_not_require_raw_key_storage(self):
         with mock.patch.dict(server.os.environ, {"SFC3_CDKEY_POLICY": "permissive"}, clear=False):
@@ -238,8 +315,8 @@ class DynamicSecurityWireTests(unittest.TestCase):
                         "captain", 1000, station=server.OFFICER_STATIONS[0]
                     )
                 self.assertEqual(record["prestige"], 120)
-                self.assertEqual(record["officers"][0]["name"], "INCOMING")
-                self.assertTrue(record["refit"]["items"][0].startswith("OFFICER:HELM:INCOMING:"))
+                self.assertEqual(record["ship"]["officers"][0]["name"], "INCOMING")
+                self.assertTrue(record["ship"]["refit"]["items"][0].startswith("OFFICER:HELM:INCOMING:"))
                 with (
                     mock.patch.object(
                         server, "_officer_names", return_value=("INCOMING", "SECOND")
@@ -296,7 +373,7 @@ class DynamicSecurityWireTests(unittest.TestCase):
                     record = server._update_supplies(
                         "captain", {"shuttles": 3, "marines": 1, "mines": 2}
                     )
-                self.assertEqual(record["stores"], {"shuttles": 3, "marines": 1, "mines": 2})
+                self.assertEqual(record["ship"]["stores"], {"shuttles": 3, "marines": 1, "mines": 2})
                 self.assertEqual(record["prestige"], 20)
         finally:
             server.CHARACTER_STORE_PATH = old_characters
@@ -411,7 +488,8 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 profile = root / "ServerProfiles"
                 profile.mkdir()
                 (profile / "Time.gf").write_text(
-                    "[Clock]\nTurnsPerYear=10000\nMilliSecondsPerTurn=120000\n",
+                    "[Clock]\nTurnsPerYear=10000\nMilliSecondsPerTurn=120000\n"
+                    "[Clock/StartingDate]\nBaseYear=56200\n",
                     encoding="ascii",
                 )
                 server.CAMPAIGN_STATE_PATH = root / "campaign.json"
@@ -421,13 +499,86 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 self.assertEqual(payload[0], 1)
                 self.assertEqual(
                     struct.unpack_from("<IIIII", payload, 1),
-                    (0, 8, 10_000, 120_000, 2159),
+                    (0, 0, 10_000, 120_000, 56_200),
                 )
                 self.assertEqual(server._campaign_turn(now=1_239.999), 1)
                 self.assertEqual(server._campaign_turn(now=1_240.0), 2)
         finally:
             server.CAMPAIGN_STATE_PATH = old_path
             server.SERVER_ASSET_ROOT = old_server_root
+
+    def test_clock_snapshot_matches_recovered_retail_semantics(self):
+        old_path = server.CAMPAIGN_STATE_PATH
+        old_server_root = server.SERVER_ASSET_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                profile = root / "ServerProfiles"
+                profile.mkdir()
+                (profile / "Time.gf").write_text(
+                    "[Clock]\nTurnsPerYear=10000\nMilliSecondsPerTurn=120000\n"
+                    "[Clock/StartingDate]\nBaseYear=56200\n",
+                    encoding="ascii",
+                )
+                server.CAMPAIGN_STATE_PATH = root / "campaign.json"
+                server.SERVER_ASSET_ROOT = root
+                server.CAMPAIGN_STATE_PATH.write_text(json.dumps({
+                    "epoch_unix": 1_000.0,
+                    "initial_turn": 93_528,
+                    "auctions": {},
+                }), encoding="utf-8")
+
+                snapshot = server._clock_snapshot(now=1_000.0)
+                self.assertEqual(
+                    snapshot,
+                    server.CampaignClockSnapshot(93_528, 9, 10_000, 120_000, 56_200),
+                )
+                self.assertEqual(
+                    struct.unpack_from("<IIIII", snapshot.payload(), 1),
+                    (93_528, 9, 10_000, 120_000, 56_200),
+                )
+        finally:
+            server.CAMPAIGN_STATE_PATH = old_path
+            server.SERVER_ASSET_ROOT = old_server_root
+
+    def test_clock_year_rollover_and_restart_use_persisted_epoch(self):
+        old_path = server.CAMPAIGN_STATE_PATH
+        old_server_root = server.SERVER_ASSET_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                profile = root / "ServerProfiles"
+                profile.mkdir()
+                (profile / "Time.gf").write_text(
+                    "[Clock]\nTurnsPerYear=10\nMilliSecondsPerTurn=1000\n"
+                    "[Clock/StartingDate]\nBaseYear=56200\n",
+                    encoding="ascii",
+                )
+                server.CAMPAIGN_STATE_PATH = root / "campaign.json"
+                server.SERVER_ASSET_ROOT = root
+                server.CAMPAIGN_STATE_PATH.write_text(json.dumps({
+                    "epoch_unix": 100.0,
+                    "initial_turn": 8,
+                    "auctions": {"3000": {"turn_bid_made": 8}},
+                }), encoding="utf-8")
+
+                self.assertEqual(server._clock_snapshot(now=101.999).current_year, 0)
+                self.assertEqual(server._clock_snapshot(now=102.0).current_turn, 10)
+                self.assertEqual(server._clock_snapshot(now=102.0).current_year, 1)
+                self.assertEqual(server._milliseconds_until_next_turn(now=102.25), 750.0)
+
+                reloaded = server._load_campaign_clock(now=200.0)
+                self.assertEqual(reloaded["epoch_unix"], 100.0)
+                self.assertEqual(reloaded["initial_turn"], 8)
+                self.assertEqual(server._campaign_turn(now=200.0), 108)
+                self.assertIn("3000", reloaded["auctions"])
+        finally:
+            server.CAMPAIGN_STATE_PATH = old_path
+            server.SERVER_ASSET_ROOT = old_server_root
+
+    def test_clock_snapshot_rejects_unsigned_overflow(self):
+        with self.assertRaises(ValueError):
+            server.CampaignClockSnapshot(0x1_0000_0000, 0, 1, 1, 0).payload()
 
     def test_map_size_shape_matches_retail_map(self):
         payload = server._map_size_payload()
@@ -657,7 +808,8 @@ class DynamicSecurityWireTests(unittest.TestCase):
         ship = server._tng_ship_payload(core, ("Federation", "Norway", "USS Venture"), 7.0)
         self.assertEqual(ship[:2], b"\x01\x01")
         loadout, offset = server._unpack_string(ship, 2 + len(core))
-        self.assertEqual(loadout, "Federation\tNorway\tUSS Venture")
+        self.assertEqual(loadout, "Federation\tNorway\tUSS Venture\t")
+        self.assertEqual(ship[offset - 1 : offset + 4], b"\t" + struct.pack("<f", 7.0))
         self.assertEqual(struct.unpack_from("<f", ship, offset)[0], 7.0)
 
     def test_installed_default_parser_maps_all_starter_ships(self):
@@ -812,7 +964,7 @@ class DynamicSecurityWireTests(unittest.TestCase):
         )
         self.assertEqual(config[:5], b"\x01" + struct.pack("<I", server.SHIP_DATABASE_ID))
         self.assertEqual(config[5:-8], expected_tng)
-        self.assertEqual(struct.unpack("<fI", config[-8:]), (1.0, 1500))
+        self.assertEqual(struct.unpack("<If", config[-8:]), (1500, 1.0))
 
         old_kit_root = server.SERVER_ASSET_ROOT
         server.SERVER_ASSET_ROOT = (
@@ -983,9 +1135,18 @@ class DynamicSecurityWireTests(unittest.TestCase):
 
     def test_character_store_round_trip(self):
         old_path = server.CHARACTER_STORE_PATH
+        old_persistence = server.PERSISTENCE
         try:
             with tempfile.TemporaryDirectory() as directory:
                 server.CHARACTER_STORE_PATH = Path(directory) / "characters.json"
+                server.PERSISTENCE = server.database.initialize(
+                    Path(directory) / "campaign.sqlite3"
+                )
+                server.PERSISTENCE.execute(
+                    "INSERT INTO campaigns(id, map_id, epoch_unix, initial_turn) "
+                    "VALUES(1, 'retail', 0, 0)"
+                )
+                server.PERSISTENCE.commit()
                 server._save_character(
                     "user@example", "Captain Test", "192.0.2.10", 2
                 )
@@ -997,9 +1158,28 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 self.assertEqual(record["map_id"], server.CAMPAIGN_MAP_ID)
                 self.assertEqual(record["ship"]["class_name"], "Falcon")
                 self.assertEqual(record["ship"]["id"], 2)
+                self.assertEqual(len(record["ship"]["officers"]), 6)
+                self.assertEqual(
+                    {item["station"] for item in record["ship"]["officers"]},
+                    set(server.OFFICER_STATIONS),
+                )
+                officer_items = [
+                    item for item in record["ship"]["refit"]["items"]
+                    if item.startswith("OFFICER:")
+                ]
+                self.assertEqual(len(officer_items), 6)
+                self.assertTrue(all(item.split(":")[2] for item in officer_items))
+                self.assertEqual(server.PERSISTENCE.execute(
+                    "SELECT COUNT(*) FROM officers WHERE ship_id=2"
+                ).fetchone()[0], 6)
                 payload = server._stored_character_payload("user@example", record)
                 self.assertEqual(struct.unpack_from("<I", payload, len(payload) - 4)[0], 0)
+                server.PERSISTENCE.close()
+                server.PERSISTENCE = old_persistence
         finally:
+            if server.PERSISTENCE is not None and server.PERSISTENCE is not old_persistence:
+                server.PERSISTENCE.close()
+            server.PERSISTENCE = old_persistence
             server.CHARACTER_STORE_PATH = old_path
 
     def test_old_character_coordinates_reset_when_campaign_map_changes(self):
@@ -1014,6 +1194,81 @@ class DynamicSecurityWireTests(unittest.TestCase):
         self.assertEqual(record["homeworld"], [24, 19])
         self.assertEqual(record["destination"], [-1, -1])
         self.assertEqual(record["map_id"], server.CAMPAIGN_MAP_ID)
+
+    def test_legacy_split_ship_state_migrates_into_one_persisted_instance(self):
+        legacy = server._normalize_character_record({
+            "race": server.RACE_FEDERATION,
+            "stores": {"shuttles": 3, "marines": 1, "mines": 2},
+            "refit": {"loadout_name": "Norway", "items": ["PHASER IX:1"]},
+            "officers": [{"id": 1000, "name": "KLEIMAN", "station": 96, "worth": 14}],
+        })
+        self.assertNotIn("stores", legacy)
+        self.assertNotIn("refit", legacy)
+        self.assertNotIn("officers", legacy)
+        self.assertEqual(legacy["ship"]["stores"]["shuttles"], 3)
+        self.assertEqual(legacy["ship"]["refit"]["items"], ["PHASER IX:1"])
+        self.assertEqual(legacy["ship"]["officers"][0]["name"], "KLEIMAN")
+
+    def test_canonical_ship_snapshot_survives_json_restart(self):
+        assets = Path(__file__).resolve().parent.parent / "assets" / "server-kit"
+        record = server._normalize_character_record({
+            "race": server.RACE_FEDERATION,
+            "ship": {
+                "id": 2, "owner_id": 1, "class_name": "Norway",
+                "loadout_name": "Norway", "name": "USS Persistent",
+                "class_type": 3, "bpv": 1250, "damage": 0.75, "flags": 3,
+                "turn_created": 42,
+                "stores": {"shuttles": 3, "marines": 1, "mines": 2},
+                "refit": {"loadout_name": "Norway", "items": ["PHASER IX:1"]},
+                "officers": [{"id": 1000, "name": "KLEIMAN", "station": 96, "worth": 14}],
+            },
+        })
+        before = server._canonical_ship_snapshot(record, assets)
+        restarted = json.loads(json.dumps(record))
+        self.assertEqual(server._canonical_ship_snapshot(restarted, assets), before)
+
+    def test_fleet_data_uses_persisted_ship_identity_class_and_position(self):
+        record = server._normalize_character_record({
+            "race": server.RACE_FEDERATION,
+            "map_id": server.CAMPAIGN_MAP_ID,
+            "position": [25, 20],
+            "ship": {
+                "id": 77, "class_name": "Sovereign", "loadout_name": "Sovereign A",
+                "name": "USS Venture", "class_type": 8, "bpv": 2800,
+                "damage": 1.0, "flags": 0,
+            },
+        })
+        payload = server._fleet_data_payload(server.RACE_FEDERATION, record)
+        self.assertEqual(
+            struct.unpack_from("<IIiiIBI", payload, 5),
+            (server.CHARACTER_DATABASE_ID, 77, 25, 20, 8, 1, 0),
+        )
+
+    def test_facility_payloads_share_exact_canonical_tng_configuration(self):
+        assets = Path(__file__).resolve().parent.parent / "assets" / "server-kit"
+        record = server._normalize_character_record({
+            "race": server.RACE_FEDERATION,
+            "ship": {
+                "id": 2, "class_name": "Norway", "loadout_name": "Norway",
+                "name": "USS Venture", "class_type": 3, "bpv": 1250,
+                "damage": 1.0, "flags": 0,
+                "refit": {"loadout_name": "Norway", "items": ["PHASER IX:1"]},
+            },
+        })
+        defaults = server._character_ship_defaults(record, assets)
+        expected = server._tng_ship_payload(
+            server._default_ship_core_payload(defaults), defaults["loadout_fields"]
+        )
+        self.assertIn(expected, server._supply_dock_payload(
+            server.RACE_FEDERATION, assets, record=record
+        ))
+        self.assertIn(expected, server._character_ship_config_payload(
+            server.RACE_FEDERATION, assets, record=record
+        ))
+        with mock.patch.object(server, "_generated_officers", return_value=()):
+            self.assertIn(expected, server._officers_to_review_payload(
+                server.RACE_FEDERATION, assets, record=record
+            ))
 
 
 class DynamicSecurityReaderTests(unittest.IsolatedAsyncioTestCase):

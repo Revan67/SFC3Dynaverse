@@ -32,7 +32,7 @@ resolve only from `assets/server-kit`; the retail installation is a research and
 | News rules | `...\ServerProfiles\News.gf` | News retention and publication settings |
 | Mission rules | `...\ServerProfiles\MissionMatching.gf`, `MissionGoals.gf`, `Goal.gf` | Mission selection and campaign goals |
 | Campaign template | `assets/server-kit/Scripts/Campaigns/Campaign 1.mct` | Default map selection, races, era, and mission list |
-| Database schema | `C:\Utilities\SFC3Server\SQL\CreateTables.sql` | Original entities, fields, and relationships |
+| Database schema | `assets/server-kit/SQL/CreateTables.sql` | Original entities, fields, and relationships; source reference for `server/schema.sql` |
 
 The verified clean E: GOG installation remains an external research reference when a controlled
 comparison is needed; it is not a runtime dependency. The server-kit `DefaultCore.txt` matches the
@@ -77,4 +77,5 @@ to the client presence flags, and preserves economy/strength values.
    and settlement remain.
 4. Add item pricing and availability to Supply Dock and Refit from the CommonSettings catalogs.
 5. Implement news retention/publication from `News.gf` and recovered request serializers.
-6. Analyze the SQL schema and `.sds` save as behavioral evidence for persistent campaign entities.
+6. The SQL schema has now informed the versioned SQLite entity model in
+   `server/schema.sql`; analyze the `.sds` save for populated-record evidence.

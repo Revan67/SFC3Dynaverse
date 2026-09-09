@@ -35,6 +35,9 @@ import struct
 import logging
 import os
 import time
+from dataclasses import dataclass
+
+import database
 from pathlib import Path
 
 from asset_sources import find_structured_asset, parse_gf
@@ -126,6 +129,14 @@ CAMPAIGN_STATE_PATH = Path(
         str(Path(__file__).with_name("campaign.local.json")),
     )
 )
+DATABASE_PATH = Path(
+    os.environ.get("SFC3_DATABASE", "").strip()
+    or str(Path(__file__).with_name("campaign.local.sqlite3"))
+)
+DEFAULT_DATABASE_PATH = Path(
+    os.environ.get("SFC3_DEFAULT_DATABASE", "").strip()
+    or str(Path(__file__).with_name("default-campaign.sqlite3"))
+)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SERVER_ASSET_ROOT = Path(
     os.environ.get(
@@ -136,6 +147,7 @@ SERVER_ASSET_ROOT = Path(
 # alias while the ship serializers still accept the older generic asset-root
 # argument, but do not load commercial retail installation assets at runtime.
 ASSET_ROOT = SERVER_ASSET_ROOT
+PERSISTENCE = None
 
 # ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -242,19 +254,50 @@ def _security_success_payload() -> bytes:
     return struct.pack("<II", 1, 0) + struct.pack("<I", len(message)) + message
 
 
-def _clock_settings() -> tuple[int, int]:
-    """Return turns/year and milliseconds/turn using normal asset precedence."""
+@dataclass(frozen=True)
+class CampaignClockConfig:
+    turns_per_year: int
+    milliseconds_per_turn: int
+    base_year: int
+
+
+@dataclass(frozen=True)
+class CampaignClockSnapshot:
+    current_turn: int
+    current_year: int
+    turns_per_year: int
+    milliseconds_per_turn: int
+    base_year: int
+
+    def payload(self) -> bytes:
+        values = (
+            self.current_turn,
+            self.current_year,
+            self.turns_per_year,
+            self.milliseconds_per_turn,
+            self.base_year,
+        )
+        if any(not 0 <= value <= 0xFFFFFFFF for value in values):
+            raise ValueError("campaign clock fields must fit unsigned 32-bit values")
+        return b"\x01" + struct.pack("<IIIII", *values)
+
+
+def _clock_config() -> CampaignClockConfig:
+    """Load the complete client-facing clock configuration from Time.gf."""
     source = find_structured_asset(
         "ServerProfiles/Time.gf",
         server_asset_root=SERVER_ASSET_ROOT,
         retail_asset_root=ASSET_ROOT,
     )
-    values = parse_gf(source.path).get("Clock", {})
+    profile = parse_gf(source.path)
+    values = profile.get("Clock", {})
+    starting_date = profile.get("Clock/StartingDate", {})
     turns_per_year = int(values.get("TurnsPerYear", 10_000))
     milliseconds_per_turn = int(values.get("MilliSecondsPerTurn", 120_000))
-    if turns_per_year <= 0 or milliseconds_per_turn <= 0:
+    base_year = int(starting_date.get("BaseYear", 56_200))
+    if turns_per_year <= 0 or milliseconds_per_turn <= 0 or base_year < 0:
         raise ValueError("Time.gf clock values must be positive")
-    return turns_per_year, milliseconds_per_turn
+    return CampaignClockConfig(turns_per_year, milliseconds_per_turn, base_year)
 
 
 def _load_campaign_clock(now: float | None = None) -> dict:
@@ -289,24 +332,37 @@ def _campaign_turn(now: float | None = None) -> int:
     """Calculate the current turn while preserving the epoch across restarts."""
     current_time = time.time() if now is None else float(now)
     state = _load_campaign_clock(current_time)
-    _turns_per_year, milliseconds_per_turn = _clock_settings()
+    config = _clock_config()
     elapsed_ms = max(0.0, (current_time - state["epoch_unix"]) * 1000.0)
-    return state["initial_turn"] + int(elapsed_ms // milliseconds_per_turn)
+    return state["initial_turn"] + int(elapsed_ms // config.milliseconds_per_turn)
+
+
+def _clock_snapshot(now: float | None = None) -> CampaignClockSnapshot:
+    """Return one canonical tCurrentTime snapshot with retail field semantics."""
+    config = _clock_config()
+    current_turn = _campaign_turn(now)
+    return CampaignClockSnapshot(
+        current_turn=current_turn,
+        current_year=current_turn // config.turns_per_year,
+        turns_per_year=config.turns_per_year,
+        milliseconds_per_turn=config.milliseconds_per_turn,
+        base_year=config.base_year,
+    )
 
 
 def _clock_snapshot_payload(now: float | None = None) -> bytes:
     """Build tCurrentTime using persistent time and server-kit cadence."""
-    turns_per_year, milliseconds_per_turn = _clock_settings()
-    # The client-facing year is not Time.gf's internal BaseYear (56200).
-    # Supplying that value produces malformed displays such as "219.1".
-    return b"\x01" + struct.pack(
-        "<IIIII",
-        _campaign_turn(now),
-        8,
-        turns_per_year,
-        milliseconds_per_turn,
-        2159,
-    )
+    return _clock_snapshot(now).payload()
+
+
+def _milliseconds_until_next_turn(now: float | None = None) -> float:
+    """Return the wall-clock delay to the next persisted campaign turn."""
+    current_time = time.time() if now is None else float(now)
+    state = _load_campaign_clock(current_time)
+    config = _clock_config()
+    elapsed_ms = max(0.0, (current_time - state["epoch_unix"]) * 1000.0)
+    remainder = elapsed_ms % config.milliseconds_per_turn
+    return config.milliseconds_per_turn - remainder
 
 
 def _map_size_payload() -> bytes:
@@ -461,14 +517,24 @@ def _ship_cache_payload(race: int, ship: dict | None = None) -> bytes:
     )
 
 
-def _fleet_data_payload(race: int) -> bytes:
-    """Build tGetFleetDataReq::tRep with the player's starter ship icon."""
-    x, y = _campaign_start_for_race(race)
-    _class_name, _ship_name, class_type = _starting_ship_for_race(race)
+def _fleet_data_payload(race: int, record: dict | None = None) -> bytes:
+    """Build tGetFleetDataReq::tRep from the authoritative ship instance."""
+    if record is None:
+        x, y = _campaign_start_for_race(race)
+        _class_name, _ship_name, class_type = _starting_ship_for_race(race)
+        character_id = CHARACTER_DATABASE_ID
+        ship_id = SHIP_DATABASE_ID
+    else:
+        record = _normalize_character_record(record)
+        x, y = record["position"]
+        ship = record["ship"]
+        class_type = int(ship["class_type"])
+        character_id = int(record.get("database_id", CHARACTER_DATABASE_ID))
+        ship_id = int(ship["id"])
     fleet_icon = struct.pack(
         "<IIiiIBI",
-        CHARACTER_DATABASE_ID,
-        SHIP_DATABASE_ID,
+        character_id,
+        ship_id,
         x,
         y,
         class_type,
@@ -699,23 +765,24 @@ def _normalize_character_record(record: dict) -> dict:
         normalized.setdefault("position", list(_campaign_start_for_race(race)))
         normalized.setdefault("homeworld", list(_campaign_homeworld_for_race(race)))
         normalized.setdefault("destination", [-1, -1])
-    normalized.setdefault(
-        "ship",
-        {
-            "id": SHIP_DATABASE_ID,
-            "class_name": class_name,
-            "name": ship_name,
-            "class_type": class_type,
-            "bpv": 250,
-            "damage": 1.0,
-            "flags": 0,
-        },
-    )
+    ship = dict(normalized.get("ship") or {})
+    ship.setdefault("id", SHIP_DATABASE_ID)
+    ship.setdefault("owner_id", int(normalized.get("database_id", CHARACTER_DATABASE_ID)))
+    ship.setdefault("class_name", class_name)
+    ship.setdefault("loadout_name", ship["class_name"])
+    ship.setdefault("name", ship_name)
+    ship.setdefault("class_type", class_type)
+    ship.setdefault("bpv", 250)
+    ship.setdefault("damage", 1.0)
+    ship.setdefault("flags", 0)
+    ship.setdefault("turn_created", 0)
+    # Migrate the prototype's split mutable fields into the ship they describe.
+    ship.setdefault("stores", dict(normalized.pop("stores", {}) or {}))
+    ship.setdefault("refit", dict(normalized.pop("refit", {}) or {}))
+    ship.setdefault("officers", list(normalized.pop("officers", []) or []))
+    normalized["ship"] = ship
     if "prestige" not in normalized:
         normalized["prestige"] = _starting_prestige()
-    normalized.setdefault("officers", [])
-    normalized.setdefault("stores", {})
-    normalized.setdefault("refit", {})
     normalized.setdefault("missions", [])
     return normalized
 
@@ -739,18 +806,91 @@ def _save_character(
     verification_id: str = "",
 ) -> dict:
     characters = _load_characters()
-    record = _normalize_character_record({
-        "character_name": character_name,
-        "client_address": client_address,
-        "race": race,
-        **({"verification_id": verification_id} if verification_id else {}),
-    })
+    record = _new_character_record(
+        character_name, client_address, race, verification_id
+    )
+    if PERSISTENCE is not None:
+        ids = database.bootstrap_character(
+            PERSISTENCE, account_name=account, record=record
+        )
+        record["database_id"] = ids["character_id"]
+        record["ship"]["id"] = ids["ship_id"]
+        record["ship"]["owner_id"] = ids["character_id"]
+        for officer, officer_id in zip(record["ship"]["officers"], ids["officer_ids"]):
+            officer["id"] = officer_id
     characters[account] = record
     CHARACTER_STORE_PATH.write_text(
         json.dumps(characters, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return record
+
+
+def _new_character_record(
+    character_name: str, client_address: str, race: int, verification_id: str = ""
+) -> dict:
+    """Instantiate all mutable state defined by the campaign starter templates."""
+    defaults = _starter_ship_defaults(race)
+    class_name, ship_name, class_type = _starting_ship_for_race(race)
+    names = _officer_names(race)
+    first_name = min(_officer_review_limit(), max(0, len(names) - 6))
+    crew_names = names[first_name:first_name + 6]
+    if len(crew_names) != 6:
+        raise ValueError(f"race {race} does not define six starting officer names")
+    officers = [
+        {
+            "id": 10_000 + race * 100 + index,
+            "name": name,
+            "station": station,
+            "race": race,
+            "worth": 114,
+        }
+        for index, (name, station) in enumerate(zip(crew_names, OFFICER_STATIONS))
+    ]
+    officer_names_by_station = {
+        OFFICER_STATION_NAMES[int(item["station"])]: str(item["name"])
+        for item in officers
+    }
+    items = []
+    for item in defaults["items"]:
+        fields = item.split(":")
+        if len(fields) >= 3 and fields[0] == "OFFICER" and fields[1] in officer_names_by_station:
+            item = _officer_loadout_item(officer_names_by_station[fields[1]],
+                                         OFFICER_STATIONS[list(OFFICER_STATION_NAMES.values()).index(fields[1])])
+        items.append(item)
+    position = list(_campaign_start_for_race(race))
+    record = {
+        "database_id": CHARACTER_DATABASE_ID,
+        "character_name": character_name,
+        "client_address": client_address,
+        "race": race,
+        "map_id": CAMPAIGN_MAP_ID,
+        "position": position,
+        "homeworld": list(_campaign_homeworld_for_race(race)),
+        "destination": [-1, -1],
+        "prestige": _starting_prestige(),
+        "missions": [],
+        "ship": {
+            "id": SHIP_DATABASE_ID,
+            "owner_id": CHARACTER_DATABASE_ID,
+            "class_name": class_name,
+            "loadout_name": defaults["sub_name"],
+            "name": ship_name,
+            "class_type": class_type,
+            "bpv": int(defaults["hull_cost"]),
+            "damage": 1.0,
+            "flags": 0,
+            "turn_created": _campaign_turn(),
+            "stores": {
+                name: int(defaults[name][2]) for name in ("shuttles", "marines", "mines")
+            },
+            "refit": {"loadout_name": defaults["sub_name"], "items": items},
+            "officers": officers,
+        },
+    }
+    if verification_id:
+        record["verification_id"] = verification_id
+    return _normalize_character_record(record)
 
 
 def _write_character_record(account: str, record: dict) -> dict:
@@ -792,7 +932,8 @@ def _purchase_officers(
         names = _officer_names(race)[:_officer_review_limit()]
         defaults = _character_ship_defaults(record)
         items = list(defaults["items"])
-        existing_by_station = {int(item["station"]): item for item in record["officers"]}
+        ship = record["ship"]
+        existing_by_station = {int(item["station"]): item for item in ship["officers"]}
         prepared = []
         seen_ids = set()
         outgoing_credit = 0
@@ -803,7 +944,7 @@ def _purchase_officers(
             if not 0 <= index < len(names):
                 raise ValueError("officer is not in review")
             if officer_id in seen_ids or any(
-                int(item["id"]) == officer_id for item in record["officers"]
+                int(item["id"]) == officer_id for item in ship["officers"]
             ):
                 raise ValueError("officer is already assigned")
             if assigned_station not in OFFICER_STATIONS:
@@ -831,17 +972,17 @@ def _purchase_officers(
             raise ValueError("insufficient prestige")
         replaced_stations = {item[1] for item in prepared}
         record["prestige"] = new_prestige
-        record["officers"] = [
-            item for item in record["officers"]
+        ship["officers"] = [
+            item for item in ship["officers"]
             if int(item.get("station", -1)) not in replaced_stations
         ]
         for officer_id, assigned_station, name, replacement_index, fields in prepared:
             items[replacement_index] = _officer_loadout_item(name, assigned_station)
-            record["officers"].append({
+            ship["officers"].append({
                 "id": officer_id, "name": name, "station": assigned_station,
                 "worth": incoming_cost,
             })
-        record["refit"] = {
+        ship["refit"] = {
             "loadout_name": defaults["sub_name"],
             "items": items,
         }
@@ -869,7 +1010,7 @@ def _purchase_supplies(account: str, *, shuttles: int = 0, marines: int = 0, min
         total = sum(requested[name] * costs[name] for name in requested)
         if int(record["prestige"]) < total:
             raise ValueError("insufficient prestige")
-        stores = record.setdefault("stores", {})
+        stores = record["ship"].setdefault("stores", {})
         for name, amount in requested.items():
             current = int(stores.get(name, defaults[name][0]))
             if current + amount > maxima[name]:
@@ -892,7 +1033,7 @@ def _update_supplies(account: str, desired: dict[str, int]) -> dict:
     def mutate(record: dict) -> None:
         defaults = _character_ship_defaults(record)
         current = {
-            name: int(record.setdefault("stores", {}).get(name, defaults[name][2]))
+            name: int(record["ship"].setdefault("stores", {}).get(name, defaults[name][2]))
             for name in desired
         }
         for name, count in desired.items():
@@ -907,7 +1048,7 @@ def _update_supplies(account: str, desired: dict[str, int]) -> dict:
         if int(record["prestige"]) + sales < buys:
             raise ValueError("insufficient prestige")
         record["prestige"] = int(record["prestige"]) - buys + sales
-        record["stores"].update(desired)
+        record["ship"]["stores"].update(desired)
 
     return _update_character(account, mutate)
 
@@ -933,7 +1074,7 @@ def _save_refit(account: str, loadout_name: str, items: list[str], *, cost: int 
         record["ship"]["class_name"] = defaults["ui_name"]
         record["ship"]["loadout_name"] = defaults["sub_name"]
         record["ship"]["class_type"] = _ship_class_id(defaults["class_code"])
-        record["refit"] = {"loadout_name": defaults["sub_name"], "items": list(items)}
+        record["ship"]["refit"] = {"loadout_name": defaults["sub_name"], "items": list(items)}
     return _update_character(account, mutate)
 
 
@@ -1418,7 +1559,11 @@ def _tng_ship_payload(
     configuration_scalar: float = 1.0,
 ) -> bytes:
     """Serialize tTNGShip from generated core and DefaultLoadOut fields."""
-    loadout = "\t".join(str(field) for field in loadout_fields)
+    # Retail tTNGShip::StreamOut always terminates the tab-delimited loadout
+    # with one final tab.  This is not cosmetic: the client feeds the string
+    # back through its loadout parser, which expects the last item to be
+    # delimited before the following binary configuration scalar.
+    loadout = "\t".join(str(field) for field in loadout_fields) + "\t"
     return b"\x01\x01" + core_payload + _pack_str(loadout) + struct.pack(
         "<f", configuration_scalar
     )
@@ -1591,7 +1736,16 @@ def _supply_dock_payload(race: int, asset_root: Path | None = None, *, record: d
     defaults = _character_ship_defaults(record, asset_root) if record else _starter_ship_defaults(race, asset_root)
     _class_name, starter_name, _class_type = _starting_ship_for_race(race)
     ship_name = str(record["ship"].get("name", starter_name)) if record else starter_name
-    ship = _full_ship_payload(race=race, ship_name=ship_name, defaults=defaults, stores=(record or {}).get("stores"))
+    ship = _full_ship_payload(
+        race=race,
+        ship_name=ship_name,
+        defaults=defaults,
+        stores=(record or {}).get("ship", {}).get("stores"),
+        database_id=int((record or {}).get("ship", {}).get("id", SHIP_DATABASE_ID)),
+        owner_id=int((record or {}).get("ship", {}).get("owner_id", CHARACTER_DATABASE_ID)),
+        epv=int((record or {}).get("ship", {}).get("bpv", 250)),
+        turn_created=int((record or {}).get("ship", {}).get("turn_created", 0)),
+    )
     return (
         b"\x01"
         + ship
@@ -1637,7 +1791,11 @@ def _updated_ship_payload(record: dict) -> bytes:
         race=int(record["race"]),
         ship_name=str(ship["name"]),
         defaults=defaults,
-        stores=record.get("stores"),
+        stores=ship.get("stores"),
+        database_id=int(ship["id"]),
+        owner_id=int(ship.get("owner_id", CHARACTER_DATABASE_ID)),
+        epv=int(ship.get("bpv", 250)),
+        turn_created=int(ship.get("turn_created", 0)),
     )
 
 
@@ -1680,7 +1838,7 @@ def _character_ship_config_payload(
         b"\x01"
         + struct.pack("<I", ship_id)
         + tng_ship
-        + struct.pack("<fI", economic_scalar, prestige)
+        + struct.pack("<If", prestige, economic_scalar)
     )
 
 
@@ -1795,7 +1953,7 @@ def _officers_to_review_payload(
         race,
         (
             item.get("id")
-            for item in (record or {}).get("officers", ())
+            for item in (record or {}).get("ship", {}).get("officers", ())
             if isinstance(item, dict) and "id" in item
         ),
     )
@@ -2193,6 +2351,7 @@ def _settle_shipyard_bids(*, now: float | None = None) -> tuple[dict, ...]:
         record["prestige"] = max(0, int(record.get("prestige", 0)) - price)
         record["ship"] = {
             "id": SHIP_DATABASE_ID,
+            "owner_id": int(record.get("database_id", CHARACTER_DATABASE_ID)),
             "class_name": defaults["ui_name"],
             "loadout_name": defaults["sub_name"],
             "name": str(record.get("ship", {}).get("name", "USS Venture")),
@@ -2200,6 +2359,17 @@ def _settle_shipyard_bids(*, now: float | None = None) -> tuple[dict, ...]:
             "bpv": int(defaults["hull_cost"]),
             "damage": 1.0,
             "flags": 0,
+            "turn_created": current_turn,
+            "stores": {
+                "shuttles": int(defaults["shuttles"][2]),
+                "marines": int(defaults["marines"][2]),
+                "mines": int(defaults["mines"][2]),
+            },
+            "refit": {
+                "loadout_name": defaults["sub_name"],
+                "items": list(defaults["items"]),
+            },
+            "officers": [],
         }
         characters[owner] = _normalize_character_record(record)
         settlement = {
@@ -2269,7 +2439,12 @@ def _load_ship_defaults(core_path: Path, loadout_path: Path, model_name: str) ->
         "political_base": loadout_row[0],
         "loadout_class_name": loadout_row[1],
         "sub_name": loadout_row[2],
-        "ui_name": loadout_row[3],
+        # tShip's player-facing class name and tAuctionItem's description are
+        # the selected DefaultLoadOut variant (Talon/Falcon/Warbird), not the
+        # internal model key in column 4 (RomulanFrigate/romulan_warbird).
+        # Federation hid this distinction because many of its two values are
+        # identical (for example Norway and Sovereign).
+        "ui_name": loadout_row[2],
         "default": loadout_row[4],
         "special": loadout_row[5],
         "items": tuple(field for field in loadout_row[6:] if field),
@@ -2300,20 +2475,58 @@ def _character_ship_defaults(record: dict, asset_root: Path | None = None) -> di
     specs = root / "Specs"
     if not specs.is_dir():
         specs = root / "Spec"
-    model_name = str(record["ship"].get("loadout_name") or record["ship"]["class_name"])
+    ship = record["ship"]
+    refit = ship.get("refit", {})
+    model_name = str(
+        (refit.get("loadout_name") if isinstance(refit, dict) else "")
+        or ship.get("loadout_name")
+        or ship["class_name"]
+    )
     try:
         defaults = _load_ship_defaults(
             specs / "DefaultCore.txt", specs / "DefaultLoadOut.txt", model_name
         )
     except ValueError:
         defaults = _starter_ship_defaults(int(record["race"]), root)
-    refit = record.get("refit", {})
     items = refit.get("items") if isinstance(refit, dict) else None
     if isinstance(items, list) and all(isinstance(item, str) for item in items):
         defaults = dict(defaults)
         defaults["items"] = tuple(item for item in items if item)
         defaults["loadout_fields"] = tuple(defaults["loadout_fields"][:6]) + tuple(items)
     return defaults
+
+
+def _canonical_ship_snapshot(record: dict, asset_root: Path | None = None) -> dict:
+    """Return the complete mutable ship state consumed by every read path.
+
+    Spec rows remain immutable templates.  Character JSON owns identity and all
+    mutable instance data; resolving a template must never replace those values.
+    """
+    record = _normalize_character_record(record)
+    ship = record["ship"]
+    defaults = _character_ship_defaults(record, asset_root)
+    return {
+        "id": int(ship["id"]),
+        "owner_id": int(ship.get("owner_id", CHARACTER_DATABASE_ID)),
+        "race": int(record["race"]),
+        "class_name": str(ship["class_name"]),
+        "loadout_name": str(defaults["sub_name"]),
+        "name": str(ship["name"]),
+        "class_type": int(ship["class_type"]),
+        "bpv": int(ship["bpv"]),
+        "damage": float(ship["damage"]),
+        "flags": int(ship["flags"]),
+        "turn_created": int(ship.get("turn_created", 0)),
+        "items": tuple(defaults["items"]),
+        "stores": {
+            name: int(ship.get("stores", {}).get(name, defaults[name][2]))
+            for name in ("shuttles", "marines", "mines")
+        },
+        "officers": tuple(
+            (int(item["id"]), str(item["name"]), int(item["station"]), int(item["worth"]))
+            for item in ship.get("officers", ())
+        ),
+    }
 
 
 def _stored_character_payload(account: str, record: dict) -> bytes:
@@ -2600,10 +2813,7 @@ class DynamicSecurityClient:
     async def _clock_loop(self):
         """Deliver the retail clock relay's asynchronous turn-break updates."""
         while True:
-            state = _load_campaign_clock()
-            _turns_per_year, milliseconds_per_turn = _clock_settings()
-            elapsed_ms = max(0.0, (time.time() - state["epoch_unix"]) * 1000.0)
-            remaining_ms = milliseconds_per_turn - (elapsed_ms % milliseconds_per_turn)
+            remaining_ms = _milliseconds_until_next_turn()
             await asyncio.sleep(max(0.05, remaining_ms / 1000.0))
             if not self.clock_subscribers:
                 continue
@@ -2933,7 +3143,7 @@ class DynamicSecurityClient:
                             desired,
                             requested,
                             {
-                                name: int(self.current_record.get("stores", {}).get(name, defaults[name][2]))
+                                name: int(self.current_record["ship"].get("stores", {}).get(name, defaults[name][2]))
                                 for name in requested
                             },
                             {name: int(defaults[name][1]) + 1 for name in requested},
@@ -3319,11 +3529,12 @@ class DynamicSecurityClient:
                 callback = _parse_callback(payload)
                 self.writer.write(_nswitch_frame(
                     callback[0], callback[1], callback[2], _fleet_data_payload(
-                        self.current_character[3] if self.current_character else RACE_NEUTRAL
+                        self.current_character[3] if self.current_character else RACE_NEUTRAL,
+                        self.current_record,
                     )
                 ))
                 await self.writer.drain()
-                self._log("info", "-> starter-ship fleet data")
+                self._log("info", "-> authoritative character fleet data")
                 continue
             if (sw, obj, ch) == (0, 6, 6):
                 (
@@ -3498,6 +3709,26 @@ class StatusProtocol(asyncio.DatagramProtocol):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
+    global PERSISTENCE
+    if not DEFAULT_DATABASE_PATH.exists():
+        from build_default_database import build as build_default_database
+        manifest = build_default_database(DEFAULT_DATABASE_PATH, SERVER_ASSET_ROOT)
+        log.info(
+            "Built default campaign database at %s (asset manifest %s)",
+            DEFAULT_DATABASE_PATH,
+            manifest,
+        )
+    created = database.create_working_database(
+        DEFAULT_DATABASE_PATH, DATABASE_PATH, epoch_unix=time.time()
+    )
+    persistence = database.initialize(DATABASE_PATH)
+    PERSISTENCE = persistence
+    log.info(
+        "SQLite persistence schema ready at %s (version %d, first_start=%s); JSON compatibility storage remains active",
+        DATABASE_PATH,
+        database.schema_version(persistence),
+        created,
+    )
     relay_handler = lambda r, w: asyncio.ensure_future(SFC3Client(r, w).run())
     game_handler = lambda r, w: asyncio.ensure_future(DynamicSecurityClient(r, w).run())
     directory_handler = lambda r, w: asyncio.ensure_future(MasterDirectoryClient(r, w).run())
@@ -3537,6 +3768,8 @@ async def main():
         finally:
             for transport in status_transports:
                 transport.close()
+            persistence.close()
+            PERSISTENCE = None
 
 
 if __name__ == "__main__":
