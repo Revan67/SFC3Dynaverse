@@ -25,6 +25,8 @@ Dock, Refit, Officers, persistence, and relog; the five-field campaign clock;
 and the mission launch/result lifecycle. Known client-visible defects and their
 evidence are tracked in
 [`docs/investigation-evidence-matrix.md`](docs/investigation-evidence-matrix.md).
+The dependency-ordered work sequence and completion gates are in
+[`docs/implementation-roadmap.md`](docs/implementation-roadmap.md).
 
 ## Requirements
 
