@@ -64,9 +64,9 @@ After login success, TCP 29900 remains open as the GameSpy presence connection. 
 immediately causes SFC3 to report login failure. The replacement responds to `\ka\` keepalives and
 keeps the session open while the client proceeds to server discovery.
 
-The prototype persists local accounts in ignored `server/accounts.local.json`. It stores the
-nickname, numeric IDs, and MD5 password digest required by the legacy proof exchange, never the
-plaintext password.
+Local accounts are persisted in the authoritative SQLite campaign database. The isolated legacy
+credential column stores the nickname, numeric IDs, and MD5 digest required by the GameSpy proof
+exchange, never the plaintext password. `accounts.local.json` is migration input only.
 
 This legacy protocol requires the server to reproduce the password digest. A production account
 design must clearly isolate this compatibility constraint and never log passwords or proof data.

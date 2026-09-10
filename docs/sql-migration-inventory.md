@@ -83,8 +83,7 @@ original SQL Server binary:
    reseeding it.
 5. Character creation instantiates the selected starter ship, mutable
    stores/loadout, and all six starting officers from the effective definitions
-   in one transaction. This is implemented as a shadow write while JSON remains
-   the compatibility read path.
+   in one transaction. SQLite is the authoritative runtime read/write path.
 
 Changing asset files never silently mutates an existing campaign. The stored
 manifest hash provides the future operator UI with enough information to warn
@@ -98,24 +97,24 @@ about a mismatch and offer an explicit migration or new-campaign operation.
    account, campaign, character, ship, store, loadout, officer, settlement, news,
    auction, and mission records. Imports are content-hash tracked, idempotent for
    unchanged files, reject changed sources, and roll back as a unit on failure.
-3. Implement repository interfaces for accounts, campaigns, characters, ships,
-   auctions, news, and missions.
-4. Verify row counts, stable IDs, ownership, prestige, loadout order, stores, and
-   officers against canonical snapshots.
-5. Run SQLite in shadow mode and compare repository reconstructions with JSON.
-6. Dual-write through repositories, then run the server against SQLite behind an
-   explicit configuration switch.
-7. Complete retail-client regression testing before making SQLite the default.
-8. Remove JSON writes only after restart, rollback, and interrupted-transaction
-   tests pass.
+3. **Complete:** repository interfaces now cover accounts, campaigns, characters,
+   ships, auctions, news, and missions.
+4. **Complete for current fixtures:** verify stable IDs, ownership, prestige,
+   loadout order, stores, officers, and campaign state against canonical snapshots.
+5. **Complete:** switch production runtime reads and writes to SQLite; JSON is
+   available only to explicit migration tooling and unit-test fallbacks.
+6. Validate restart, rollback, and interrupted-transaction behavior against the
+   retail client before declaring the cutover complete.
+7. Validate multi-account auction ownership and settlement before combat work.
 
 The first local import completed at schema version 2 with one account, one
 character, one Sovereign A ship, stores `4/3/3`, BOWEN in station 100, 26 ordered
 loadout items, and one historical auction settlement. An immediate second import
 was a no-op, confirming idempotency. Reconciliation also exposed that only BOWEN
 exists in source persistence; the five other client-displayed crew members were
-never materialized by the prototype server. Runtime reads and writes remain on
-JSON, and full crew creation must precede authoritative SQL reads.
+never materialized by the prototype server. That imported fixture is historical
+evidence only. Newly created characters now materialize all six starting officers
+directly in the authoritative database.
 
 ## Data that should not become mutable campaign rows
 

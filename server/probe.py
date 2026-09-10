@@ -23,13 +23,15 @@ Output prefix: [PORT:XXXXX] so you can grep per port if needed.
 
 import asyncio
 import hashlib
-import json
 import random
 import string
 import struct
 import sys
 import logging
 import os
+from pathlib import Path
+
+import database
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -39,26 +41,15 @@ logging.basicConfig(
 log = logging.getLogger("probe")
 
 SERVER_HOST = os.environ.get("SFC3_SERVER_HOST", "127.0.0.1")
-ACCOUNT_STORE = os.path.join(os.path.dirname(__file__), "accounts.local.json")
+DATABASE_PATH = Path(
+    os.environ.get("SFC3_DATABASE", "").strip()
+    or Path(__file__).with_name("campaign.local.sqlite3")
+)
 
 
 def _load_accounts() -> dict[str, dict[str, str | int]]:
-    try:
-        with open(ACCOUNT_STORE, encoding="utf-8") as stream:
-            return json.load(stream)
-    except FileNotFoundError:
-        return {}
-
-
-def _save_accounts(accounts: dict[str, dict[str, str | int]]) -> None:
-    temporary = ACCOUNT_STORE + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as stream:
-        json.dump(accounts, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-    os.replace(temporary, ACCOUNT_STORE)
-
-
-ACCOUNTS = _load_accounts()
+    with database.connect(DATABASE_PATH) as connection:
+        return database.load_accounts(connection)
 
 # ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -204,7 +195,7 @@ class GPCMProbe:
     async def _respond_login(self, kv: dict[str, str], challenge: str) -> bool:
         user = kv.get("user", "")
         nick, _, email = user.partition("@")
-        account = ACCOUNTS.get(email.casefold())
+        account = _load_accounts().get(email.casefold())
         log.info("%s *** LOGIN request received ***", self.TAG)
         if account is None or account["nick"] != nick:
             self.writer.write(_gs_build(
@@ -334,15 +325,25 @@ class GPCMProbe:
             log.info("%s *** CREATE ACCOUNT — nick=%r ***",
                      self.TAG, kv.get("nick", ""))
             email = kv.get("email", "").casefold()
-            ACCOUNTS[email] = {
-                "nick": kv.get("nick", ""),
-                "password_hash": hashlib.md5(
-                    kv.get("password", "").encode("ascii")
-                ).hexdigest(),
-                "userid": uid,
-                "profileid": pid,
-            }
-            _save_accounts(ACCOUNTS)
+            try:
+                with database.connect(DATABASE_PATH) as connection:
+                    account = database.create_account(
+                        connection,
+                        account_name=email,
+                        nickname=kv.get("nick", ""),
+                        password_hash=hashlib.md5(
+                            kv.get("password", "").encode("ascii")
+                        ).hexdigest(),
+                    )
+            except ValueError:
+                self.writer.write(_gs_build(
+                    error="", err="516", fatal="",
+                    errmsg="The account already exists.", id="1",
+                ))
+                await self.writer.drain()
+                return
+            uid = int(account["userid"])
+            pid = int(account["profileid"])
             resp = _gs_build(nur="", userid=str(uid), profileid=str(pid), id="1")
             self.writer.write(resp)
             await self.writer.drain()
@@ -428,7 +429,7 @@ class GPSPProbe:
         if "valid" in kv:
             email = kv.get("email", "")
             log.info("%s *** \\valid\\ account-existence check ***", self.TAG)
-            exists = email.casefold() in ACCOUNTS
+            exists = email.casefold() in _load_accounts()
             resp = _gs_build(vr="1" if exists else "0")
             self.writer.write(resp)
             await self.writer.drain()

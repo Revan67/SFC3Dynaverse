@@ -101,23 +101,23 @@ The released kit's `SQL/CreateTables.sql` confirms that characters, ships,
 officers, auctions, and campaign state are separate database entities and that a
 ship owns its TNG configuration, damage, and stores. A versioned SQLite schema now
 captures those relationships for the replacement server. Runtime migration from
-the prototype JSON stores will occur behind repository functions before SQLite is
-made the default; the JSON path remains active for this client-validation build.
+the prototype JSON stores is now an explicit, one-time operator action. SQLite is
+the runtime authority for accounts, characters, ships, officers, and campaign
+state; production startup no longer reads or maintains JSON shadow state.
 The complete migration scope and ordering are tracked in
 `sql-migration-inventory.md`.
 
 The recovered `Database.gf` process refined the cutover: schema migration 003
 adds campaign bootstrap metadata, the asset manifest, and persisted map records.
 `default-campaign.sqlite3` is now built from the server kit and copied atomically
-only when a working database does not exist. The current JSON stores were also
-imported transactionally and reconciled in SQLite. Runtime repository/shadow-mode
-work and complete character/crew instantiation remain separate exit gates.
+only when a working database does not exist. Legacy JSON stores can be imported
+transactionally when explicitly requested, but are not consulted during normal
+runtime. Complete validation of every persisted transaction remains an exit gate.
 
-New-character bootstrap is now implemented in shadow mode. One canonical factory
+New-character bootstrap is now implemented directly in SQLite. One canonical factory
 resolves the faction start and server-kit starter hull, creates mutable stores and
 the ordered loadout, materializes all six named officer stations, and inserts the
 account, character, ship, stores, items, and officers in one SQLite transaction.
-The same object is retained by JSON compatibility storage for client testing.
 Existing incomplete prototype characters are deliberately not changed by this
 path; they require an explicit backfill operation.
 

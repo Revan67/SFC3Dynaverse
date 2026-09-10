@@ -46,5 +46,6 @@ The trailing address identifies the client object that receives the character-lo
 channel 2. The server then claims `tNotifyRelayS` as object 30. This sequence was sufficient for an
 unmodified client to enter the campaign UI.
 
-Local character records are stored in ignored `server/characters.local.json`. Creation followed by
-a server restart and direct re-login was verified end to end on 2026-09-03.
+Local character records and their owned ships are stored in the authoritative SQLite campaign
+database. Creation followed by a server restart and direct re-login has been verified end to end.
+`characters.local.json` is now only a source for the explicit legacy migration tool.

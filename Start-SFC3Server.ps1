@@ -81,6 +81,23 @@ function Start-SFC3Component {
 }
 
 try {
+    # The Dynaverse process creates/upgrades the authoritative SQLite database.
+    # Start it before the GameSpy account services so first-run account requests
+    # can never race database bootstrap.
+    Start-SFC3Component -Name 'dynaverse' `
+        -Arguments @('server\server.py') `
+        -EnvironmentOverrides @{
+            SFC3_SERVER_HOST = $ServerAddress
+            SFC3_BIND_HOSTS = "127.0.0.1,$ServerAddress"
+            SFC3_ADVERTISE_HOST = $ServerAddress
+            SFC3_SERVER_ASSET_ROOT = $ServerAssetRoot
+        }
+
+    Start-Sleep -Seconds 1
+    if ($processes[0].Process.HasExited) {
+        throw "dynaverse exited during database bootstrap. Check '$logRoot'."
+    }
+
     Start-SFC3Component -Name 'gamespy-loopback' `
         -Arguments @('server\probe.py', '29900', '29901') `
         -EnvironmentOverrides @{ SFC3_SERVER_HOST = '127.0.0.1' }
@@ -90,15 +107,6 @@ try {
             -Arguments @('server\probe.py', '29900', '29901') `
             -EnvironmentOverrides @{ SFC3_SERVER_HOST = $ServerAddress }
     }
-
-    Start-SFC3Component -Name 'dynaverse' `
-        -Arguments @('server\server.py') `
-        -EnvironmentOverrides @{
-            SFC3_SERVER_HOST = $ServerAddress
-            SFC3_BIND_HOSTS = "127.0.0.1,$ServerAddress"
-            SFC3_ADVERTISE_HOST = $ServerAddress
-            SFC3_SERVER_ASSET_ROOT = $ServerAssetRoot
-        }
 
     Start-Sleep -Seconds 1
     foreach ($component in $processes) {

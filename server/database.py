@@ -177,6 +177,88 @@ def stored_asset_manifest_sha256(connection: sqlite3.Connection) -> str | None:
     return None if row is None else row[0]
 
 
+def load_accounts(connection: sqlite3.Connection) -> dict[str, dict[str, str | int]]:
+    """Load the GameSpy-compatible account credentials from SQLite."""
+    rows = connection.execute(
+        "SELECT id, account_name, nickname, legacy_password_hash, gamespy_user_id, "
+        "gamespy_profile_id FROM accounts"
+    ).fetchall()
+    return {
+        str(row["account_name"]).casefold(): {
+            "nick": str(row["nickname"] or ""),
+            "password_hash": str(row["legacy_password_hash"] or ""),
+            "userid": int(row["gamespy_user_id"] or row["id"]),
+            "profileid": int(row["gamespy_profile_id"] or row["id"]),
+        }
+        for row in rows
+    }
+
+
+def create_account(
+    connection: sqlite3.Connection,
+    *,
+    account_name: str,
+    nickname: str,
+    password_hash: str,
+) -> dict[str, str | int]:
+    """Create one local GameSpy account and allocate stable numeric IDs."""
+    key = account_name.casefold()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if connection.execute(
+            "SELECT 1 FROM accounts WHERE account_name=? COLLATE NOCASE", (key,)
+        ).fetchone():
+            raise ValueError("account already exists")
+        next_id = int(connection.execute(
+            "SELECT COALESCE(MAX(value), 0) + 1 FROM ("
+            "SELECT COALESCE(gamespy_user_id, id) AS value FROM accounts UNION ALL "
+            "SELECT COALESCE(gamespy_profile_id, id) AS value FROM accounts)"
+        ).fetchone()[0] or 1)
+        cursor = connection.execute(
+            "INSERT INTO accounts(account_name, nickname, legacy_password_hash, "
+            "gamespy_user_id, gamespy_profile_id) VALUES(?, ?, ?, ?, ?)",
+            (key, nickname, password_hash, next_id, next_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return {"nick": nickname, "password_hash": password_hash,
+            "userid": next_id, "profileid": next_id, "id": int(cursor.lastrowid)}
+
+
+def merge_legacy_accounts(connection: sqlite3.Connection, accounts: dict) -> int:
+    """One-time migration helper for credentials from accounts.local.json."""
+    changed = 0
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for name, raw in accounts.items():
+            key = str(name).casefold()
+            row = connection.execute(
+                "SELECT id FROM accounts WHERE account_name=? COLLATE NOCASE", (key,)
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO accounts(account_name, nickname, legacy_password_hash, "
+                    "gamespy_user_id, gamespy_profile_id) VALUES(?, ?, ?, ?, ?)",
+                    (key, str(raw.get("nick", "")), raw.get("password_hash"),
+                     raw.get("userid"), raw.get("profileid")),
+                )
+            else:
+                connection.execute(
+                    "UPDATE accounts SET nickname=?, legacy_password_hash=?, "
+                    "gamespy_user_id=?, gamespy_profile_id=? WHERE id=?",
+                    (str(raw.get("nick", "")), raw.get("password_hash"),
+                     raw.get("userid"), raw.get("profileid"), int(row["id"])),
+                )
+            changed += 1
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return changed
+
+
 def bootstrap_character(
     connection: sqlite3.Connection, *, account_name: str, record: dict
 ) -> dict[str, int | list[int]]:
@@ -409,6 +491,126 @@ def save_character(connection: sqlite3.Connection, *, account_name: str, record:
               int(item.get("race", record["race"])), int(item.get("worth", 0)),
               json.dumps(item.get("profile", {}), sort_keys=True))
              for item in ship["officers"]),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def load_campaign_state(connection: sqlite3.Connection) -> dict:
+    """Reconstruct mutable campaign state from normalized SQLite tables."""
+    campaign = connection.execute(
+        "SELECT epoch_unix, initial_turn, next_news_id, next_mission_id "
+        "FROM campaigns WHERE id=1"
+    ).fetchone()
+    if campaign is None:
+        raise ValueError("campaign 1 does not exist")
+    state = {
+        "epoch_unix": float(campaign["epoch_unix"]),
+        "initial_turn": int(campaign["initial_turn"]),
+        "next_news_id": int(campaign["next_news_id"]),
+        "next_mission_id": int(campaign["next_mission_id"]),
+        "auctions": {}, "auction_settlements": [], "news": [], "missions": [],
+    }
+    for row in connection.execute(
+        "SELECT au.*, ac.account_name FROM auctions au "
+        "LEFT JOIN characters c ON c.id=au.bid_owner_character_id "
+        "LEFT JOIN accounts ac ON ac.id=c.account_id WHERE au.campaign_id=1"
+    ):
+        state["auctions"][str(int(row["catalog_item_id"]))] = {
+            "current_bid": int(row["current_bid"]),
+            "bid_maximum": int(row["bid_maximum"]),
+            "escrow": int(row["escrow"]),
+            "turn_opened": int(row["turn_opened"]),
+            "turn_bid_made": int(row["turn_bid_made"]),
+            "turn_to_close": int(row["turn_to_close"]),
+            "closing": bool(row["closing"]),
+            "bid_owner": str(row["account_name"] or ""),
+        }
+    state["news"] = [dict(row) for row in connection.execute(
+        "SELECT id, turn, timestamp, channel, priority, persistence, sequence, text "
+        "FROM news_stories WHERE campaign_id=1 ORDER BY sequence, id"
+    )]
+    state["missions"] = [json.loads(row["mission_json"]) for row in connection.execute(
+        "SELECT mission_json FROM prepared_missions WHERE campaign_id=1 ORDER BY id"
+    )]
+    state["auction_settlements"] = [
+        {"account": str(row["account_name"]),
+         "ship_id": int(row["catalog_item_id"]),
+         "class_name": str(row["class_name"]), "price": int(row["price"]),
+         "turn": int(row["turn"])}
+        for row in connection.execute(
+            "SELECT account_name, catalog_item_id, class_name, price, turn "
+            "FROM auction_settlements WHERE campaign_id=1 ORDER BY id"
+        )
+    ]
+    return state
+
+
+def save_campaign_state(connection: sqlite3.Connection, state: dict) -> None:
+    """Atomically replace mutable campaign state from its canonical envelope."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(
+            "UPDATE campaigns SET epoch_unix=?, initial_turn=?, next_news_id=?, "
+            "next_mission_id=? WHERE id=1",
+            (float(state["epoch_unix"]), int(state.get("initial_turn", 0)),
+             int(state.get("next_news_id", 1)), int(state.get("next_mission_id", 1))),
+        )
+        connection.execute("DELETE FROM auctions WHERE campaign_id=1")
+        for catalog_id_text, item in state.get("auctions", {}).items():
+            owner = None
+            if item.get("bid_owner"):
+                row = connection.execute(
+                    "SELECT c.id FROM characters c JOIN accounts a ON a.id=c.account_id "
+                    "WHERE c.campaign_id=1 AND a.account_name=? COLLATE NOCASE",
+                    (str(item["bid_owner"]),),
+                ).fetchone()
+                owner = None if row is None else int(row["id"])
+            catalog_id = int(catalog_id_text)
+            connection.execute(
+                "INSERT INTO auctions(id, campaign_id, catalog_item_id, "
+                "bid_owner_character_id, current_bid, bid_maximum, escrow, turn_opened, "
+                "turn_bid_made, turn_to_close, closing) VALUES(?,1,?,?,?,?,?,?,?,?,?)",
+                (catalog_id, catalog_id, owner, int(item.get("current_bid", 0)),
+                 int(item.get("bid_maximum", 0)), int(item.get("escrow", 0)),
+                 int(item.get("turn_opened", 0)), int(item.get("turn_bid_made", 0)),
+                 int(item.get("turn_to_close", 0)), int(bool(item.get("closing", False)))),
+            )
+        connection.execute("DELETE FROM news_stories WHERE campaign_id=1")
+        connection.executemany(
+            "INSERT INTO news_stories(id,campaign_id,turn,channel,priority,text,"
+            "timestamp,persistence,sequence) VALUES(?,1,?,?,?,?,?,?,?)",
+            ((int(item["id"]), int(item.get("turn", 0)),
+              str(item.get("channel", "system")), str(item.get("priority", "med")),
+              str(item.get("text", "")), int(item.get("timestamp", 0)),
+              int(item.get("persistence", 3)), int(item.get("sequence", item["id"])))
+             for item in state.get("news", ())),
+        )
+        connection.execute("DELETE FROM prepared_missions WHERE campaign_id=1")
+        for item in state.get("missions", ()):
+            owner = connection.execute(
+                "SELECT c.id FROM characters c JOIN accounts a ON a.id=c.account_id "
+                "WHERE c.campaign_id=1 AND a.account_name=? COLLATE NOCASE",
+                (str(item.get("account", "")),),
+            ).fetchone()
+            if owner is None:
+                raise ValueError("mission references an unknown account")
+            connection.execute(
+                "INSERT INTO prepared_missions(id,campaign_id,character_id,status,mission_json) "
+                "VALUES(?,1,?,?,?)",
+                (int(item["id"]), int(owner["id"]), str(item.get("status", "offered")),
+                 json.dumps(item, sort_keys=True)),
+            )
+        connection.execute("DELETE FROM auction_settlements WHERE campaign_id=1")
+        connection.executemany(
+            "INSERT INTO auction_settlements(campaign_id,account_name,catalog_item_id,"
+            "class_name,price,turn) VALUES(1,?,?,?,?,?)",
+            ((str(item.get("account", "")), int(item.get("ship_id", 0)),
+              str(item.get("class_name", "")), int(item.get("price", 0)),
+              int(item.get("turn", 0)))
+             for item in state.get("auction_settlements", ())),
         )
         connection.commit()
     except Exception:

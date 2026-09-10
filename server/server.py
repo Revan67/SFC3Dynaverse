@@ -148,7 +148,6 @@ SERVER_ASSET_ROOT = Path(
 # argument, but do not load commercial retail installation assets at runtime.
 ASSET_ROOT = SERVER_ASSET_ROOT
 PERSISTENCE = None
-SQL_CHARACTER_READS = os.environ.get("SFC3_SQL_CHARACTER_READS", "0") == "1"
 
 # ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -304,6 +303,8 @@ def _clock_config() -> CampaignClockConfig:
 def _load_campaign_clock(now: float | None = None) -> dict:
     """Load or initialize the restart-stable wall-clock campaign epoch."""
     current_time = time.time() if now is None else float(now)
+    if PERSISTENCE is not None:
+        return database.load_campaign_state(PERSISTENCE)
     if CAMPAIGN_STATE_PATH.exists():
         state = json.loads(CAMPAIGN_STATE_PATH.read_text(encoding="utf-8"))
         if not isinstance(state, dict):
@@ -324,6 +325,9 @@ def _load_campaign_clock(now: float | None = None) -> dict:
 
 
 def _write_campaign_state(state: dict) -> None:
+    if PERSISTENCE is not None:
+        database.save_campaign_state(PERSISTENCE, state)
+        return
     CAMPAIGN_STATE_PATH.write_text(
         json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -770,7 +774,7 @@ def _character_logon_payload(
 
 
 def _load_characters() -> dict[str, dict]:
-    if PERSISTENCE is not None and SQL_CHARACTER_READS:
+    if PERSISTENCE is not None:
         return {
             account: _normalize_character_record(record)
             for account, record in database.load_characters(PERSISTENCE).items()
@@ -838,7 +842,6 @@ def _save_character(
     account: str, character_name: str, client_address: str, race: int,
     verification_id: str = "",
 ) -> dict:
-    characters = _load_characters()
     record = _new_character_record(
         character_name, client_address, race, verification_id
     )
@@ -851,11 +854,14 @@ def _save_character(
         record["ship"]["owner_id"] = ids["character_id"]
         for officer, officer_id in zip(record["ship"]["officers"], ids["officer_ids"]):
             officer["id"] = officer_id
-    characters[account] = record
-    CHARACTER_STORE_PATH.write_text(
-        json.dumps(characters, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    else:
+        # Unit-test fallback only. The running server always initializes SQL.
+        characters = _load_characters()
+        characters[account] = record
+        CHARACTER_STORE_PATH.write_text(
+            json.dumps(characters, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     return record
 
 
@@ -930,12 +936,14 @@ def _write_character_record(account: str, record: dict) -> dict:
     normalized = _normalize_character_record(record)
     if PERSISTENCE is not None:
         database.save_character(PERSISTENCE, account_name=account, record=normalized)
-    characters = _load_characters()
-    characters[account] = normalized
-    CHARACTER_STORE_PATH.write_text(
-        json.dumps(characters, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    else:
+        # Unit-test fallback only. The running server always initializes SQL.
+        characters = _load_characters()
+        characters[account] = normalized
+        CHARACTER_STORE_PATH.write_text(
+            json.dumps(characters, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     return normalized
 
 
@@ -3831,23 +3839,11 @@ async def main():
     )
     persistence = database.initialize(DATABASE_PATH)
     PERSISTENCE = persistence
-    if not SQL_CHARACTER_READS:
-        synchronized = 0
-        for account, record in _load_characters().items():
-            try:
-                database.save_character(
-                    persistence, account_name=account, record=record
-                )
-                synchronized += 1
-            except ValueError as exc:
-                log.warning("Could not reconcile character %s into SQLite: %s", account, exc)
-        log.info("Reconciled %d JSON character snapshots into SQLite shadow storage", synchronized)
     log.info(
-        "SQLite persistence schema ready at %s (version %d, first_start=%s, sql_character_reads=%s)",
+        "SQLite persistence schema ready at %s (version %d, first_start=%s)",
         DATABASE_PATH,
         database.schema_version(persistence),
         created,
-        SQL_CHARACTER_READS,
     )
     relay_handler = lambda r, w: asyncio.ensure_future(SFC3Client(r, w).run())
     game_handler = lambda r, w: asyncio.ensure_future(DynamicSecurityClient(r, w).run())

@@ -9,6 +9,69 @@ import database
 
 
 class DatabaseSchemaTests(unittest.TestCase):
+    def test_accounts_are_created_and_loaded_from_sql(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = database.initialize(Path(directory) / "campaign.sqlite3")
+            first = database.create_account(
+                connection, account_name="Pilot@Example", nickname="Pilot",
+                password_hash="abc123",
+            )
+            second = database.create_account(
+                connection, account_name="wing@example", nickname="Wing",
+                password_hash="def456",
+            )
+            accounts = database.load_accounts(connection)
+            self.assertEqual((first["userid"], second["userid"]), (1, 2))
+            self.assertEqual(accounts["pilot@example"]["nick"], "Pilot")
+            self.assertEqual(accounts["pilot@example"]["password_hash"], "abc123")
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                database.create_account(
+                    connection, account_name="PILOT@example", nickname="Other",
+                    password_hash="ghi789",
+                )
+            connection.close()
+
+    def test_campaign_state_roundtrip_is_fully_sql_backed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = database.initialize(Path(directory) / "campaign.sqlite3")
+            connection.execute(
+                "INSERT INTO campaigns(id,map_id,epoch_unix,initial_turn) "
+                "VALUES(1,'retail',10.5,4)"
+            )
+            connection.execute(
+                "INSERT INTO accounts(id,account_name) VALUES(1,'pilot@example')"
+            )
+            connection.execute(
+                "INSERT INTO characters(id,campaign_id,account_id,character_name,race,"
+                "position_x,position_y,homeworld_x,homeworld_y) "
+                "VALUES(1,1,1,'Pilot',0,1,2,1,2)"
+            )
+            connection.commit()
+            state = {
+                "epoch_unix": 10.5, "initial_turn": 4,
+                "next_news_id": 2, "next_mission_id": 2,
+                "auctions": {"3001": {
+                    "bid_owner": "pilot@example", "current_bid": 20,
+                    "bid_maximum": 25, "escrow": 25, "turn_opened": 4,
+                    "turn_bid_made": 5, "turn_to_close": 8, "closing": False,
+                }},
+                "news": [{"id": 1, "turn": 5, "timestamp": 12,
+                          "channel": "system", "priority": "med",
+                          "persistence": 3, "sequence": 1, "text": "Welcome"}],
+                "missions": [{"id": 1, "account": "pilot@example",
+                              "status": "offered", "title": "Patrol"}],
+                "auction_settlements": [{"account": "pilot@example",
+                    "ship_id": 3000, "class_name": "Norway", "price": 10,
+                    "turn": 6}],
+            }
+            database.save_campaign_state(connection, state)
+            loaded = database.load_campaign_state(connection)
+            self.assertEqual(loaded["auctions"]["3001"]["bid_owner"], "pilot@example")
+            self.assertEqual(loaded["news"][0]["text"], "Welcome")
+            self.assertEqual(loaded["missions"][0]["title"], "Patrol")
+            self.assertEqual(loaded["auction_settlements"][0]["price"], 10)
+            connection.close()
+
     def test_initialize_creates_missing_parent_and_database(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "new" / "campaign.sqlite3"

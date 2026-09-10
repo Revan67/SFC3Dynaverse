@@ -149,9 +149,11 @@ Non-permissive modes require `SFC3_IDENTITY_HMAC_SECRET`; strict identifiers are
 listed in `SFC3_REGISTERED_KEY_IDS`. Raw key material and reusable proofs must
 never be logged or stored.
 
-Local accounts and campaign state still use ignored JSON compatibility files
-while the SQLite runtime cutover is tested. Password reset—not password
-recovery—and a mod-overlay directory are planned operator features. Baseline
+SQLite is authoritative for local accounts, characters, ships, stores, refits,
+officers, the campaign clock, auctions, news, and prepared missions. The old
+ignored JSON files are accepted only by the explicit one-time migration tool;
+normal server operation neither reads nor writes them. Password reset—not
+password recovery—and a mod-overlay directory are planned operator features. Baseline
 files under `assets/server-kit` should remain unchanged; future overrides will
 take precedence by relative path.
 
