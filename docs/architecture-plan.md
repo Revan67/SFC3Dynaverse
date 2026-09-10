@@ -1,7 +1,8 @@
 # Architecture Plan
 
-This is a design direction, not implemented behavior. Dynamic game-port authentication must be
-understood before the boundary is finalized.
+This records the target architecture. The network bootstrap, dynamic-port authentication,
+SQLite persistence, and combined launcher are implemented; Peerchat, administration, mod layers,
+and the operator GUI remain planned.
 
 ## Proposed components
 
@@ -43,13 +44,16 @@ until a trusted mail and identity-verification system exists.
 
 ## Sessions and CD keys
 
-The recovered design proposed 90-day sessions and one CD key per account, with an optional
-allow-all development mode. Those are product decisions, not protocol facts.
+The replacement supports permissive, registered, and strict CD-key policies. Non-permissive modes
+derive an operator-local HMAC identifier from the dynamic-port verification package; raw keys are
+never stored. The current binding is character-level and permits one identifier to appear on more
+than one account. Before public hosting, move binding to accounts and support multiple active or
+revoked identifiers, administrative clear/rebind after reinstall, explicit strict-allowlist
+replacement, session revocation, and sanitized audit history. Clearing a binding must never bypass
+the strict allowlist.
 
-An earlier plan correlated CD-key authentication with GPCM by client IP. That is unsafe behind
-shared NAT and was based on the now-superseded assumption that verification happened on port
-26100. Do not implement that correlation until the dynamic-port auth exchange exposes its actual
-session or account linkage.
+Never correlate GameSpy login and CD-key authentication by client IP; shared NAT makes that
+ambiguous. Bind identity only through the authenticated dynamic-port character session.
 
 ## Deployment backlog
 

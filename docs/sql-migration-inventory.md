@@ -12,7 +12,7 @@ Its tables and blob columns are retained only as behavioral and ownership
 evidence. The replacement database is free to use normalized tables, foreign-key
 constraints, transactions, and versioned migrations suited to the new server.
 
-## Existing state to migrate
+## Legacy state and authoritative destinations
 
 | Current source | Current data | SQLite destination | Notes |
 |---|---|---|---|
@@ -24,9 +24,9 @@ constraints, transactions, and versioned migrations suited to the new server.
 | Nested ship `officers` | Officer ID, name, station, worth | `officers` | Expand to the full officer profile, skills, race, base/review location, and transfer state. Enforce one officer per ship station. |
 | `campaign.local.json` clock fields | Epoch and initial turn | `campaigns` | Clock configuration remains sourced from `Time.gf`; persisted epoch/turn anchor lives in SQL. |
 | `campaign.local.json` auctions | Catalog item ID, owner account, current/max bid, escrow, bid turn, closing state | `auctions` plus auction-settlement history | Reference bidder by character ID and auctioned ship by ship ID. Settlement, prestige debit, ownership transfer, and refund must be one transaction. |
-| `campaign.local.json` auction settlements | Winner, ship, class, price, turn | `auction_settlements` | Append-only audit/history table; currently absent from `schema.sql`. |
+| `campaign.local.json` auction settlements | Winner, ship, class, price, turn | `auction_settlements` | Append-only settlement history is represented in schema migration 002. |
 | `campaign.local.json` news | IDs, next ID, turn/timestamp, channel, priority, persistence, sequence, text | `news_stories` and campaign sequence state | Add all recovered `NewsStory` fields rather than only the current prototype subset. |
-| `campaign.local.json` missions | IDs, next ID, account, title/type/reward/status/turn, accepted battle item | `prepared_missions`, mission participants, and mission-event/result tables | The current JSON envelope can remain temporarily in `mission_json`, but launch/result work should normalize ownership, participants, state transitions, and rewards. |
+| `campaign.local.json` missions | IDs, next ID, account, title/type/reward/status/turn, accepted battle item | `prepared_missions`, mission participants, and mission-event/result tables | SQLite temporarily retains the prototype envelope in `mission_json`; launch/result work should normalize ownership, participants, state transitions, and rewards. |
 | Per-connection memory | Current character/record, relay addresses, verification handshake, session key, sockets | Usually not durable | Keep live transport state in memory. Persist only explicit reconnect/recovery tokens or active mission reservations if later required. |
 
 ## Durable state not yet represented completely
@@ -58,9 +58,10 @@ complete:
    retreat/forfeit/disconnect state, rewards, damage, and post-battle return.
 9. **Auction accounting** — losing bidder refunds, escrow ledger, settlement
    events, simultaneous-close safety, and catalog rotation/history.
-10. **Moderation and authentication administration** — bans, password-reset
-    audit/revocation, credential versions, login audit/rate limiting, and optional
-    email verification if that feature is later chosen.
+10. **Moderation and authentication administration** — bans, password reset,
+    account-level HMAC key identities, clear/rebind and revocation, strict
+    allowlist management, session revocation, sanitized audits, credential
+    versions, rate limiting, and optional email verification if later chosen.
 11. **Operator configuration overrides** — definition files remain in
     `server-kit`/future `mods`, while their resolved manifest and all instantiated
     mutable campaign state are recorded in SQL.

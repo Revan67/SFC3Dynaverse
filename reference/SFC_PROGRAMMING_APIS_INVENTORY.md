@@ -115,20 +115,15 @@ types. The eleven stock-looking `Meta/` projects all mark themselves as campaign
 missions and provide concrete examples for mission matching, initialization,
 team population, victory evaluation, and Dynaverse-facing results.
 
-## Relevance to current defects
+## Relevance to the remaining work
 
 - **Mission button/combat:** high value. This is the first substantial SFC3
   tactical mission source we have and defines what data a mission expects.
 - **Post-combat persistence:** high value. It exposes stores, damage-related ship
   objects, victory/prestige results, medals, and campaign adjustment hooks.
-- **Refit overload:** moderate value. We now know the client's validation error
-  categories, but the implementation and several core loadout headers are absent.
-- **Officer transfer persistence:** low/moderate value. Ship-level officer methods
-  exist, but campaign officer-market wire formats and persistence are absent.
-- **Supply Dock transition:** low direct value. Tactical store access is distinct
-  from the campaign purchasing UI protocol.
-- **Stardate display:** low direct value. Missions receive day/year and campaign
-  year, but the campaign clock wire serialization is not included.
+- **Refit, Officers, Supply Dock, and stardate:** historical supporting evidence.
+  Those replacement paths are now implemented and client-validated; this package
+  remains useful for regression interpretation rather than active protocol gaps.
 - **GameSpy/login/server browser:** no useful implementation; this is a mission
   scripting package, not a replacement server or retail client source tree.
 
@@ -141,6 +136,5 @@ team population, victory evaluation, and Dynaverse-facing results.
    against the retail `Assets/Scripts` directory.
 4. Derive a mission-result model from `tMissionScheduler`, victory-condition
    code, and ship/store accessors before implementing combat persistence.
-5. Keep Supply Dock, refit, and officer-market debugging capture-driven; this
-   package is supporting evidence, not their wire specification.
-
+5. Keep this package as supporting mission/combat evidence, not as a wire
+   specification for already completed campaign facilities.

@@ -70,12 +70,13 @@ to the client presence flags, and preserves economy/strength values.
 
 1. Parse the `.gf` configuration format into typed Python data with source provenance.
 2. Generate officers from `OfficerNames.gf` plus `AI.gf` rules and serialize `tOfficer`. Candidate
-   browsing is now implemented and client-validated; purchase/transfer remains.
+   browsing, purchase/transfer, cancellation, and persistence are client-validated.
 3. Parse complete ship availability from `DefaultCore.txt`/`DefaultLoadOut.txt` and generate
    auction inventory according to `Ship.gf` and `Economy.gf`. Faction catalogs, bid presentation,
-   and selected-hull Vessel Library previews are implemented and client-validated; bid persistence
-   and settlement remain.
-4. Add item pricing and availability to Supply Dock and Refit from the CommonSettings catalogs.
+   selected-hull Vessel Library previews, bid persistence, and single-player settlement are
+   client-validated. Competing bidder behavior remains.
+4. Item pricing, availability, and persistence for Supply Dock and Refit are implemented from the
+   CommonSettings catalogs; retain these files as the baseline for future mod overlays.
 5. Implement news retention/publication from `News.gf` and recovered request serializers.
 6. The SQL schema has now informed the versioned SQLite entity model in
    `server/schema.sql`; analyze the `.sds` save for populated-record evidence.

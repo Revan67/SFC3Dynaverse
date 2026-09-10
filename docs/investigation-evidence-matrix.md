@@ -32,9 +32,9 @@ not application-message boundaries.
 | Area | Retail/capture evidence | Static/API evidence | Current replacement observation | Finding and next proof |
 |---|---|---|---|---|
 | Campaign clock | Retail publishes five little-endian integers: turn `93528`, current year `9`, turns/year `10000`, milliseconds/turn `120000`, base year `56200`. The same snapshot is sent to two registered clock callbacks. | `tCurrentTime::StreamOut` writes offsets `+0x0c,+0x10,+0x14,+0x18,+0x1c`. Database fields name them `CurrentTurn`, `CurrentYear`, `CurrentTurnsPerYear`, `CurrentMilliSecondsPerTurn`, and `CurrentBaseYear`. `GetYear()` computes turn divided by turns/year. `Time.gf` supplies `10000`, `120000`, and `56200`. | Auctions settled under the old provisional tuple, while the client displayed malformed values such as `219.1` and `219.1342177`. The replacement now derives the complete tuple from persisted state and `Time.gf`; client validation displayed `56200.824` and the server published the next turn normally. | **Implemented and client validated.** Automated tests cover the exact recovered retail tuple, rollover, restart stability, next-turn scheduling, and auction settlement boundaries. |
-| Supply transaction | Client sends Ship object 22/channel 13 with callback, character ID, ship name, and absolute stores. On success it requests Character channel 13 (prestige) and Ship channel 7 (full ship). Retail briefly shows black while this completes, then restores Supply Dock. | `tUpdateStoresReq::tRep` is response status, full `tShip`, then one-byte `updated` flag. The original server clamps absolute counts to capacity, calculates the net prestige delta at item-specific rates, persists character and ship, and notifies prestige changes. | Counts/persistence have sometimes updated, but buy/sell can remain black; a marine purchase once crashed. In a failing low-prestige test, a mine costing four was correctly unaffordable. | **Likely malformed/inconsistent update reply, not missing UI command.** The client initiates the two refreshes only after accepting the channel-13 response. Compare the returned `tShip` byte-for-byte by field with the requested absolute stores and with the subsequent channel-7 ship. Capture one local transaction from click through restored/stuck UI. |
-| Refit | Client sends Character object 6/channel 38: callback, character ID, ship ID, complete client-produced `tTNGShip`. Retail responds `01 01`, then the client requests prestige and full ship. A retail remove/add/save completed. | Original `PurchaseConfigChanges` checks ship ownership, computes the submitted-versus-current BPV delta, charges prestige, copies the submitted `tTNGShip` into the persisted `tShip`, calls `ShipRefitted`, and updates the character ship. There is no separate server overload test in this handler. API headers enumerate overload validation categories but omit the validating implementation. | Every local mutation produces overload, including removal. The awarded Sovereign template/loadout has also been suspected of an invalid power budget. | **Overload is most likely client validation of an inconsistent returned/refreshed `tTNGShip`, not a retail server rejection.** Preserve the client-submitted structure as the canonical refit result and ensure the follow-up full ship is semantically identical. A local capture should include one removal-only save and its refreshed ship. |
-| Officer review and transfer | Opening review uses Character channels 27/12/26 and a review relay. Free/cancel uses channel 8 and returns one success byte. Purchase uses channel 39; one assignment is 28 bytes and receives `01 01`, a user message, prestige refresh, and full-ship refresh. | The original handler treats the request map as selected reviewed officer IDs mapped to station enums. Unselected reviewed officers are released. It computes incoming worth minus outgoing officer value, updates prestige, replaces officer slots in the actual `tShip`, and persists that ship. | Cancel no longer disables facilities and transfers no longer crash, but replacing Bair/Harrison or assigning Bowen did not survive relog. | **Persistence must live in the serialized ship officer slots.** A detached roster or review-pool update is insufficient if channel 7 regenerates officers from stock loadout data. Compare the post-transfer ship response and relog ship at each officer item field. |
+| Supply transaction | Client sends Ship object 22/channel 13 with callback, character ID, ship name, and absolute stores. On success it requests Character channel 13 (prestige) and Ship channel 7 (full ship). Retail briefly shows black while this completes, then restores Supply Dock. | `tUpdateStoresReq::tRep` is response status, full `tShip`, then one-byte `updated` flag. The original server clamps absolute counts to capacity, calculates the net prestige delta at item-specific rates, persists character and ship, and notifies prestige changes. | Shuttle, marine, and mine transactions now update counts and prestige, restore the panel after the normal brief transition, and persist through relog. | **Implemented and client validated.** The accepted reply, prestige/full-ship refreshes, and registered completion notification are all required. |
+| Refit | Client sends Character object 6/channel 38: callback, character ID, ship ID, complete client-produced `tTNGShip`. Retail responds `01 01`, then the client requests prestige and full ship. A retail remove/add/save completed. | Original `PurchaseConfigChanges` checks ship ownership, computes the submitted-versus-current BPV delta, charges prestige, copies the submitted `tTNGShip` into the persisted `tShip`, calls `ShipRefitted`, and updates the character ship. There is no separate server overload test in this handler. API headers enumerate overload validation categories but omit the validating implementation. | The canonical ship serializer now preserves the complete retail structure; valid changes no longer produce the false overload and survive relog. | **Implemented and client validated.** Genuine invalid configurations remain part of failure-path regression coverage. |
+| Officer review and transfer | Opening review uses Character channels 27/12/26 and a review relay. Free/cancel uses channel 8 and returns one success byte. Purchase uses channel 39; one assignment is 28 bytes and receives `01 01`, a user message, prestige refresh, and full-ship refresh. | The original handler treats the request map as selected reviewed officer IDs mapped to station enums. Unselected reviewed officers are released. It computes incoming worth minus outgoing officer value, updates prestige, replaces officer slots in the actual `tShip`, and persists that ship. | Transfers and cancellation work without disabling facilities; all six ship-owned assignments persist in SQLite and survive relog. | **Implemented and client validated.** Broader concurrent review-pool behavior remains multiplayer regression work. |
 | Shipyard | Retail inventory, selection, preview, bid, and award were observed. The reference server settled a test bid immediately; that timing is not a retail-baseline requirement. | Server-kit ship specs/loadouts are authoritative inventory data. Original economy handlers expose auction ships, bids, close-bids, scrap, and award flows. | Rows highlight, preview selects the right hull, bids persist, and a settled bid awarded a Sovereign. Losing/outbid behavior is untested. | Core single-player path is working. Remaining proof needs two clients: outbid notification, loser refund/accounting, winner charge/trade-in, and simultaneous settlement. |
 | News | Retail uses News object 27/channel 2 with a requested story ID and one story response. | Static serializer returns one `tNewsStory`, not a counted list. | Welcome story now renders. | Functionally confirmed for one story. Later test paging, missing IDs, and retained campaign feed. |
 | Movement | Retail and local traffic use direct move response plus viewport state publication/completion. | Original server distinguishes automatic move, must-head-to-hex, movement completion, and battle-trigger paths. | One-, three-, and six-hex moves have completed; a two-hex diagonal move once stalled. | Treat as intermittent until a failing local capture proves whether callback, viewport completion, or battle matching is absent. Add deterministic path tests before changing logic. |
@@ -164,36 +164,25 @@ No new broad capture is needed. The remaining useful captures are narrow and
 should each begin before opening the relevant facility and end after returning
 to the campaign view or reproducing the failure:
 
-1. Local Supply Dock: buy one affordable item, then separately sell one item.
-2. Local Refit: remove one item only, accept, relog; later add it back.
-3. Local Officers: record the outgoing officer, incoming review ID and station,
-   accept, return to map, and relog.
-4. Local movement only if a multi-hex stall reproduces.
-5. Retail mission launch, from clicking Accept through tactical loading and the
+1. Local movement only if a multi-hex stall reproduces.
+2. Retail mission launch, from clicking Accept through tactical loading and the
    first playable frame. This validates the dynamic host address, return ID,
    channel-5 go-play message, and any secondary tactical connection.
-6. Retail mission completion, from a known pre-battle character/ship state
+3. Retail mission completion, from a known pre-battle character/ship state
    through return to the campaign. Record victory level, damage, expended
    stores, prestige, medal/event, and resulting hex ownership.
-7. Retail retreat or forfeit as a separate result case; it follows different
+4. Retail retreat or forfeit as a separate result case; it follows different
    server policy and must not be inferred from a normal victory.
-8. Two-client auction only when a second tester is available.
+5. Two-client auction only when a second tester is available.
 
-For Supply, Refit, and Officers, the decisive comparison is not merely response
-length or success bytes. It is semantic equality between the mutation request,
-the immediate returned ship (where applicable), the follow-up channel-7 ship,
-and the ship returned after relog.
+Supply Dock, Refit, and Officers have passed that semantic comparison across the
+mutation, follow-up ship, SQLite persistence, and relog paths. Retain those tests
+as regression coverage rather than open investigations.
 
-## Working conclusions before reassessment
+## Current conclusions
 
-- Clock display has a confirmed five-field semantic mismatch.
-- Supply Dock is primarily a response/refresh consistency defect; economy
-  persistence has already worked in several runs.
-- Refit overload is most plausibly caused by invalid regenerated ship state.
-- Officer transfers were stored outside the ship instance, while other paths
-  regenerated the stock loadout. Stores, refit items, and officer assignments
-  now migrate into and persist under one owned ship; automated cross-path and
-  restart equality tests pass, and a BOWEN transfer survived client relog.
+- Clock, Supply Dock, Refit, and Officers are implemented and client-validated
+  against one canonical SQLite-owned ship and character state.
 - Mission availability requires a generated assignment publication, not another
   eligibility flag. The original launch is a request/response/final-go sequence.
 - The tactical result schema and server-side consequences are statically known,
@@ -206,16 +195,9 @@ and the ship returned after relog.
 
 This is an investigation conclusion, not authorization to change code:
 
-1. Correct the five-field campaign clock so every later time-dependent feature
-   (auctions, mission timing, UI stardate) shares one valid model.
-2. Validate the newly canonical serialized `tShip` across Supply Dock, Refit,
-   Officers, channel-7 refresh, persistence, and relog. The three current
-   facility defects may still expose transaction-specific wire mismatches.
-3. Re-run the three narrow local mutation captures and compare request,
-   immediate response, refresh response, and relog state field-by-field.
-4. Implement the complete `tPushMatchedMission` assignment handshake and prove
+1. Implement the complete `tPushMatchedMission` assignment handshake and prove
    a deterministic mission reaches tactical play.
-5. Capture and implement `tReadyToPlayRequest::tResponse` ingestion through
+2. Capture and implement `tReadyToPlayRequest::tResponse` ingestion through
    DataValidator, initially for a single human and AI opposition.
-6. Add retreat/forfeit, disconnect recovery, fleets/multiple humans, and only
+3. Add retreat/forfeit, disconnect recovery, fleets/multiple humans, and only
    then random encounter generation.

@@ -89,7 +89,8 @@ It is sent to the return address supplied by the verification request.
 
 After accepting the security result, the client publishes `tCharacterRelayS` at `(0, 1, 2)`. The
 server claims it with the same claim format, assigning server object ID 6. Character login and the
-remaining authenticated IPL messages are the next implementation phase.
+authenticated character and campaign services follow. Those non-combat services are now implemented;
+mission launch and tactical result handling remain the next protocol boundary.
 
 ## Related live-service observations
 

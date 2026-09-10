@@ -1,6 +1,6 @@
 # Ordered Milestone Roadmap
 
-Reviewed 2026-09-09. This is the authoritative work order derived from client
+Reviewed 2026-09-10. This is the authoritative work order derived from client
 tests, retail captures, SFC3 client/server static analysis, server-kit data, and
 the archived programming/forum research.
 
@@ -24,7 +24,7 @@ The project already has a working foundation:
 
 ## Milestone 1 — Canonical campaign clock
 
-**Status: implementation substantially complete; full crew persistence gap found during SQL reconciliation.**
+**Status: implemented and retail-client validated.**
 
 Build one clock model used by UI snapshots, auctions, missions, persistence, and
 simulation. Serialize the recovered five fields with retail semantics:
@@ -50,10 +50,10 @@ Exit criteria:
 - Turns advance consistently without requiring player movement.
 - An auction closes on the configured turn and remains correct after restart.
 
-Automated validation now covers the recovered retail tuple, year rollover,
+Automated validation covers the recovered retail tuple, year rollover,
 unsigned field bounds, restart-stable epoch/turn state, next-turn scheduling,
-and an auction settlement exactly on its configured turn boundary. The remaining
-client validation confirmed a correct `56200.824` display and turn publication.
+and an auction settlement exactly on its configured turn boundary. Client
+validation confirmed a correct `56200.824` display and turn publication.
 
 ## Milestone 2 — Canonical `tShip` model and serializer
 
@@ -85,17 +85,15 @@ and officer fields into the owned ship instance. Fleet data follows the persiste
 ship identity, class, and position; facility serializers resolve the same mutable
 loadout; and Shipyard awards create a complete configured instance. Automated
 tests cover legacy migration, restart equality, cross-facility configuration
-equality, and non-starter fleet identity. Client validation remains the exit gate.
+equality, and non-starter fleet identity. Client validation passed the exit gate.
 
 Client validation confirms the awarded Sovereign identity, Sovereign A mutable
 loadout selection, map marker/Center behavior, and stores `4/3/3` with capacities
 `7/21/25`. An officer exchange committed as BOWEN in station 100, updated the
-loadout slot, and survived relog. SQL reconciliation then proved that the other
-five client-displayed crew members were never materialized as server-owned
-officer records: only transferred officers currently persist. Complete starting
-crew materialization is therefore still required. The later client crash and
-Refit overload remain transaction-specific defects assigned to the Officers and
-Refit milestones.
+loadout slot, and survived relog. SQL reconciliation exposed an older incomplete
+character whose five synthesized crew members had never been materialized. New
+characters now receive all six server-owned officer records, and officer/refit
+mutations persist through relog.
 
 The released kit's `SQL/CreateTables.sql` confirms that characters, ships,
 officers, auctions, and campaign state are separate database entities and that a
@@ -123,6 +121,8 @@ path; they require an explicit backfill operation.
 
 ## Milestone 3 — Supply Dock transaction loop
 
+**Status: implemented and retail-client validated.**
+
 Complete the retail channel-13 mutation, prestige refresh, and channel-7 ship
 refresh sequence.
 
@@ -144,7 +144,12 @@ Implementation and exit criteria:
 - Counts and prestige agree immediately and after relog.
 - Rejected and unaffordable transactions restore usable UI state unchanged.
 
+Client validation confirmed purchases, prestige and absolute counts, the normal
+brief black transition back to Supply Dock, and persistence through relog.
+
 ## Milestone 4 — Refit validation and persistence
+
+**Status: implemented and retail-client validated.**
 
 Resolve the false overload before expanding configuration features.
 
@@ -166,7 +171,13 @@ Implementation and exit criteria:
 - Genuine invalid configurations are rejected without corrupting the ship or
   leaving the UI blocked.
 
+The false overload was traced to incomplete ship serialization. The canonical
+ship response now preserves the submitted retail structure; remove/save/relog and
+subsequent facility persistence passed client validation.
+
 ## Milestone 5 — Officer transfer persistence
+
+**Status: implemented and retail-client validated.**
 
 Persist officer assignments in the canonical ship slots rather than a detached
 review roster.
@@ -186,7 +197,12 @@ Exit criteria:
 - The new officer is visible immediately and after restart/relog.
 - Prestige and the review pool are correct; cancel leaves all facilities usable.
 
+Transfer, cancellation, six-station assignment, SQLite persistence, and relog
+were validated with the retail client.
+
 ## Milestone 6 — Facility regression checkpoint
+
+**Status: core single-client paths passed; failure-path and multiplayer breadth remain ongoing.**
 
 Before missions, prove the shared character/ship boundary is stable.
 
@@ -336,8 +352,17 @@ Exit criteria:
 - Move idle kick, auction duration, starting prestige, faction starting ships,
   turn duration, capacity, ports, and related variables into schema-driven
   instance configuration.
-- Add reset-only account password administration, session revocation, sanitized
-  audit events, and backup/restore/migration tooling.
+- Move CD-key identity binding from campaign characters to accounts before
+  public hosting. Support multiple replaceable HMAC identifiers per account,
+  active/revoked state, and no raw-key storage.
+- Add operator actions to clear an account's key binding for reinstall/recovery,
+  rebind it after the next successful verification, revoke a compromised
+  identifier, and explicitly replace a strict-mode allowlist entry. Clearing a
+  binding must not modify or bypass the strict allowlist.
+- Revoke active sessions after password or key-identity changes and retain only
+  sanitized audit data: account, operator, timestamp, action, and reason.
+- Add reset-only account password administration and backup/restore/migration
+  tooling. Password and key recovery must never expose the original secret.
 
 ## Milestone 15 — Operator GUI and deployment
 

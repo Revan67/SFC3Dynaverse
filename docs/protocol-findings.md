@@ -51,11 +51,13 @@ second GT2 and nSwitch setup, followed by:
 2. Server claim of that relay
 3. Client registration frame
 4. Server sends a 55-byte nSwitch-framed challenge
-5. Client closes before sending a successful verification response
+5. Client sends the complete manifest/access verification request
+6. Server validates it under the configured CD-key policy and returns success
+7. Client publishes `tCharacterRelayS` and proceeds into campaign services
 
 This supersedes the earlier assumption that CD-key verification occurs directly on port 26100.
-The exact challenge schema, `VerifyClientRequest`, and auth result are the current protocol
-blockers.
+The challenge, `VerifyClientRequest`, access-package identity, and success response are implemented
+and client-validated. Private identity material is deliberately neither logged nor stored raw.
 
 ## Key Classes (from ServerPlatform.exe debug symbols)
 
@@ -100,9 +102,9 @@ before the client entered combat. Raw captures remain local and ignored; the san
   combat followed the move immediately; ordinary movement timing remains to be validated.
 
 Sending these notifications to `PlayerRelayC` was an earlier hypothesis and is superseded by the
-capture. The local direct callback response is accepted by the client and starts its movement bar;
-the viewport completion notification is what should end that state. Final confirmation requires one
-client move after restarting onto the current code.
+capture. The local direct callback response starts the movement bar and the viewport completion
+notification ends it. Adjacent and multi-hex moves, persistence, and relog have since passed client
+validation; investigate again only if the earlier intermittent stall becomes reproducible.
 
 ## Supply Dock and character refresh (capture-confirmed)
 
@@ -149,13 +151,10 @@ The 2026-09-08 controlled live mutation capture adds the complete post-purchase 
 - Retail itself briefly shows that black transition while applying a purchase, so only a transition
   that does not return is erroneous.
 
-Replacement-server validation subsequently confirmed that shuttle, marine, and mine counts and
-prestige changes persist across the transaction/re-entry path. The remaining defect is UI completion:
-the local client can remain on the black intermediary screen after either buying or selling. In the
-observed failing local sequence it re-requested Ship object 22/channel 7 but did not issue the live
-server's Character object 6/channel 13 prestige request. One marine purchase also ended in abnormal
-client termination. This distinguishes a response/state-transition defect from an economy mutation
-or persistence defect.
+Replacement-server validation subsequently confirmed that shuttle, marine, and mine counts,
+prestige changes, the completion notification, panel restoration, and SQLite persistence all match
+the required transaction/re-entry path. The earlier stuck transition and marine crash remain useful
+regression history but are no longer current defects.
 
 The generated response now uses the installed capacities and server-kit rates. Damage maxima and
 the full economy remain prototype values.
@@ -174,10 +173,9 @@ The same 2026-09-08 capture establishes the non-mission mutation envelopes:
   marker; a single assignment is exactly 28 bytes. It returns two success bytes (`01 01`) before the
   prestige/full-ship refresh sequence.
 
-The replacement implements these envelopes and persistence models, but the 2026-09-08 client run did
-not validate the mutation paths. The replacement now uses the captured two-byte replies and commits
-officer exchanges atomically with outgoing-officer credit. The separate officer-review cancel/free
-path is client-validated: it returns to the campaign view without disabling the facility buttons.
+The replacement implements these envelopes and commits refits and officer exchanges atomically
+against the canonical ship, including outgoing-officer credit. Refit changes, officer transfers,
+cancel/free behavior, SQLite persistence, and relog have all passed retail-client validation.
 
 News object 27/channel 2 carries a requested story ID after its callback, not a character ID. The
 reply is a four-byte success value followed directly by one `tNewsStory`; there is no list-count word.
@@ -195,9 +193,8 @@ from the active session rather than replayed.
 Local Shipyard selection, preview, bid increments, bid persistence, closing, and hull award are now
 client-observed. A bid on the Sovereign survived relogging and settled after further campaign moves;
 the character then loaded with the Sovereign and the updated trade-in value. Settlement therefore
-works even though the client-facing clock is suspect. The stardate initially appeared not to advance
-and later rendered as `219.1342177` instead of the expected `56200.xx`, indicating a clock serializer
-or numeric-format mismatch rather than proof that turns failed to advance.
+works with the canonical clock. Earlier malformed `219.x` values identified the old serializer
+defect; the retail client now displays and advances the expected `56200.xx` stardate.
 
 Multi-hex movement also needs regression coverage. One two-hex diagonal attempt appeared to stall,
 while a later three-hex move completed after a short calculation delay. Treat this as intermittent or

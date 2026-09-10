@@ -1,7 +1,8 @@
 # Initial Hot & Spicy archive findings
 
 This is a targeted first pass over the local forum snapshot, focused on issues
-currently encountered by the SFC3 Dynaverse replacement. Treat cross-title
+encountered during the early SFC3 Dynaverse replacement work. It is a historical
+research snapshot, not current project status. Treat cross-title
 findings as leads rather than proof of SFC3 wire behavior.
 
 ## Supply dock and persistence
@@ -38,8 +39,8 @@ findings as leads rather than proof of SFC3 wire behavior.
 - An SFC3 disassembly thread confirms that reopening the recruitment screen can
   refresh the available-officer list. That supports treating the available pool
   as a fresh server response, but it does not document mutation acknowledgements.
-- Current refit and officer fixes still need to be driven by captures, executable
-  analysis, and server-kit data rather than assumptions from other SFC titles.
+- The subsequently completed refit and officer work was driven by captures,
+  executable analysis, and server-kit data rather than assumptions from other titles.
 
 ## SFCLauncher and client patching
 
