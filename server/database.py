@@ -286,6 +286,136 @@ def bootstrap_character(
             "ship_id": ship_id, "officer_ids": officer_ids}
 
 
+def load_characters(connection: sqlite3.Connection) -> dict[str, dict]:
+    """Reconstruct canonical character records from normalized SQL rows."""
+    records: dict[str, dict] = {}
+    rows = connection.execute(
+        "SELECT a.account_name, c.*, s.id AS ship_id, s.race AS ship_race, "
+        "s.class_type, s.class_name, s.loadout_name, s.name AS ship_name, "
+        "s.epv, s.damage, s.flags AS ship_flags, s.turn_created, "
+        "ss.shuttles, ss.marines, ss.mines "
+        "FROM characters c JOIN accounts a ON a.id=c.account_id "
+        "JOIN ships s ON s.owner_character_id=c.id "
+        "JOIN ship_stores ss ON ss.ship_id=s.id "
+        "WHERE c.campaign_id=1 ORDER BY c.id, s.id"
+    ).fetchall()
+    for row in rows:
+        ship_id = int(row["ship_id"])
+        items = [item["item"] for item in connection.execute(
+            "SELECT item FROM ship_loadout_items WHERE ship_id=? ORDER BY slot_index",
+            (ship_id,),
+        )]
+        officers = [
+            {
+                "id": int(item["id"]), "name": str(item["name"]),
+                "station": int(item["station"]), "race": int(item["race"]),
+                "worth": int(item["worth"]),
+                "profile": json.loads(item["profile_json"] or "{}"),
+            }
+            for item in connection.execute(
+                "SELECT id, station, name, race, worth, profile_json FROM officers "
+                "WHERE ship_id=? ORDER BY station", (ship_id,)
+            )
+        ]
+        records[str(row["account_name"])] = {
+            "database_id": int(row["id"]),
+            "character_name": str(row["character_name"]),
+            "client_address": str(row["client_address"]),
+            "race": int(row["race"]),
+            "rank": int(row["rank"]), "rating": int(row["rating"]),
+            "prestige": int(row["prestige"]),
+            "lifetime_prestige": int(row["lifetime_prestige"]),
+            "disrepute": int(row["disrepute"]),
+            "lifetime_disrepute": int(row["lifetime_disrepute"]),
+            "position": [int(row["position_x"]), int(row["position_y"])],
+            "homeworld": [int(row["homeworld_x"]), int(row["homeworld_y"])],
+            "destination": [int(row["destination_x"]), int(row["destination_y"])],
+            "flags": int(row["flags"]),
+            "verification_id": row["verification_id"],
+            "missions": json.loads(row["missions_played_json"] or "[]"),
+            "ship": {
+                "id": ship_id, "owner_id": int(row["id"]),
+                "class_name": str(row["class_name"]),
+                "loadout_name": str(row["loadout_name"]),
+                "name": str(row["ship_name"]),
+                "class_type": int(row["class_type"]), "bpv": int(row["epv"]),
+                "damage": float(row["damage"]), "flags": int(row["ship_flags"]),
+                "turn_created": int(row["turn_created"]),
+                "stores": {"shuttles": int(row["shuttles"]),
+                           "marines": int(row["marines"]), "mines": int(row["mines"])},
+                "refit": {"loadout_name": str(row["loadout_name"]), "items": items},
+                "officers": officers,
+            },
+        }
+    return records
+
+
+def save_character(connection: sqlite3.Connection, *, account_name: str, record: dict) -> None:
+    """Atomically replace the mutable SQL snapshot for one existing character."""
+    ship = record["ship"]
+    position, homeworld = record["position"], record["homeworld"]
+    destination = record.get("destination", (-1, -1))
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        account = connection.execute(
+            "SELECT id FROM accounts WHERE account_name=? COLLATE NOCASE", (account_name,)
+        ).fetchone()
+        if account is None:
+            raise ValueError("unknown account")
+        character_id = int(record["database_id"])
+        ship_id = int(ship["id"])
+        result = connection.execute(
+            "UPDATE characters SET character_name=?, client_address=?, race=?, rank=?, "
+            "rating=?, prestige=?, lifetime_prestige=?, disrepute=?, lifetime_disrepute=?, "
+            "position_x=?, position_y=?, homeworld_x=?, homeworld_y=?, destination_x=?, "
+            "destination_y=?, flags=?, verification_id=?, missions_played_json=? "
+            "WHERE id=? AND campaign_id=1 AND account_id=?",
+            (str(record["character_name"]), str(record.get("client_address", "")),
+             int(record["race"]), int(record.get("rank", 0)), int(record.get("rating", 1500)),
+             int(record["prestige"]), int(record.get("lifetime_prestige", 0)),
+             int(record.get("disrepute", 0)), int(record.get("lifetime_disrepute", 0)),
+             int(position[0]), int(position[1]), int(homeworld[0]), int(homeworld[1]),
+             int(destination[0]), int(destination[1]), int(record.get("flags", 0)),
+             record.get("verification_id"), json.dumps(record.get("missions", []), sort_keys=True),
+             character_id, int(account["id"])),
+        )
+        if result.rowcount != 1:
+            raise ValueError("unknown campaign character")
+        result = connection.execute(
+            "UPDATE ships SET race=?, class_type=?, class_name=?, loadout_name=?, name=?, "
+            "epv=?, damage=?, flags=?, turn_created=? WHERE id=? AND owner_character_id=?",
+            (int(record["race"]), int(ship["class_type"]), str(ship["class_name"]),
+             str(ship["loadout_name"]), str(ship["name"]), int(ship["bpv"]),
+             float(ship.get("damage", 1.0)), int(ship.get("flags", 0)),
+             int(ship.get("turn_created", 0)), ship_id, character_id),
+        )
+        if result.rowcount != 1:
+            raise ValueError("unknown character ship")
+        stores = ship["stores"]
+        connection.execute(
+            "UPDATE ship_stores SET shuttles=?, marines=?, mines=? WHERE ship_id=?",
+            (int(stores["shuttles"]), int(stores["marines"]), int(stores["mines"]), ship_id),
+        )
+        connection.execute("DELETE FROM ship_loadout_items WHERE ship_id=?", (ship_id,))
+        connection.executemany(
+            "INSERT INTO ship_loadout_items(ship_id, slot_index, item) VALUES(?, ?, ?)",
+            ((ship_id, index, str(item)) for index, item in enumerate(ship["refit"]["items"])),
+        )
+        connection.execute("DELETE FROM officers WHERE ship_id=?", (ship_id,))
+        connection.executemany(
+            "INSERT INTO officers(id, campaign_id, ship_id, station, name, race, worth, profile_json) "
+            "VALUES(?, 1, ?, ?, ?, ?, ?, ?)",
+            ((int(item["id"]), ship_id, int(item["station"]), str(item["name"]),
+              int(item.get("race", record["race"])), int(item.get("worth", 0)),
+              json.dumps(item.get("profile", {}), sort_keys=True))
+             for item in ship["officers"]),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def _json_source(path: Path) -> tuple[object, str] | None:
     if not path.exists():
         return None

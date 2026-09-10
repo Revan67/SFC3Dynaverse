@@ -148,6 +148,7 @@ SERVER_ASSET_ROOT = Path(
 # argument, but do not load commercial retail installation assets at runtime.
 ASSET_ROOT = SERVER_ASSET_ROOT
 PERSISTENCE = None
+SQL_CHARACTER_READS = os.environ.get("SFC3_SQL_CHARACTER_READS", "0") == "1"
 
 # ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -709,6 +710,33 @@ def _parse_relay_publication(payload: bytes) -> tuple[bytes, tuple[int, int]]:
     return name, address
 
 
+def _parse_notify_registration(payload: bytes) -> tuple[int, int, bytes, int]:
+    """Parse tRegisterForNotify's non-async wire form."""
+    if len(payload) < 26:
+        raise ValueError("truncated notify registration")
+    category = struct.unpack_from("<I", payload, 8)[0]
+    event = payload[12]
+    name_length = struct.unpack_from("<I", payload, 17)[0]
+    end = 21 + name_length
+    if end + 5 != len(payload):
+        raise ValueError("invalid notify registration length")
+    relay_name = payload[21:end]
+    data_id = struct.unpack_from("<I", payload, end)[0]
+    if payload[end + 4] != 0:
+        raise ValueError("unsupported async notify registration")
+    return category, event, relay_name, data_id
+
+
+def _parse_notify_event(payload: bytes) -> tuple[int, int, int]:
+    """Parse the nine-byte tNotifyEvent relay payload."""
+    if len(payload) != 9:
+        raise ValueError("invalid notify event length")
+    category = struct.unpack_from("<I", payload, 0)[0]
+    event = payload[4]
+    extra_id = struct.unpack_from("<I", payload, 5)[0]
+    return category, event, extra_id
+
+
 def _parse_relay_request(payload: bytes) -> tuple[tuple[int, int, int], bytes]:
     """Parse an interface request asking the server to claim a named relay."""
     if len(payload) < 17 or payload[0] != 1:
@@ -742,6 +770,11 @@ def _character_logon_payload(
 
 
 def _load_characters() -> dict[str, dict]:
+    if PERSISTENCE is not None and SQL_CHARACTER_READS:
+        return {
+            account: _normalize_character_record(record)
+            for account, record in database.load_characters(PERSISTENCE).items()
+        }
     if not CHARACTER_STORE_PATH.exists():
         return {}
     data = json.loads(CHARACTER_STORE_PATH.read_text(encoding="utf-8"))
@@ -894,8 +927,10 @@ def _new_character_record(
 
 
 def _write_character_record(account: str, record: dict) -> dict:
-    characters = _load_characters()
     normalized = _normalize_character_record(record)
+    if PERSISTENCE is not None:
+        database.save_character(PERSISTENCE, account_name=account, record=normalized)
+    characters = _load_characters()
     characters[account] = normalized
     CHARACTER_STORE_PATH.write_text(
         json.dumps(characters, indent=2, sort_keys=True) + "\n",
@@ -1746,12 +1781,13 @@ def _supply_dock_payload(race: int, asset_root: Path | None = None, *, record: d
         epv=int((record or {}).get("ship", {}).get("bpv", 250)),
         turn_created=int((record or {}).get("ship", {}).get("turn_created", 0)),
     )
+    ship_id = int((record or {}).get("ship", {}).get("id", SHIP_DATABASE_ID))
     return (
         b"\x01"
         + ship
-        + _id_double_map_payload(((SHIP_DATABASE_ID, 1.0),))
-        + _id_double_map_payload(((SHIP_DATABASE_ID, 0.5),))
-        + _id_item_rates_map_payload(((SHIP_DATABASE_ID, (1.0, (2.0, 4.0, 4.0))),))
+        + _id_double_map_payload(((ship_id, 1.0),))
+        + _id_double_map_payload(((ship_id, 0.5),))
+        + _id_item_rates_map_payload(((ship_id, (1.0, (2.0, 4.0, 4.0))),))
     )
 
 
@@ -1797,6 +1833,13 @@ def _updated_ship_payload(record: dict) -> bytes:
         epv=int(ship.get("bpv", 250)),
         turn_created=int(ship.get("turn_created", 0)),
     )
+
+
+def _update_stores_response(record: dict | None, *, updated: bool) -> bytes:
+    """Serialize the exact retail tUpdateStoresReq::tRep wire shape."""
+    if record is None:
+        return b"\x00"
+    return b"\x01" + _updated_ship_payload(record) + bytes((int(updated),))
 
 
 def _parse_character_ship_config_request(
@@ -2786,6 +2829,8 @@ class DynamicSecurityClient:
         self.verification_id = ""
         self.player_relay_address = None
         self.viewport_relay_address = None
+        self.client_relays: dict[bytes, tuple[int, int]] = {}
+        self.notify_subscriptions: list[tuple[int, int, bytes, int]] = []
         self.clock_subscribers: set[tuple[int, int, int]] = set()
         self.clock_task: asyncio.Task | None = None
 
@@ -2833,6 +2878,31 @@ class DynamicSecurityClient:
                 _campaign_turn(),
                 len(self.clock_subscribers),
             )
+
+    async def _send_notification(self, category: int, event: int, extra_id: int):
+        """Deliver a retail tNotifyEvent to every matching client callback."""
+        payload = struct.pack("<IBI", category, event, extra_id)
+        delivered = 0
+        for registered_category, registered_event, relay_name, data_id in tuple(
+            self.notify_subscriptions
+        ):
+            if (registered_category, registered_event) != (category, event):
+                continue
+            address = self.client_relays.get(relay_name)
+            if address is None:
+                continue
+            self.writer.write(_nswitch_frame(address[0], address[1], data_id, payload))
+            delivered += 1
+        if delivered:
+            await self.writer.drain()
+        self._log(
+            "info",
+            "-> notify category=%d event=%d extra=%d subscribers=%d",
+            category,
+            event,
+            extra_id,
+            delivered,
+        )
 
     async def _handle(self):
         if not await self._gt2_handshake():
@@ -3008,6 +3078,7 @@ class DynamicSecurityClient:
                         relay_name,
                         relay_address,
                     )
+                    self.client_relays[relay_name] = relay_address
                     if relay_name.endswith(b"PlayerRelayC"):
                         self.player_relay_address = relay_address
                     if relay_name.endswith(b"MetaViewPortHandlerNameC"):
@@ -3034,6 +3105,32 @@ class DynamicSecurityClient:
                                 "info",
                                 "-> initial viewport position/facility state",
                             )
+            if (sw, obj, ch) == (0, 30, 2):
+                try:
+                    subscription = _parse_notify_registration(payload)
+                except ValueError as exc:
+                    self._log("warning", "notify registration rejected: %s", exc)
+                else:
+                    if subscription not in self.notify_subscriptions:
+                        self.notify_subscriptions.append(subscription)
+                    self._log(
+                        "info",
+                        "<- notify registration category=%d event=%d relay=%r data=%d",
+                        *subscription,
+                    )
+                continue
+            if (sw, obj, ch) == (0, 30, 3):
+                try:
+                    category, event, extra_id = _parse_notify_event(payload)
+                except ValueError as exc:
+                    self._log("warning", "notify event rejected: %s", exc)
+                else:
+                    # tNotifyRelayS fans client-originated events back out to
+                    # every registered callback. UpdateStores causes the
+                    # retail client to publish events 13 and 14; event 14 is
+                    # what completes the Supply Dock return transition.
+                    await self._send_notification(category, event, extra_id)
+                continue
             if (sw, obj, ch) == (0, 1, 0) and b"CharacterLogOnRelayNameC" in payload:
                 if self.current_character is None:
                     raise ValueError("character logon publication preceded character creation")
@@ -3126,10 +3223,7 @@ class DynamicSecurityClient:
                 continue
             if (sw, obj, ch) == (0, 22, 13):
                 callback = _parse_callback(payload)
-                response = (
-                    b"\x01" + _updated_ship_payload(self.current_record) + b"\x00"
-                    if self.current_record is not None else b"\x00"
-                )
+                response = _update_stores_response(self.current_record, updated=False)
                 try:
                     _callback, character_id, ship_name, desired = _parse_update_stores_request(payload)
                     if (
@@ -3157,11 +3251,19 @@ class DynamicSecurityClient:
                         self.current_record = _update_supplies(
                             self.current_character[0], requested
                         )
-                        response = b"\x01" + _updated_ship_payload(self.current_record) + b"\x01"
+                        response = _update_stores_response(self.current_record, updated=True)
                 except (KeyError, OSError, RuntimeError, ValueError) as exc:
                     self._log("warning", "Supply Dock update rejected: %s", exc)
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
+                if response[0] and self.current_record is not None:
+                    # Retail UpdateStores announces both mutations. These
+                    # callbacks make the client refresh its prestige and ship
+                    # state and finish the Supply Dock screen transition.
+                    await self._send_notification(0, 7, CHARACTER_DATABASE_ID)
+                    await self._send_notification(
+                        1, 0, int(self.current_record["ship"].get("database_id", 2))
+                    )
                 self._log("info", "-> Supply Dock update result=%d", response[0])
                 continue
             if (sw, obj, ch) == (0, 19, 2):
@@ -3729,11 +3831,23 @@ async def main():
     )
     persistence = database.initialize(DATABASE_PATH)
     PERSISTENCE = persistence
+    if not SQL_CHARACTER_READS:
+        synchronized = 0
+        for account, record in _load_characters().items():
+            try:
+                database.save_character(
+                    persistence, account_name=account, record=record
+                )
+                synchronized += 1
+            except ValueError as exc:
+                log.warning("Could not reconcile character %s into SQLite: %s", account, exc)
+        log.info("Reconciled %d JSON character snapshots into SQLite shadow storage", synchronized)
     log.info(
-        "SQLite persistence schema ready at %s (version %d, first_start=%s); JSON compatibility storage remains active",
+        "SQLite persistence schema ready at %s (version %d, first_start=%s, sql_character_reads=%s)",
         DATABASE_PATH,
         database.schema_version(persistence),
         created,
+        SQL_CHARACTER_READS,
     )
     relay_handler = lambda r, w: asyncio.ensure_future(SFC3Client(r, w).run())
     game_handler = lambda r, w: asyncio.ensure_future(DynamicSecurityClient(r, w).run())

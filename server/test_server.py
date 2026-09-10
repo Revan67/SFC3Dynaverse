@@ -989,6 +989,52 @@ class DynamicSecurityWireTests(unittest.TestCase):
             self.assertEqual(generated[0], 1)
             self.assertEqual(generated[-len(maps):], maps)
 
+    def test_supply_update_response_is_full_canonical_ship_plus_updated_flag(self):
+        assets = Path(__file__).resolve().parent.parent / "assets" / "server-kit"
+        old_root = server.ASSET_ROOT
+        server.ASSET_ROOT = assets
+        try:
+            for race, class_name, ship_name in (
+                (server.RACE_FEDERATION, "Norway", "USS Venture"),
+                (server.RACE_KLINGON, "K'Vort", "IKV Test"),
+                (server.RACE_ROMULAN, "Falcon", "IRW Test"),
+                (server.RACE_BORG, "Diamond", "Borg Test"),
+            ):
+                record = server._normalize_character_record({
+                    "race": race,
+                    "ship": {
+                        "id": 77,
+                        "owner_id": 31,
+                        "class_name": class_name,
+                        "loadout_name": class_name,
+                        "name": ship_name,
+                        "stores": {"shuttles": 1, "marines": 2, "mines": 3},
+                    },
+                })
+                ship = server._updated_ship_payload(record)
+                response = server._update_stores_response(record, updated=True)
+                self.assertEqual(response, b"\x01" + ship + b"\x01")
+                self.assertEqual(response[0], 1)
+                self.assertEqual(response[-1], 1)
+        finally:
+            server.ASSET_ROOT = old_root
+
+    def test_supply_dock_rate_maps_use_the_persisted_ship_id(self):
+        assets = Path(__file__).resolve().parent.parent / "assets" / "server-kit"
+        record = server._normalize_character_record({
+            "race": server.RACE_FEDERATION,
+            "ship": {"id": 77, "class_name": "Norway", "loadout_name": "Norway"},
+        })
+        response = server._supply_dock_payload(
+            server.RACE_FEDERATION, assets, record=record
+        )
+        expected_maps = (
+            server._id_double_map_payload(((77, 1.0),))
+            + server._id_double_map_payload(((77, 0.5),))
+            + server._id_item_rates_map_payload(((77, (1.0, (2.0, 4.0, 4.0))),))
+        )
+        self.assertTrue(response.endswith(expected_maps))
+
     def test_character_ship_config_and_server_kit_officer_review_payloads(self):
         assets = Path(r"D:\Games\GOG\Star Trek SFC3\Assets")
         if not assets.is_dir():
@@ -1148,6 +1194,26 @@ class DynamicSecurityWireTests(unittest.TestCase):
         name = b"accountCharacterLogOnRelayNameC"
         payload = struct.pack("<I", len(name)) + name + struct.pack("<II", 77, 4)
         self.assertEqual(server._parse_relay_publication(payload), (name, (77, 4)))
+
+    def test_notify_registration_matches_retail_capture(self):
+        payload = bytes.fromhex(
+            "000000000000000000000000071aa20d0019000000"
+            "7465737440746573742e636f6d506c6179657252656c617943"
+            "0500000000"
+        )
+        self.assertEqual(
+            server._parse_notify_registration(payload),
+            (0, 7, b"test@test.comPlayerRelayC", 5),
+        )
+
+    def test_notify_event_wire_shape(self):
+        payload = struct.pack("<IBI", 0, 14, 1)
+        self.assertEqual(payload.hex(), "000000000e01000000")
+        self.assertEqual(server._parse_notify_event(payload), (0, 14, 1))
+
+    def test_notify_event_rejects_wrong_length(self):
+        with self.assertRaisesRegex(ValueError, "notify event length"):
+            server._parse_notify_event(b"\x00" * 8)
 
     def test_relay_request_shape(self):
         name = b" *~Server~* tMapRelayS"

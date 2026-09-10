@@ -156,6 +156,46 @@ class DatabaseSchemaTests(unittest.TestCase):
             ).fetchone()[0], 1)
             connection.close()
 
+    def test_character_repository_round_trips_facility_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = database.initialize(Path(directory) / "campaign.sqlite3")
+            connection.execute(
+                "INSERT INTO campaigns(id, map_id, epoch_unix, initial_turn) "
+                "VALUES(1, 'retail', 0, 0)"
+            )
+            connection.commit()
+            record = {
+                "database_id": 1, "character_name": "Captain", "client_address": "local",
+                "race": 2, "rank": 0, "rating": 1500, "prestige": 200,
+                "position": [36, 29], "homeworld": [36, 29], "destination": [-1, -1],
+                "ship": {
+                    "id": 2, "class_type": 3, "class_name": "Falcon",
+                    "loadout_name": "Falcon", "name": "IRW Test", "bpv": 1125,
+                    "stores": {"shuttles": 2, "marines": 5, "mines": 2},
+                    "refit": {"items": ["R-DISRUPTOR II:1", "R-DISRUPTOR II:2"]},
+                    "officers": [
+                        {"id": 10000 + index, "station": station,
+                         "name": f"Crew{station}", "race": 2, "worth": 114}
+                        for index, station in enumerate(range(96, 102))
+                    ],
+                },
+            }
+            database.bootstrap_character(connection, account_name="romulan", record=record)
+            loaded = database.load_characters(connection)["romulan"]
+            loaded["prestige"] = 193
+            loaded["ship"]["stores"] = {"shuttles": 3, "marines": 4, "mines": 3}
+            loaded["ship"]["refit"]["items"] = ["R-DISRUPTOR II:2"]
+            loaded["ship"]["officers"][0]["name"] = "BOWEN"
+            database.save_character(connection, account_name="romulan", record=loaded)
+            restarted = database.load_characters(connection)["romulan"]
+            self.assertEqual(restarted["prestige"], 193)
+            self.assertEqual(restarted["ship"]["stores"], {
+                "shuttles": 3, "marines": 4, "mines": 3,
+            })
+            self.assertEqual(restarted["ship"]["refit"]["items"], ["R-DISRUPTOR II:2"])
+            self.assertEqual(restarted["ship"]["officers"][0]["name"], "BOWEN")
+            connection.close()
+
     def test_ship_state_is_owned_and_rejects_orphans(self):
         with tempfile.TemporaryDirectory() as directory:
             connection = database.initialize(Path(directory) / "campaign.sqlite3")
