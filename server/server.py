@@ -1635,14 +1635,14 @@ def _default_ship_core_payload(defaults: dict) -> bytes:
     marines = defaults["marines"]
     shuttles = defaults["shuttles"]
     primary_values = (
-        defaults["power_space"],
         defaults["weapon_space"],
         defaults["hull_space"],
+        defaults["power_space"],
         defaults["size_class"],
         _ship_class_id(defaults["class_code"]),
         defaults["base_weight"],
-        defaults["cargo_space"],
-        defaults["hull_cost"],
+        defaults["ship_size"],
+        defaults["shield_space"],
     )
     model_values = (
         mines[1],
@@ -1656,8 +1656,8 @@ def _default_ship_core_payload(defaults: dict) -> bytes:
     secondary_values = (
         shuttles[0],
         shuttles[2],
-        defaults["shield_space"],
-        defaults["ship_size"],
+        defaults["cargo_space"],
+        defaults["hull_cost"],
     )
     core = _ship_core_payload(
         _core_hardpoint_vectors(defaults),
@@ -1838,7 +1838,8 @@ def _character_ship_config_payload(
         b"\x01"
         + struct.pack("<I", ship_id)
         + tng_ship
-        + struct.pack("<If", prestige, economic_scalar)
+        # Retail StreamOut writes the economic scalar before prestige.
+        + struct.pack("<fI", economic_scalar, prestige)
     )
 
 
@@ -1958,7 +1959,7 @@ def _officers_to_review_payload(
         ),
     )
     return b"\x01" + struct.pack("<I", len(officers)) + b"".join(officers) + tng_ship + struct.pack(
-        "<If", prestige, economic_scalar
+        "<fI", economic_scalar, prestige
     )
 
 
@@ -2404,11 +2405,16 @@ def _load_ship_defaults(core_path: Path, loadout_path: Path, model_name: str) ->
         None,
     )
     core_model_name = loadout_row[3] if loadout_row is not None else model_name
+    loadout_class_name = loadout_row[1] if loadout_row is not None else None
     core_row = next(
         (
             row
             for row in _spec_rows(core_path)
-            if len(row) >= 20 and row[11] == core_model_name
+            if (
+                len(row) >= 20
+                and row[11] == core_model_name
+                and (loadout_class_name is None or row[10] == loadout_class_name)
+            )
         ),
         None,
     )

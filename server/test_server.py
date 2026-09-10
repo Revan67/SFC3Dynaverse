@@ -872,10 +872,8 @@ class DynamicSecurityWireTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             server._weapon_arc_id("12_34")
 
-    def test_installed_norway_hardpoint_vectors_match_default_core(self):
-        assets = Path(r"D:\Games\GOG\Star Trek SFC3\Assets")
-        if not assets.is_dir():
-            self.skipTest("local SFC3 asset install is unavailable")
+    def test_server_kit_norway_core_matches_retail_stream_order(self):
+        assets = Path(__file__).resolve().parent.parent / "assets" / "server-kit"
         defaults = server._starter_ship_defaults(server.RACE_FEDERATION, assets)
         self.assertEqual(
             server._core_hardpoint_vectors(defaults),
@@ -888,8 +886,60 @@ class DynamicSecurityWireTests(unittest.TestCase):
         vectors_length = sum(4 + 4 * size for size in (3, 3, 3, 3, 3, 2))
         self.assertEqual(
             struct.unpack_from("<8I", core, vectors_length),
-            (2550, 1000, 2300, 10, 3, 1250, 0, 1250),
+            (1000, 2300, 2550, 10, 3, 1250, 1021, 8500),
         )
+        # StreamOut places cargo and hull cost after the interleaved supply
+        # fields, not in the first numeric group.
+        self.assertEqual(struct.unpack_from("<4I", core, len(core) - 16), (1, 2, 0, 1250))
+
+    def test_shared_romulan_model_resolves_the_selected_loadout_class(self):
+        specs = Path(__file__).resolve().parent.parent / "assets" / "server-kit" / "Spec"
+        falcon = server._load_ship_defaults(
+            specs / "DefaultCore.txt", specs / "DefaultLoadOut.txt", "Falcon"
+        )
+        self.assertEqual(falcon["class_name"], "Romulan-Destroyer")
+        self.assertEqual(falcon["class_code"], "DD")
+        self.assertEqual(falcon["power_space"], 2775)
+        self.assertEqual(falcon["weapon_space"], 1000)
+        self.assertEqual(falcon["hull_space"], 2300)
+        self.assertEqual(falcon["heavy_hardpoints"], ((12, "330_30"), (13, "330_30")))
+
+    def test_representative_faction_cores_use_validated_wire_capacities(self):
+        root = Path(__file__).resolve().parent.parent / "assets" / "server-kit"
+        specs = root / "Spec"
+        expected = {
+            "Norway": (1000, 2300, 2550, 10, 3, 1250, 1021, 8500),
+            "K'Vort": (1000, 2300, 2425, 10, 3, 1125, 795, 8500),
+            "Falcon": (1000, 2300, 2775, 10, 3, 1125, 548, 8000),
+            "Diamond": (1450, 3700, 4800, 40, 4, 3775, 1206, 0),
+        }
+        for name, capacities in expected.items():
+            defaults = server._load_ship_defaults(
+                specs / "DefaultCore.txt", specs / "DefaultLoadOut.txt", name
+            )
+            core = server._default_ship_core_payload(defaults)
+            vectors_length = sum(
+                4 + 4 * len(group) for group in server._core_hardpoint_vectors(defaults)
+            )
+            self.assertEqual(struct.unpack_from("<8I", core, vectors_length), capacities)
+            config = server._character_ship_config_payload(
+                next(
+                    race for race, base in server.SHIP_POLITICAL_BASES.items()
+                    if base == defaults["political_base"]
+                ),
+                root,
+                prestige=500,
+                record=server._normalize_character_record({
+                    "race": next(
+                        race for race, base in server.SHIP_POLITICAL_BASES.items()
+                        if base == defaults["political_base"]
+                    ),
+                    "ship": {"class_name": name, "loadout_name": name},
+                }),
+            )
+            parsed, end = server._parse_tng_ship(config, 5)
+            self.assertEqual(end, len(config) - 8)
+            self.assertEqual(parsed["model_name"], defaults["model_name"])
 
     def test_ship_class_table_matches_executable_order(self):
         self.assertEqual(server._ship_class_id("SH"), 0)
@@ -964,7 +1014,7 @@ class DynamicSecurityWireTests(unittest.TestCase):
         )
         self.assertEqual(config[:5], b"\x01" + struct.pack("<I", server.SHIP_DATABASE_ID))
         self.assertEqual(config[5:-8], expected_tng)
-        self.assertEqual(struct.unpack("<If", config[-8:]), (1500, 1.0))
+        self.assertEqual(struct.unpack("<fI", config[-8:]), (1.0, 1500))
 
         old_kit_root = server.SERVER_ASSET_ROOT
         server.SERVER_ASSET_ROOT = (
@@ -988,7 +1038,7 @@ class DynamicSecurityWireTests(unittest.TestCase):
         )
         self.assertGreater(officer_size, 0)
         self.assertEqual(officers[5 + officer_bytes:-8], expected_tng)
-        self.assertEqual(struct.unpack("<If", officers[-8:]), (1500, 1.0))
+        self.assertEqual(struct.unpack("<fI", officers[-8:]), (1.0, 1500))
 
     def test_generated_officer_item_uses_recovered_field_order(self):
         payload = server._officer_item_payload("KLEIMAN", server.RACE_FEDERATION, 0x60)
