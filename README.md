@@ -7,25 +7,76 @@ or `ServerPlatform.exe`.
 
 ## Current status
 
-The unmodified GOG client can currently:
+The project has rebuilt most of the non-combat Dynaverse foundation. An
+unmodified retail/GOG client can discover the replacement server, create an
+account and character, enter the persistent campaign, move around the retail
+map, and use its principal ship-management facilities.
 
-- create and log into a local account;
-- create, persist, and rejoin a character;
-- discover the server and enter the campaign;
-- render the stock 51x34 server-kit map and faction homeworld;
-- display and recenter on the player marker;
-- move and retain position across reconnects;
-- browse Supply Dock, Refit, Officers, and the server-kit Shipyard catalog;
-- select and preview Shipyard vessels, place persistent bids, and receive a
-  winning vessel;
-- display the welcome news item.
+### Implemented and retail-client tested
 
-Current work is focused on one authoritative serialized `tShip` across Supply
-Dock, Refit, Officers, persistence, and relog; the five-field campaign clock;
-and the mission launch/result lifecycle. Known client-visible defects and their
-evidence are tracked in
+- **Network services:** GameSpy-compatible account/profile services, directory
+  listing, browser status, GT2/nSwitch bootstrap, dynamic security, loopback and
+  LAN hosting, and configurable permissive/registered/strict CD-key policies.
+- **Accounts and characters:** creation, login, reconnect, all four playable
+  factions, correct homeworld starts, complete starting crews, and persistent
+  character state.
+- **Campaign:** stock 51x34 server-kit map, faction territory, player marker,
+  Center behavior, immediate homeworld facilities, multi-hex movement, and
+  restart-stable position.
+- **Campaign clock:** the recovered five-field retail clock, client-visible
+  `56200.xx` stardate, movement-independent turns, and restart-stable timing.
+- **Ships:** one canonical mutable ship instance shared by login, fleet data,
+  Supply Dock, Refit, Officers, Shipyard awards, restart, and relog.
+- **Supply Dock:** shuttle, marine, and mine purchases and sales with capacity,
+  prestige, UI completion, and persistence.
+- **Refit:** valid removal/addition, prestige accounting, overload validation,
+  complete loadout saving, and persistence.
+- **Officers:** server-kit rosters, transfer in/out, station replacement,
+  cancellation, facility restoration, and persistent six-station assignments.
+- **Shipyard:** faction inventory, localized names, selection, previews, bids,
+  escrow, turn-based settlement, trade-in, and complete winning-ship awards.
+- **News:** a working panel and persisted welcome story.
+- **SQLite:** authoritative accounts, characters, ships, stores, loadouts,
+  officers, clock, auctions, settlements, news, missions, map, and asset
+  provenance. First start creates a working campaign from a pristine template;
+  later starts never silently reseed it.
+
+### Partially complete
+
+- **Two-player auctions:** single-player settlement is proven; competing bids,
+  loser refunds, simultaneous bids, and reconnect behavior need a second client.
+- **Multiplayer concurrency:** normal single-client paths work, but concurrent
+  movement, notifications, facilities, auctions, and disconnect races need
+  broader testing.
+- **Failure paths:** insufficient prestige, full capacity, invalid or stale
+  requests, and interrupted transactions need systematic retail-client coverage.
+
+### Major gameplay work remaining
+
+1. **Battle-item and mission availability:** publish valid offers and enable the
+   Missions panel.
+2. **Tactical launch:** match players and AI, serialize the complete mission,
+   select a host, complete ready-to-play, and reach a playable battle.
+3. **Tactical results:** ingest returned ships, damage, stores, outcomes,
+   prestige, rewards, and campaign consequences exactly once.
+4. **Mission lifecycle:** selection, acceptance, objectives, rewards, expiry,
+   disconnect recovery, and multiplayer participation.
+5. **Random encounters and simulation:** generate encounters from campaign
+   state, run strategic AI/economy/map changes, and remain deterministic across
+   long-running campaigns and restarts.
+
+The replacement is therefore a functional persistent strategic campaign and
+ship-management server. The central missing boundary is converting campaign
+state into a playable tactical battle and safely reconciling its result.
+
+Later product work includes Peerchat, mod/override layers, expanded host
+configuration, password-reset administration, backup/restore, an operator GUI,
+deployment packaging, and multi-player stress testing. Client resolution,
+scaling, renderer, and GOG-wrapper improvements belong on a separate branch.
+
+Known evidence and open questions are tracked in
 [`docs/investigation-evidence-matrix.md`](docs/investigation-evidence-matrix.md).
-The dependency-ordered work sequence and completion gates are in
+The dependency-ordered sequence and completion gates are in
 [`docs/implementation-roadmap.md`](docs/implementation-roadmap.md).
 
 ## Requirements
