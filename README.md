@@ -240,7 +240,7 @@ successors. Users must supply a legitimately owned game client and assets.
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0** (see [LICENSE](LICENSE)).
+This project is licensed under the **GNU General Public License v3.0** (see [LICENSE](LICENSE.MD)).
 
 This project is an independent reimplementation of server-side functionality.
 No original game assets or proprietary code are included. You must supply
