@@ -1,5 +1,21 @@
 # SFC3 Dynaverse Server Revival
 
+<p align="center">
+  <!-- Top Row: Technologies Used -->
+  <img src="https://shields.io" alt="Python" />
+  <img src="https://shields.io" alt="SQLite" />
+  <img src="https://shields.io" alt="Windows" />
+  <img src="https://shields.io" alt="Linux" />
+</p>
+
+<p align="center">
+  <!-- Bottom Row: Live Repository Stats -->
+  <!-- ⚠️ REPLACE 'YOUR_USERNAME' AND 'YOUR_REPO_NAME' with your actual GitHub username and repository name below ⚠️ -->
+  <img src="https://shields.io" alt="Open Issues" />
+  <img src="https://shields.io" alt="Open PRs" />
+  <img src="https://shields.io" alt="Downloads" />
+</p>
+
 A clean-room Python replacement for the retired Star Trek: Starfleet Command III
 Dynaverse and GameSpy services. The goal is to let an unmodified retail client
 host and join persistent private campaigns without the original online services
