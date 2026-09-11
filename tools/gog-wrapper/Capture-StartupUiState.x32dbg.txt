@@ -1,0 +1,15 @@
+// SFC3 1.01 build 534 startup UI-state capture for x32dbg.
+// Run while stopped at the initial system breakpoint.
+
+bp 00631c20, "SFC3 window procedure"
+SetBreakpointLog 00631c20, "WNDPROC hwnd={p:[esp+4]} msg={x:[esp+8]} wParam={p:[esp+C]} lParam={p:[esp+10]}"
+SetBreakpointCondition 00631c20, 0
+SetBreakpointSilent 00631c20, 1
+
+bp 00407325, "SFC3 state callback"
+SetBreakpointLog 00407325, "STATE cip={p:cip} ecx={p:ecx} esi={p:esi} eax={p:eax} caller={p:[esp]}"
+SetBreakpointCondition 00407325, 0
+SetBreakpointSilent 00407325, 1
+
+log "SFC3 startup UI capture armed; continuing until exception..."
+run

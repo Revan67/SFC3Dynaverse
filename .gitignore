@@ -41,3 +41,8 @@ reference/forum-archive/hotandspicy/crawl-state.json
 reference/forum-archive/hotandspicy/manifest.jsonl
 reference/forum-archive/hotandspicy/external-links.txt
 reference/forum-archive/hotandspicy/media-links.txt
+
+# Local GOG compatibility test products and third-party renderer binaries.
+.tmp-gog-patch-validation*/
+artifacts/
+tools/gog-wrapper/Renderer/*.dll
