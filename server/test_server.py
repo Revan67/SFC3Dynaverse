@@ -28,6 +28,20 @@ class DynamicSecurityWireTests(unittest.TestCase):
         payload = struct.pack("<III", 6, 6, 4) + b"request fields"
         self.assertEqual(server._parse_callback(payload), (6, 6, 4))
 
+    def test_clock_registration_preserves_unique_name_and_frequency(self):
+        name = b"test@exampleMetaClientClock"
+        payload = struct.pack("<III", 7, 14, 1) + struct.pack("<I", len(name)) + name + struct.pack("<I", 3)
+        self.assertEqual(
+            server._parse_clock_registration_request(payload),
+            ((7, 14, 1), name, 3),
+        )
+
+    def test_clock_registration_rejects_zero_frequency(self):
+        name = b"clock"
+        payload = struct.pack("<III", 7, 14, 1) + struct.pack("<I", len(name)) + name + struct.pack("<I", 0)
+        with self.assertRaisesRegex(ValueError, "registration values"):
+            server._parse_clock_registration_request(payload)
+
     def test_get_auction_ships_request_shape(self):
         payload = (
             b"\x01"
@@ -183,6 +197,9 @@ class DynamicSecurityWireTests(unittest.TestCase):
                     mock.patch.object(server, "_economy_ship_auction_settings", return_value=(1.0, 3, 40)),
                     mock.patch.object(server, "_shipyard_defaults", return_value=catalog),
                     mock.patch.object(server, "_shipyard_award_defaults", return_value=award),
+                    mock.patch.object(server, "_ship_trade_in_value", return_value=300),
+                    mock.patch.object(server, "_ship_total_bpv", return_value=100),
+                    mock.patch.object(server, "_can_benefit_from_downgrade", return_value=True),
                 ):
                     self.assertEqual(server._settle_shipyard_bids(now=102.999), ())
                     settlements = server._settle_shipyard_bids(now=103.0)
@@ -196,9 +213,129 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 character = json.loads(
                     server.CHARACTER_STORE_PATH.read_text(encoding="utf-8")
                 )["captain"]
-                self.assertEqual(character["prestige"], 100)
+                self.assertEqual(character["prestige"], 400)
+                self.assertEqual(settlements[0]["trade_in_value"], 300)
+                self.assertEqual(settlements[0]["net_cost"], -200)
                 self.assertEqual(character["ship"]["class_name"], "Test Hull")
         finally:
+            server.CAMPAIGN_STATE_PATH = old_campaign
+            server.CHARACTER_STORE_PATH = old_characters
+            server.SERVER_ASSET_ROOT = old_server_root
+
+    def test_connected_winner_reloads_record_after_auction_settlement(self):
+        stale = {"database_id": 50, "ship": {"class_name": "Diamond"}}
+        refreshed = {
+            "database_id": 50,
+            "prestige": 100,
+            "ship": {"id": 51, "class_name": "Sphere Prime"},
+        }
+        settlements = ({"account": "Test@Example.com", "ship_id": 39},)
+        with mock.patch.object(
+            server, "_character_record_for_account", return_value=refreshed
+        ) as lookup:
+            record, changed = server._record_after_auction_settlement(
+                "test@example.com", stale, settlements
+            )
+        self.assertTrue(changed)
+        self.assertIs(record, refreshed)
+        lookup.assert_called_once_with("test@example.com")
+
+    def test_unrelated_settlement_keeps_connected_record(self):
+        current = {"database_id": 50, "ship": {"class_name": "Diamond"}}
+        with mock.patch.object(server, "_character_record_for_account") as lookup:
+            record, changed = server._record_after_auction_settlement(
+                "test@example.com",
+                current,
+                ({"account": "someone@example.com", "ship_id": 39},),
+            )
+        self.assertFalse(changed)
+        self.assertIs(record, current)
+        lookup.assert_not_called()
+
+    def test_auction_settlement_persists_sql_ship_identity_and_crew(self):
+        old_campaign = server.CAMPAIGN_STATE_PATH
+        old_characters = server.CHARACTER_STORE_PATH
+        old_persistence = server.PERSISTENCE
+        old_server_root = server.SERVER_ASSET_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                profile = root / "ServerProfiles"
+                profile.mkdir()
+                (profile / "Time.gf").write_text(
+                    "[Clock]\nTurnsPerYear=10000\nMilliSecondsPerTurn=1000\n"
+                    "[Clock/StartingDate]\nBaseYear=56200\n",
+                    encoding="ascii",
+                )
+                server.CAMPAIGN_STATE_PATH = root / "campaign.json"
+                server.CHARACTER_STORE_PATH = root / "characters.json"
+                server.SERVER_ASSET_ROOT = root
+                server.PERSISTENCE = server.database.initialize(root / "campaign.sqlite3")
+                server.PERSISTENCE.execute(
+                    "INSERT INTO campaigns(id, map_id, epoch_unix, initial_turn) "
+                    "VALUES(1, 'retail', 100, 0)"
+                )
+                server.PERSISTENCE.commit()
+                original = server._save_character(
+                    "captain", "Test", "local", server.RACE_FEDERATION
+                )
+                original_ship_id = int(original["ship"]["id"])
+                original_officers = tuple(
+                    (item["id"], item["name"], item["station"])
+                    for item in original["ship"]["officers"]
+                )
+                auction_id, catalog_item_id = server.database.shipyard_catalog_ids(
+                    server.PERSISTENCE, race=server.RACE_FEDERATION, count=1
+                )[0]
+                server.database.save_campaign_state(server.PERSISTENCE, {
+                    "epoch_unix": 100.0,
+                    "initial_turn": 0,
+                    "auctions": {str(catalog_item_id): {
+                        "auction_id": auction_id,
+                        "current_bid": 100,
+                        "bid_owner": "captain",
+                        "bid_maximum": 100,
+                        "turn_bid_made": 0,
+                        "escrow": 100,
+                    }},
+                    "news": [], "missions": [], "auction_settlements": [],
+                })
+                catalog = ({"hull_cost": 100, "ui_name": "Test Hull", "class_code": "DD"},)
+                award = {
+                    "hull_cost": 100, "ui_name": "Test Hull",
+                    "sub_name": "Test Loadout", "class_code": "DD",
+                    "shuttles": (1, 2, 1), "marines": (1, 2, 1),
+                    "mines": (1, 2, 1), "items": ("PHASER IX:1",),
+                }
+                with (
+                    mock.patch.object(server, "_economy_ship_auction_settings", return_value=(1.0, 3, 40)),
+                    mock.patch.object(server, "_shipyard_defaults", return_value=catalog),
+                    mock.patch.object(server, "_shipyard_award_defaults", return_value=award),
+                    mock.patch.object(server, "_ship_trade_in_value", return_value=0),
+                    mock.patch.object(server, "_ship_total_bpv", return_value=100),
+                    mock.patch.object(server, "_can_benefit_from_downgrade", return_value=True),
+                ):
+                    settlements = server._settle_shipyard_bids(now=103.0)
+
+                self.assertEqual(len(settlements), 1)
+                restarted = server.database.load_characters(server.PERSISTENCE)["captain"]
+                self.assertEqual(restarted["ship"]["id"], original_ship_id)
+                self.assertEqual(restarted["ship"]["class_name"], "Test Hull")
+                self.assertEqual(
+                    tuple((item["id"], item["name"], item["station"])
+                          for item in restarted["ship"]["officers"]),
+                    original_officers,
+                )
+                self.assertEqual(
+                    server.database.load_campaign_state(server.PERSISTENCE)["auctions"], {}
+                )
+                self.assertFalse(server.CHARACTER_STORE_PATH.exists())
+                server.PERSISTENCE.close()
+                server.PERSISTENCE = old_persistence
+        finally:
+            if server.PERSISTENCE is not None and server.PERSISTENCE is not old_persistence:
+                server.PERSISTENCE.close()
+            server.PERSISTENCE = old_persistence
             server.CAMPAIGN_STATE_PATH = old_campaign
             server.CHARACTER_STORE_PATH = old_characters
             server.SERVER_ASSET_ROOT = old_server_root
@@ -378,6 +515,84 @@ class DynamicSecurityWireTests(unittest.TestCase):
         finally:
             server.CHARACTER_STORE_PATH = old_characters
 
+    def test_rejected_supply_update_is_atomic(self):
+        old_characters = server.CHARACTER_STORE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.CHARACTER_STORE_PATH = Path(directory) / "characters.json"
+                original = {
+                    "captain": {
+                        "race": 0, "character_name": "Test", "client_address": "local",
+                        "prestige": 1,
+                        "ship": {"stores": {"shuttles": 2, "marines": 2, "mines": 2}},
+                    }
+                }
+                server.CHARACTER_STORE_PATH.write_text(json.dumps(original), encoding="utf-8")
+                with mock.patch.object(server, "_character_ship_defaults", return_value={
+                    "shuttles": (2, 3, 2), "marines": (2, 3, 2), "mines": (2, 3, 2),
+                }):
+                    with self.assertRaisesRegex(ValueError, "capacity"):
+                        server._update_supplies(
+                            "captain", {"shuttles": 5, "marines": 2, "mines": 2}
+                        )
+                persisted = json.loads(server.CHARACTER_STORE_PATH.read_text(encoding="utf-8"))
+                self.assertEqual(persisted, original)
+        finally:
+            server.CHARACTER_STORE_PATH = old_characters
+
+    def test_duplicate_officer_target_is_rejected_before_mutation(self):
+        old_characters = server.CHARACTER_STORE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                server.CHARACTER_STORE_PATH = Path(directory) / "characters.json"
+                original = {
+                    "captain": {
+                        "race": server.RACE_FEDERATION,
+                        "character_name": "Test", "client_address": "local", "prestige": 20,
+                    }
+                }
+                server.CHARACTER_STORE_PATH.write_text(json.dumps(original), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "same station"):
+                    server._purchase_officers(
+                        "captain",
+                        {1000: server.OFFICER_STATIONS[0], 1001: server.OFFICER_STATIONS[0]},
+                    )
+                persisted = json.loads(server.CHARACTER_STORE_PATH.read_text(encoding="utf-8"))
+                self.assertEqual(persisted, original)
+        finally:
+            server.CHARACTER_STORE_PATH = old_characters
+
+    def test_rejected_refit_is_atomic(self):
+        old_characters = server.CHARACTER_STORE_PATH
+        old_assets = server.ASSET_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "Spec").mkdir()
+                server.ASSET_ROOT = root
+                server.CHARACTER_STORE_PATH = root / "characters.json"
+                original = {
+                    "captain": {
+                        "race": 0, "character_name": "Test", "client_address": "local",
+                        "prestige": 10,
+                        "ship": {"class_name": "Norway", "loadout_name": "Norway"},
+                    }
+                }
+                server.CHARACTER_STORE_PATH.write_text(json.dumps(original), encoding="utf-8")
+                submitted = {"ui_name": "Sovereign", "sub_name": "Sovereign A", "class_code": "DN"}
+                current = {"ui_name": "Norway", "sub_name": "Norway", "class_code": "DD"}
+                with (
+                    mock.patch.object(server, "_load_ship_defaults", return_value=submitted),
+                    mock.patch.object(server, "_character_ship_defaults", return_value=current),
+                ):
+                    with self.assertRaisesRegex(ValueError, "cannot change hull"):
+                        server._save_refit("captain", "Sovereign A", ["PHASER IX:1"])
+                persisted = json.loads(server.CHARACTER_STORE_PATH.read_text(encoding="utf-8"))
+                self.assertEqual(persisted, original)
+        finally:
+            server.CHARACTER_STORE_PATH = old_characters
+            server.ASSET_ROOT = old_assets
+
     def test_logon_payload_includes_persistent_prestige(self):
         with mock.patch.object(server, "_starting_prestige", return_value=200):
             record = server._normalize_character_record({"race": 0, "prestige": 77})
@@ -536,6 +751,16 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 self.assertEqual(
                     struct.unpack_from("<IIIII", snapshot.payload(), 1),
                     (93_528, 9, 10_000, 120_000, 56_200),
+                )
+                self.assertEqual(
+                    snapshot.turn_break_payload(),
+                    struct.pack("<IIIII", 93_528, 9, 10_000, 120_000, 56_200)
+                    + b"\x00",
+                )
+                self.assertEqual(
+                    server._clock_turn_break_payload_for_turn(93_529),
+                    struct.pack("<IIIII", 93_529, 9, 10_000, 120_000, 56_200)
+                    + b"\x00",
                 )
         finally:
             server.CAMPAIGN_STATE_PATH = old_path
@@ -1273,7 +1498,8 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 self.assertEqual(record["destination"], [-1, -1])
                 self.assertEqual(record["map_id"], server.CAMPAIGN_MAP_ID)
                 self.assertEqual(record["ship"]["class_name"], "Falcon")
-                self.assertEqual(record["ship"]["id"], 2)
+                self.assertEqual(record["database_id"], 18)
+                self.assertEqual(record["ship"]["id"], 19)
                 self.assertEqual(len(record["ship"]["officers"]), 6)
                 self.assertEqual(
                     {item["station"] for item in record["ship"]["officers"]},
@@ -1286,10 +1512,17 @@ class DynamicSecurityWireTests(unittest.TestCase):
                 self.assertEqual(len(officer_items), 6)
                 self.assertTrue(all(item.split(":")[2] for item in officer_items))
                 self.assertEqual(server.PERSISTENCE.execute(
-                    "SELECT COUNT(*) FROM officers WHERE ship_id=2"
+                    "SELECT COUNT(*) FROM officers WHERE ship_id=?",
+                    (record["ship"]["id"],)
                 ).fetchone()[0], 6)
                 payload = server._stored_character_payload("user@example", record)
                 self.assertEqual(struct.unpack_from("<I", payload, len(payload) - 4)[0], 0)
+                _address, offset = server._unpack_string(payload, 1)
+                _account, offset = server._unpack_string(payload, offset)
+                self.assertEqual(
+                    struct.unpack_from("<I", payload, offset)[0],
+                    record["database_id"],
+                )
                 server.PERSISTENCE.close()
                 server.PERSISTENCE = old_persistence
         finally:
@@ -1388,6 +1621,158 @@ class DynamicSecurityWireTests(unittest.TestCase):
 
 
 class DynamicSecurityReaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_turn_coordinator_announces_before_settlement(self):
+        events = []
+
+        class Writer:
+            def is_closing(self):
+                return False
+
+        class Client:
+            writer = Writer()
+
+            async def _announce_campaign_turn(self, turn):
+                events.append(("announce", turn))
+
+            async def _synchronize_campaign_turn(self):
+                events.append(("synchronize", 12))
+
+            async def _apply_turn_settlements(self, settlements):
+                events.append(("notify", settlements[0]["account"]))
+
+            def _log(self, *_args):
+                pass
+
+        client = Client()
+        server.ACTIVE_GAME_CLIENTS.add(client)
+        try:
+            def settle():
+                events.append(("settle", 12))
+                return ({"account": "captain"},)
+
+            with mock.patch.object(server, "TURN_ANNOUNCEMENT_MODE", "full"), \
+                 mock.patch.object(server, "_settle_shipyard_bids", side_effect=settle):
+                await server.CampaignTurnCoordinator().process_turn(12)
+        finally:
+            server.ACTIVE_GAME_CLIENTS.discard(client)
+        self.assertEqual(
+            events,
+            [
+                ("announce", 12),
+                ("synchronize", 12),
+                ("settle", 12),
+                ("notify", "captain"),
+            ],
+        )
+
+    async def test_turn_coordinator_gates_incomplete_live_sequence(self):
+        events = []
+
+        class Writer:
+            def is_closing(self):
+                return False
+
+        class Client:
+            writer = Writer()
+
+            async def _announce_campaign_turn(self, turn):
+                events.append(("announce", turn))
+
+            async def _apply_turn_settlements(self, settlements):
+                pass
+
+            def _log(self, *_args):
+                pass
+
+        client = Client()
+        server.ACTIVE_GAME_CLIENTS.add(client)
+        try:
+            with mock.patch.object(server, "TURN_ANNOUNCEMENT_MODE", "off"), \
+                 mock.patch.object(server, "_settle_shipyard_bids", return_value=()):
+                await server.CampaignTurnCoordinator().process_turn(12)
+        finally:
+            server.ACTIVE_GAME_CLIENTS.discard(client)
+        self.assertEqual(events, [])
+
+    async def test_turn_announcement_honors_registration_frequency(self):
+        class Writer:
+            def __init__(self):
+                self.frames = []
+
+            def write(self, frame):
+                self.frames.append(frame)
+
+            async def drain(self):
+                pass
+
+        client = object.__new__(server.DynamicSecurityClient)
+        client.writer = Writer()
+        client.clock_subscribers = {
+            (7, 10, 1): (b"every-turn", 1),
+            (7, 14, 1): (b"every-third-turn", 3),
+        }
+        client.client_relays = {b"every-turn": (7, 10), b"every-third-turn": (7, 14)}
+        client._log = lambda *_args, **_kwargs: None
+        with mock.patch.object(server, "TURN_ANNOUNCEMENT_MODE", "full"), \
+             mock.patch.object(
+                 server,
+                 "_clock_turn_break_payload_for_turn",
+                 return_value=struct.pack("<IIIIIB", 4, 0, 10_000, 120_000, 56_200, 0),
+             ):
+            await client._announce_campaign_turn(4)
+            self.assertEqual(len(client.writer.frames), 1)
+            await client._announce_campaign_turn(6)
+            self.assertEqual(len(client.writer.frames), 3)
+
+    async def test_display_turn_mode_only_targets_player_info_panel(self):
+        class Writer:
+            def __init__(self):
+                self.frames = []
+
+            def write(self, frame):
+                self.frames.append(frame)
+
+            async def drain(self):
+                pass
+
+        client = object.__new__(server.DynamicSecurityClient)
+        client.writer = Writer()
+        client.clock_subscribers = {
+            (7, 6, 8): (b"accountPlayerInfoPanel", 1),
+            (7, 6, 9): (b"accountMetaViewPortHandlerNameC", 1),
+        }
+        client.client_relays = {
+            b"accountPlayerInfoPanel": (7, 10),
+            b"accountMetaViewPortHandlerNameC": (7, 14),
+        }
+        client._log = lambda *_args, **_kwargs: None
+        with mock.patch.object(server, "TURN_ANNOUNCEMENT_MODE", "display"), \
+             mock.patch.object(
+                 server,
+                 "_clock_turn_break_payload_for_turn",
+                 return_value=struct.pack("<IIIIIB", 12, 0, 10_000, 120_000, 56_200, 0),
+             ):
+            await client._announce_campaign_turn(12)
+        self.assertEqual(len(client.writer.frames), 1)
+        self.assertEqual(struct.unpack_from("<III", client.writer.frames[0], 2), (7, 10, 1))
+
+        client.writer.frames.clear()
+        with mock.patch.object(server, "TURN_ANNOUNCEMENT_MODE", "viewport"), \
+             mock.patch.object(
+                 server,
+                 "_clock_turn_break_payload_for_turn",
+                 return_value=struct.pack("<IIIIIB", 12, 0, 10_000, 120_000, 56_200, 0),
+             ):
+            await client._announce_campaign_turn(12)
+        self.assertEqual(len(client.writer.frames), 1)
+        self.assertEqual(struct.unpack_from("<III", client.writer.frames[0], 2), (7, 14, 1))
+
+        client.writer.frames.clear()
+        client.client_relays.clear()
+        with mock.patch.object(server, "TURN_ANNOUNCEMENT_MODE", "full"):
+            await client._announce_campaign_turn(13)
+        self.assertEqual(client.writer.frames, [])
+
     async def test_reader_skips_keepalive_and_reassembles_frame(self):
         reader = asyncio.StreamReader()
         client = object.__new__(server.DynamicSecurityClient)
@@ -1417,8 +1802,13 @@ class DynamicSecurityReaderTests(unittest.IsolatedAsyncioTestCase):
 
 class GameSpyDiscoveryTests(unittest.TestCase):
     def test_compact_list_matches_live_capture(self):
+        header = bytes.fromhex("ebf91fc06862ebea")
+        clear_key = bytes(
+            value ^ gamespy.GAME_KEY[index] if index < len(gamespy.GAME_KEY) else value
+            for index, value in enumerate(header[1:])
+        )
         self.assertEqual(
-            gamespy.compact_server_list("70.27.77.102", 27633).hex(),
+            gamespy.compact_server_list("70.27.77.102", 27632, crypt_key=clear_key).hex(),
             "ebf91fc06862ebeaed4821f9df501d9073a77bd107",
         )
 
@@ -1427,7 +1817,8 @@ class GameSpyDiscoveryTests(unittest.TestCase):
             gamespy.compact_server_list("::1", 27633)
 
     def test_compact_list_substitutes_only_encrypted_endpoint(self):
-        response = gamespy.compact_server_list("127.0.0.1", 27633)
+        clear_key = bytes.fromhex("be76f72b5a98ea")
+        response = gamespy.compact_server_list("127.0.0.1", 27632, crypt_key=clear_key)
 
         self.assertEqual(len(response), 21)
         self.assertEqual(response[:8], bytes.fromhex("ebf91fc06862ebea"))
@@ -1435,14 +1826,14 @@ class GameSpyDiscoveryTests(unittest.TestCase):
 
     def test_status_response_advertises_game_port(self):
         response = gamespy.status_response("Test Dynaverse", 27632, "17.1")
-        self.assertIn(b"\\gamename\\sfc3", response)
+        self.assertIn(b"\\gamename\\sfc3dv", response)
         self.assertIn(b"\\hostname\\Test Dynaverse", response)
         self.assertIn(b"\\hostport\\27632", response)
         self.assertTrue(response.endswith(b"\\final\\\\queryid\\17.1"))
 
 
 class MasterDirectoryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_directory_flow(self):
+    async def _directory_flow(self, game_name: bytes):
         listener = await asyncio.start_server(
             lambda reader, writer: server.MasterDirectoryClient(reader, writer).run(),
             "127.0.0.1",
@@ -1450,28 +1841,35 @@ class MasterDirectoryTests(unittest.IsolatedAsyncioTestCase):
         )
         port = listener.sockets[0].getsockname()[1]
         old_host = server.ADVERTISE_HOST
-        old_port = server.STATUS_PORT
+        old_port = server.GAME_PORT
         server.ADVERTISE_HOST = "127.0.0.1"
-        server.STATUS_PORT = 27633
+        server.GAME_PORT = 27632
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
             greeting = await asyncio.wait_for(reader.readexactly(21), timeout=1.0)
             self.assertTrue(greeting.startswith(b"\\basic\\\\secure\\"))
             writer.write(
-                b"\\gamename\\sfc3\\gamever\\2\\location\\0\\validate\\ignored"
+                b"\\gamename\\" + game_name + b"\\gamever\\2\\location\\0\\validate\\ignored"
                 b"\\enctype\\2\\final\\\\queryid\\1.1\\"
-                b"\\list\\cmp\\gamename\\sfc3\\final\\"
+                b"\\list\\cmp\\gamename\\" + game_name + b"\\final\\"
             )
             await writer.drain()
             response = await asyncio.wait_for(reader.read(), timeout=1.0)
-            self.assertEqual(response, gamespy.compact_server_list("127.0.0.1", 27633))
+            self.assertEqual(len(response), 21)
+            self.assertEqual(response[0], 0xEB)
             writer.close()
             await writer.wait_closed()
         finally:
             server.ADVERTISE_HOST = old_host
-            server.STATUS_PORT = old_port
+            server.GAME_PORT = old_port
             listener.close()
             await listener.wait_closed()
+
+    async def test_directory_flow_retail(self):
+        await self._directory_flow(b"sfc3dv")
+
+    async def test_directory_flow_modified_client(self):
+        await self._directory_flow(b"sfc3")
 
 
 if __name__ == "__main__":

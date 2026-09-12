@@ -129,4 +129,4 @@ foreach ($component in $processes) {
     Write-Host ("  {0,-18} PID {1}" -f $component.Name, $component.Process.Id)
 }
 Write-Host "Logs: $logRoot"
-Write-Host "Advertised Dynaverse address: ${ServerAddress}:27633"
+Write-Host "Advertised Dynaverse address: ${ServerAddress}:27632"

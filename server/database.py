@@ -53,6 +53,113 @@ def schema_version(connection: sqlite3.Connection) -> int:
     return int(row["version"] or 0)
 
 
+def _allocate_object_id(connection: sqlite3.Connection) -> int:
+    """Consume one ID from the retail-style database-wide object sequence."""
+    row = connection.execute(
+        "UPDATE object_id_sequence SET next_id=next_id+1 WHERE singleton=1 "
+        "RETURNING next_id-1"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("global object-ID sequence is unavailable")
+    return int(row[0])
+
+
+def allocate_object_id(connection: sqlite3.Connection) -> int:
+    """Atomically allocate one persistent game-object ID."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        object_id = _allocate_object_id(connection)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return object_id
+
+
+def shipyard_catalog_ids(
+    connection: sqlite3.Connection, *, race: int, count: int
+) -> tuple[tuple[int, int], ...]:
+    """Return stable globally allocated (auction, item) IDs for one catalog."""
+    if count < 0:
+        raise ValueError("negative shipyard catalog size")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for index in range(count):
+            if connection.execute(
+                "SELECT 1 FROM shipyard_catalog "
+                "WHERE campaign_id=1 AND race=? AND catalog_index=?",
+                (race, index),
+            ).fetchone() is None:
+                auction_id = _allocate_object_id(connection)
+                item_id = _allocate_object_id(connection)
+                connection.execute(
+                    "INSERT INTO shipyard_catalog(campaign_id,race,catalog_index,"
+                    "auction_id,item_id) VALUES(1,?,?,?,?)",
+                    (race, index, auction_id, item_id),
+                )
+        rows = connection.execute(
+            "SELECT auction_id,item_id FROM shipyard_catalog "
+            "WHERE campaign_id=1 AND race=? AND catalog_index<? "
+            "ORDER BY catalog_index",
+            (race, count),
+        ).fetchall()
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    if len(rows) != count:
+        raise RuntimeError("incomplete shipyard catalog identity allocation")
+    return tuple((int(row[0]), int(row[1])) for row in rows)
+
+
+def officer_review_catalog_ids(
+    connection: sqlite3.Connection, *, race: int, count: int
+) -> tuple[int, ...]:
+    """Return stable globally allocated IDs for one race's review candidates."""
+    if count < 0:
+        raise ValueError("negative officer review catalog size")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for index in range(count):
+            row = connection.execute(
+                "SELECT officer_id FROM officer_review_catalog "
+                "WHERE campaign_id=1 AND race=? AND candidate_index=?",
+                (race, index),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO officer_review_catalog(campaign_id,race,candidate_index,"
+                    "officer_id) VALUES(1,?,?,?)",
+                    (race, index, _allocate_object_id(connection)),
+                )
+            elif connection.execute(
+                "SELECT 1 FROM officers WHERE id=?", (int(row[0]),)
+            ).fetchone() is not None:
+                # Review candidates are persistent game objects, but cease to be
+                # review objects once assigned to a ship. Replenish that catalog
+                # slot with a fresh database-wide identity before advertising it
+                # again; otherwise a second character can select an ID already
+                # owned by another ship and violate officers.id uniqueness.
+                connection.execute(
+                    "UPDATE officer_review_catalog SET officer_id=? "
+                    "WHERE campaign_id=1 AND race=? AND candidate_index=?",
+                    (_allocate_object_id(connection), race, index),
+                )
+        rows = connection.execute(
+            "SELECT officer_id FROM officer_review_catalog "
+            "WHERE campaign_id=1 AND race=? AND candidate_index<? "
+            "ORDER BY candidate_index",
+            (race, count),
+        ).fetchall()
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    if len(rows) != count:
+        raise RuntimeError("incomplete officer review identity allocation")
+    return tuple(int(row[0]) for row in rows)
+
+
 def asset_manifest(asset_root: Path) -> tuple[list[dict], str]:
     """Return a deterministic manifest for the effective campaign assets."""
     entries = []
@@ -281,22 +388,8 @@ def bootstrap_character(
             (account_id,),
         ).fetchone():
             raise ValueError("account already has a campaign character")
-        requested_character_id = int(record.get("database_id", 0))
-        character_id = requested_character_id
-        if character_id <= 0 or connection.execute(
-            "SELECT 1 FROM characters WHERE id=?", (character_id,)
-        ).fetchone():
-            character_id = int(connection.execute(
-                "SELECT COALESCE(MAX(id), 0) + 1 FROM characters"
-            ).fetchone()[0])
-        requested_ship_id = int(ship.get("id", 0))
-        ship_id = requested_ship_id
-        if ship_id <= 0 or connection.execute(
-            "SELECT 1 FROM ships WHERE id=?", (ship_id,)
-        ).fetchone():
-            ship_id = int(connection.execute(
-                "SELECT COALESCE(MAX(id), 0) + 1 FROM ships"
-            ).fetchone()[0])
+        character_id = _allocate_object_id(connection)
+        ship_id = _allocate_object_id(connection)
         connection.execute(
             "INSERT INTO characters(id, campaign_id, account_id, character_name, "
             "client_address, race, rank, rating, prestige, lifetime_prestige, "
@@ -339,23 +432,15 @@ def bootstrap_character(
         officers = list(ship["officers"])
         if len(officers) != 6 or len({int(item["station"]) for item in officers}) != 6:
             raise ValueError("a starting ship must have six unique officer stations")
-        next_officer_id = int(connection.execute(
-            "SELECT COALESCE(MAX(id), 9999) + 1 FROM officers"
-        ).fetchone()[0])
         officer_ids = []
         for officer in officers:
-            requested_id = int(officer.get("id", 0))
-            if requested_id <= 0 or connection.execute(
-                "SELECT 1 FROM officers WHERE id=?", (requested_id,)
-            ).fetchone():
-                requested_id = next_officer_id
-                next_officer_id += 1
-            officer_ids.append(requested_id)
+            officer_id = _allocate_object_id(connection)
+            officer_ids.append(officer_id)
             connection.execute(
                 "INSERT INTO officers(id, campaign_id, ship_id, station, name, race, worth, profile_json) "
                 "VALUES(?, 1, ?, ?, ?, ?, ?, ?)",
                 (
-                    requested_id, ship_id, int(officer["station"]), str(officer["name"]),
+                    officer_id, ship_id, int(officer["station"]), str(officer["name"]),
                     int(officer.get("race", record["race"])), int(officer.get("worth", 0)),
                     json.dumps(officer.get("profile", {}), sort_keys=True),
                 ),
@@ -519,6 +604,7 @@ def load_campaign_state(connection: sqlite3.Connection) -> dict:
         "LEFT JOIN accounts ac ON ac.id=c.account_id WHERE au.campaign_id=1"
     ):
         state["auctions"][str(int(row["catalog_item_id"]))] = {
+            "auction_id": int(row["id"]),
             "current_bid": int(row["current_bid"]),
             "bid_maximum": int(row["bid_maximum"]),
             "escrow": int(row["escrow"]),
@@ -536,12 +622,12 @@ def load_campaign_state(connection: sqlite3.Connection) -> dict:
         "SELECT mission_json FROM prepared_missions WHERE campaign_id=1 ORDER BY id"
     )]
     state["auction_settlements"] = [
-        {"account": str(row["account_name"]),
+        {"id": int(row["id"]), "account": str(row["account_name"]),
          "ship_id": int(row["catalog_item_id"]),
          "class_name": str(row["class_name"]), "price": int(row["price"]),
          "turn": int(row["turn"])}
         for row in connection.execute(
-            "SELECT account_name, catalog_item_id, class_name, price, turn "
+            "SELECT id, account_name, catalog_item_id, class_name, price, turn "
             "FROM auction_settlements WHERE campaign_id=1 ORDER BY id"
         )
     ]
@@ -569,11 +655,12 @@ def save_campaign_state(connection: sqlite3.Connection, state: dict) -> None:
                 ).fetchone()
                 owner = None if row is None else int(row["id"])
             catalog_id = int(catalog_id_text)
+            auction_id = int(item.get("auction_id", catalog_id))
             connection.execute(
                 "INSERT INTO auctions(id, campaign_id, catalog_item_id, "
                 "bid_owner_character_id, current_bid, bid_maximum, escrow, turn_opened, "
                 "turn_bid_made, turn_to_close, closing) VALUES(?,1,?,?,?,?,?,?,?,?,?)",
-                (catalog_id, catalog_id, owner, int(item.get("current_bid", 0)),
+                (auction_id, catalog_id, owner, int(item.get("current_bid", 0)),
                  int(item.get("bid_maximum", 0)), int(item.get("escrow", 0)),
                  int(item.get("turn_opened", 0)), int(item.get("turn_bid_made", 0)),
                  int(item.get("turn_to_close", 0)), int(bool(item.get("closing", False)))),
@@ -604,14 +691,16 @@ def save_campaign_state(connection: sqlite3.Connection, state: dict) -> None:
                  json.dumps(item, sort_keys=True)),
             )
         connection.execute("DELETE FROM auction_settlements WHERE campaign_id=1")
-        connection.executemany(
-            "INSERT INTO auction_settlements(campaign_id,account_name,catalog_item_id,"
-            "class_name,price,turn) VALUES(1,?,?,?,?,?)",
-            ((str(item.get("account", "")), int(item.get("ship_id", 0)),
-              str(item.get("class_name", "")), int(item.get("price", 0)),
-              int(item.get("turn", 0)))
-             for item in state.get("auction_settlements", ())),
-        )
+        for item in state.get("auction_settlements", ()):
+            settlement_id = int(item.get("id", 0)) or _allocate_object_id(connection)
+            item["id"] = settlement_id
+            connection.execute(
+                "INSERT INTO auction_settlements(id,campaign_id,account_name,catalog_item_id,"
+                "class_name,price,turn) VALUES(?,1,?,?,?,?,?)",
+                (settlement_id, str(item.get("account", "")),
+                 int(item.get("ship_id", 0)), str(item.get("class_name", "")),
+                 int(item.get("price", 0)), int(item.get("turn", 0))),
+            )
         connection.commit()
     except Exception:
         connection.rollback()

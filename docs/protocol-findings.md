@@ -190,11 +190,30 @@ from the active session rather than replayed.
 
 ## Campaign clock and Shipyard settlement observations
 
+The recovered `ClockRelayS.cpp` flow establishes a strict turn boundary. One
+campaign-wide timer advances persistent time, publishes `tTurnAnnouncement` to
+each due client registration (`turn % frequency == 0`), and only afterward
+dispatches internal Database/Character/Map/AI/Goal/MissionMatcher/Ship work.
+The replacement mirrors that ordering with one global coordinator; auctions are
+no longer settled opportunistically by each connected session or catalog read.
+
 Local Shipyard selection, preview, bid increments, bid persistence, closing, and hull award are now
 client-observed. A bid on the Sovereign survived relogging and settled after further campaign moves;
 the character then loaded with the Sovereign and the updated trade-in value. Settlement therefore
 works with the canonical clock. Earlier malformed `219.x` values identified the old serializer
-defect; the retail client now displays and advances the expected `56200.xx` stardate.
+defect. A later stock-client turn-break crash exposed two distinct envelopes:
+the synchronous clock reply is a leading success byte plus five little-endian
+integers, while the asynchronous turn break is those five integers followed by
+a zero byte. Separate serializers now match both wire contexts.
+
+The registration RPC return address is distinct from the named UI relay.
+`tClockRelayS::AnnounceTurn` resolves `tUniqueNameInfo::GetAddress` and sends on
+channel 1. The replacement now resolves each registration name through current
+client publications rather than reusing its RPC return address. Retail testing
+on 2026-09-11 confirmed advancing stardates 1049, 1050, and 1051 and the turn
+progress bar, with no observed crash or disconnect. Tests cover differing RPC
+and UI object IDs and skipping names not yet published. Full delivery is the
+default; the proposed four-second delay was removed as unsupported speculation.
 
 Multi-hex movement also needs regression coverage. One two-hex diagonal attempt appeared to stall,
 while a later three-hex move completed after a short calculation delay. Treat this as intermittent or

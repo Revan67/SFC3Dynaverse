@@ -85,7 +85,7 @@ class DatabaseSchemaTests(unittest.TestCase):
             connection = database.initialize(Path(directory) / "campaign.sqlite3")
             try:
                 self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
-                self.assertEqual(database.schema_version(connection), 3)
+                self.assertEqual(database.schema_version(connection), 4)
                 tables = {
                     row[0]
                     for row in connection.execute(
@@ -95,6 +95,7 @@ class DatabaseSchemaTests(unittest.TestCase):
                 self.assertTrue({
                     "campaigns", "accounts", "characters", "ships", "ship_stores",
                     "ship_loadout_items", "officers", "auctions",
+                    "object_id_sequence",
                 }.issubset(tables))
             finally:
                 connection.close()
@@ -198,17 +199,18 @@ class DatabaseSchemaTests(unittest.TestCase):
                 connection, account_name="pilot@example", record=record
             )
             self.assertEqual(ids["account_id"], 1)
-            self.assertEqual(ids["character_id"], 1)
-            self.assertEqual(ids["ship_id"], 2)
-            self.assertEqual(ids["officer_ids"], list(range(10000, 10006)))
+            self.assertEqual(ids["character_id"], 18)
+            self.assertEqual(ids["ship_id"], 19)
+            self.assertEqual(ids["officer_ids"], list(range(20, 26)))
             self.assertEqual(connection.execute(
-                "SELECT COUNT(*) FROM officers WHERE ship_id=2"
+                "SELECT COUNT(*) FROM officers WHERE ship_id=?", (ids["ship_id"],)
             ).fetchone()[0], 6)
             self.assertEqual(connection.execute(
-                "SELECT COUNT(*) FROM ship_loadout_items WHERE ship_id=2"
+                "SELECT COUNT(*) FROM ship_loadout_items WHERE ship_id=?", (ids["ship_id"],)
             ).fetchone()[0], 7)
             self.assertEqual(tuple(connection.execute(
-                "SELECT shuttles, marines, mines FROM ship_stores WHERE ship_id=2"
+                "SELECT shuttles, marines, mines FROM ship_stores WHERE ship_id=?",
+                (ids["ship_id"],)
             ).fetchone()), (2, 2, 2))
             with self.assertRaisesRegex(ValueError, "already has"):
                 database.bootstrap_character(
@@ -217,6 +219,55 @@ class DatabaseSchemaTests(unittest.TestCase):
             self.assertEqual(connection.execute(
                 "SELECT COUNT(*) FROM characters"
             ).fetchone()[0], 1)
+            second = json.loads(json.dumps(record))
+            second["character_name"] = "Second Captain"
+            second["ship"]["name"] = "USS Second"
+            second_ids = database.bootstrap_character(
+                connection, account_name="second@example", record=second
+            )
+            self.assertEqual(second_ids["character_id"], 26)
+            self.assertEqual(second_ids["ship_id"], 27)
+            self.assertEqual(second_ids["officer_ids"], list(range(28, 34)))
+            allocated = {
+                ids["character_id"], ids["ship_id"], *ids["officer_ids"],
+                second_ids["character_id"], second_ids["ship_id"],
+                *second_ids["officer_ids"],
+            }
+            self.assertEqual(len(allocated), 16)
+            self.assertEqual(connection.execute(
+                "SELECT next_id FROM object_id_sequence WHERE singleton=1"
+            ).fetchone()[0], 34)
+            shipyard_ids = database.shipyard_catalog_ids(
+                connection, race=0, count=2
+            )
+            review_ids = database.officer_review_catalog_ids(
+                connection, race=0, count=2
+            )
+            self.assertEqual(shipyard_ids, ((34, 35), (36, 37)))
+            self.assertEqual(review_ids, (38, 39))
+            self.assertEqual(
+                database.shipyard_catalog_ids(connection, race=0, count=2),
+                shipyard_ids,
+            )
+            self.assertEqual(
+                database.officer_review_catalog_ids(connection, race=0, count=2),
+                review_ids,
+            )
+            connection.execute(
+                "INSERT INTO officers(id,campaign_id,ship_id,station,name,race,worth) "
+                "VALUES(?,1,NULL,96,'Transferred',0,14)",
+                (review_ids[0],),
+            )
+            connection.commit()
+            replenished_review_ids = database.officer_review_catalog_ids(
+                connection, race=0, count=2
+            )
+            self.assertNotEqual(replenished_review_ids[0], review_ids[0])
+            self.assertEqual(replenished_review_ids[1], review_ids[1])
+            self.assertGreaterEqual(replenished_review_ids[0], 40)
+            self.assertTrue(allocated.isdisjoint({
+                value for pair in shipyard_ids for value in pair
+            } | set(review_ids)))
             connection.close()
 
     def test_character_repository_round_trips_facility_mutations(self):

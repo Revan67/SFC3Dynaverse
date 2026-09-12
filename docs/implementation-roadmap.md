@@ -232,6 +232,12 @@ Work and exit criteria:
 - The loser is not charged or is refunded according to recovered rules.
 - Outbid notification, simultaneous bids, disconnect, restart, and multiple
   same-turn settlements behave deterministically.
+- Verify against the original server whether a character may bid on the exact
+  hull/loadout it already owns. The current replacement permits it, and the
+  normal trade-in formula can make an identical replacement profitable when
+  trade-in value exceeds the winning bid. If retail did not prevent this,
+  define an explicit anti-exploit rule (reject the bid or cap the same-template
+  trade-in credit) and cover repeated purchases with an economy regression test.
 
 This milestone may move after Milestone 10 if a second tester is unavailable; it
 must not block single-player mission work.

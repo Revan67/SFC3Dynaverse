@@ -77,10 +77,14 @@ The live exchange repeats consistently:
 
 ```text
 S -> C: \basic\\secure\<6-character challenge>
-C -> S: \gamename\sfc3\gamever\2\location\0\validate\<proof>\enctype\2\final\\queryid\1.1\
-C -> S: \list\cmp\gamename\sfc3\final\
+C -> S: \gamename\sfc3dv\gamever\2\location\0\validate\<proof>\enctype\2\final\\queryid\1.1\
+C -> S: \list\cmp\gamename\sfc3dv\final\
 S -> C: <21-byte enctype-2 compact endpoint record>
 ```
+
+The clean GOG retail client uses `sfc3dv`; the previously captured community-modified client uses
+`sfc3`. The replacement accepts both identifiers while advertising the retail identifier in status
+metadata.
 
 The compact record decodes to an IPv4 address and UDP query port. The 2026-09-02 trace advertised
 the live host's UDP 27633 endpoint. Its captured seven-byte record and stable enctype-2 stream are
@@ -91,7 +95,7 @@ compatibility but does not use it as an authorization boundary.
 ## Status: UDP 27633
 
 The client sends exactly `\status\`. The server returns plaintext GameSpy key/value metadata,
-including `gamename=sfc3`, `gamever=2`, display name, population fields, and `hostport=27632`.
+including `gamename=sfc3dv`, `gamever=2`, display name, population fields, and `hostport=27632`.
 That `hostport` causes the subsequent GT2/nSwitch security connection.
 
 ## Security

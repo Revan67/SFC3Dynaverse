@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import json
 import random
+import sqlite3
 import string
 import struct
 import logging
@@ -47,7 +48,7 @@ from campaign_map import (
     SOURCE_SHA256 as CAMPAIGN_MAP_ID,
     WIDTH as CAMPAIGN_MAP_WIDTH,
 )
-from gamespy import compact_server_list, status_response
+from gamespy import COMPATIBLE_GAME_NAMES, compact_server_list, status_response
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -67,10 +68,23 @@ BIND_HOSTS = tuple(
     )
 )
 DIRECTORY_PORT = int(os.environ.get("SFC3_DIRECTORY_PORT", "28900"))
-STATUS_PORT    = int(os.environ.get("SFC3_STATUS_PORT", "27633"))
+STATUS_PORT    = int(os.environ.get("SFC3_STATUS_PORT", str(GAME_PORT)))
 ADVERTISE_HOST = os.environ.get("SFC3_ADVERTISE_HOST", SERVER_HOST)
 SERVER_NAME    = os.environ.get("SFC3_SERVER_NAME", "Local SFC3 Dynaverse")
 PRIVATE_CAPTURE_PATH = os.environ.get("SFC3_PRIVATE_CAPTURE_PATH", "")
+# The PlayerInfoPanel callback only advances the visible stardate.  The second
+# stock-client subscriber, MetaViewPortHandlerNameC, drives campaign-map turn
+# behavior and retail follows it with Character/Map/Ship work that is not yet
+# fully reproduced here.  "display" and "viewport" are investigation modes
+# that isolate each callback; "full" matches retail registration delivery and
+# "off" preserves the containment mode.
+TURN_ANNOUNCEMENT_MODE = os.environ.get(
+    "SFC3_TURN_ANNOUNCEMENT_MODE", "full"
+).strip().lower()
+if TURN_ANNOUNCEMENT_MODE not in {"off", "display", "viewport", "full"}:
+    raise ValueError(
+        "SFC3_TURN_ANNOUNCEMENT_MODE must be off, display, viewport, or full"
+    )
 # Temporary fixed default. Expose this as a user-configurable setting when the
 # server UI/configuration layer is built.
 SESSION_IDLE_TIMEOUT = 15 * 60
@@ -279,7 +293,23 @@ class CampaignClockSnapshot:
         )
         if any(not 0 <= value <= 0xFFFFFFFF for value in values):
             raise ValueError("campaign clock fields must fit unsigned 32-bit values")
+        # The request/reply envelope has the usual leading success byte.
         return b"\x01" + struct.pack("<IIIII", *values)
+
+    def turn_break_payload(self) -> bytes:
+        """Build the distinct asynchronous tTurnBreak clock envelope."""
+        values = (
+            self.current_turn,
+            self.current_year,
+            self.turns_per_year,
+            self.milliseconds_per_turn,
+            self.base_year,
+        )
+        if any(not 0 <= value <= 0xFFFFFFFF for value in values):
+            raise ValueError("campaign clock fields must fit unsigned 32-bit values")
+        # The live retail capture writes tCurrentTime first, followed by the
+        # turn-break boolean.  Reusing payload() here shifts every field.
+        return struct.pack("<IIIII", *values) + b"\x00"
 
 
 def _clock_config() -> CampaignClockConfig:
@@ -358,6 +388,23 @@ def _clock_snapshot(now: float | None = None) -> CampaignClockSnapshot:
 def _clock_snapshot_payload(now: float | None = None) -> bytes:
     """Build tCurrentTime using persistent time and server-kit cadence."""
     return _clock_snapshot(now).payload()
+
+
+def _clock_turn_break_payload(now: float | None = None) -> bytes:
+    """Build the byte-exact asynchronous turn-break payload."""
+    return _clock_snapshot(now).turn_break_payload()
+
+
+def _clock_turn_break_payload_for_turn(turn: int) -> bytes:
+    """Build a turn-break payload from the coordinator's authoritative turn."""
+    config = _clock_config()
+    return CampaignClockSnapshot(
+        current_turn=turn,
+        current_year=turn // config.turns_per_year,
+        turns_per_year=config.turns_per_year,
+        milliseconds_per_turn=config.milliseconds_per_turn,
+        base_year=config.base_year,
+    ).turn_break_payload()
 
 
 def _milliseconds_until_next_turn(now: float | None = None) -> float:
@@ -455,6 +502,7 @@ def _character_position_payload(
     race: int,
     position: tuple[int, int] | None = None,
     destination: tuple[int, int] = (-1, -1),
+    database_id: int = CHARACTER_DATABASE_ID,
 ) -> bytes:
     """Build IPL_Character::tGetCharacterPositionReq::tRep."""
     position_x, position_y = position or _campaign_start_for_race(race)
@@ -464,6 +512,7 @@ def _character_position_payload(
             position_x,
             position_y,
             race,
+            database_id=database_id,
             has_planet=True,
             victory_points=50,
             economy_points=100,
@@ -488,7 +537,7 @@ def _get_client_character_payload(
             account=account,
             character_name=character_name,
             race=race,
-            database_id=1,
+            database_id=int(record.get("database_id", CHARACTER_DATABASE_ID)),
             rank=0,
             current_position=tuple(record["position"]),
             homeworld=tuple(record["homeworld"]),
@@ -609,6 +658,24 @@ def _parse_character_initialize(payload: bytes) -> tuple[tuple[int, int, int], s
     return return_address, account, client_address
 
 
+def _parse_clock_registration_request(
+    payload: bytes,
+) -> tuple[tuple[int, int, int], bytes, int]:
+    """Parse Clock channel 2: callback, tUniqueName byte vector, frequency."""
+    if len(payload) < 20:
+        raise ValueError("truncated clock registration request")
+    callback = _parse_callback(payload)
+    name_length = struct.unpack_from("<I", payload, 12)[0]
+    name_end = 16 + name_length
+    if name_end + 4 != len(payload):
+        raise ValueError("invalid clock registration request length")
+    name = payload[16:name_end]
+    frequency = struct.unpack_from("<I", payload, name_end)[0]
+    if not name or frequency == 0:
+        raise ValueError("invalid clock registration values")
+    return callback, name, frequency
+
+
 def _default_client_character_payload(
     *,
     client_address: str = "",
@@ -650,6 +717,7 @@ def _default_client_character_payload(
         start_x,
         start_y,
         race,
+        database_id=database_id,
         has_planet=True,
         victory_points=50,
         economy_points=100,
@@ -688,16 +756,23 @@ def _parse_create_client_character(
 
 
 def _character_created_payload(
-    account: str, character_name: str, client_address: str, race: int
+    account: str, character_name: str, client_address: str, race: int,
+    record: dict | None = None,
 ) -> bytes:
     """Build a minimal successful tCreateClientCharacterReq::tRep."""
+    record = _normalize_character_record(record or {"race": race})
     character = _default_client_character_payload(
         client_address=client_address,
         account=account,
         character_name=character_name,
         race=race,
-        database_id=1,
+        database_id=int(record.get("database_id", CHARACTER_DATABASE_ID)),
         rank=0,
+        current_position=tuple(record["position"]),
+        homeworld=tuple(record["homeworld"]),
+        destination=tuple(record["destination"]),
+        prestige=int(record["prestige"]),
+        ship=record["ship"],
     )
     return b"\x01" + character + struct.pack("<I", 0)
 
@@ -763,7 +838,7 @@ def _character_logon_payload(
         account=account,
         character_name=character_name,
         race=race,
-        database_id=1,
+        database_id=int(record.get("database_id", CHARACTER_DATABASE_ID)),
         rank=0,
         current_position=tuple(record["position"]),
         homeworld=tuple(record["homeworld"]),
@@ -969,10 +1044,19 @@ def _purchase_officers(
         raise ValueError("officer costs cannot be negative")
     if not assignments:
         raise ValueError("officer assignment is empty")
+    if len({int(station) for station in assignments.values()}) != len(assignments):
+        raise ValueError("multiple officers cannot target the same station")
 
     def mutate(record: dict) -> None:
         race = int(record["race"])
         names = _officer_names(race)[:_officer_review_limit()]
+        candidate_ids = (
+            database.officer_review_catalog_ids(
+                PERSISTENCE, race=race, count=len(names)
+            )
+            if PERSISTENCE is not None
+            else tuple(1000 + index for index in range(len(names)))
+        )
         defaults = _character_ship_defaults(record)
         items = list(defaults["items"])
         ship = record["ship"]
@@ -983,8 +1067,12 @@ def _purchase_officers(
         for officer_id, assigned_station in assignments.items():
             officer_id = int(officer_id)
             assigned_station = int(assigned_station)
-            index = officer_id - 1000
-            if not 0 <= index < len(names):
+            index = next(
+                (index for index, candidate_id in enumerate(candidate_ids)
+                 if candidate_id == officer_id),
+                -1,
+            )
+            if index < 0:
                 raise ValueError("officer is not in review")
             if officer_id in seen_ids or any(
                 int(item["id"]) == officer_id for item in ship["officers"]
@@ -1129,8 +1217,13 @@ def _publish_news(text: str, *, channel: str = "system", priority: str = "med", 
     limit = max(1, int(parse_gf(source.path).get("General", {}).get("MaximumItemsAtOnce", 30)))
     state = _load_campaign_clock()
     items = state.setdefault("news", [])
+    news_id = (
+        database.allocate_object_id(PERSISTENCE)
+        if PERSISTENCE is not None
+        else int(state.get("next_news_id", 1))
+    )
     item = {
-        "id": int(state.get("next_news_id", 1)),
+        "id": news_id,
         "turn": _campaign_turn() if turn is None else int(turn),
         "timestamp": int(time.time()),
         "channel": channel,
@@ -1206,7 +1299,12 @@ def _offer_mission(account: str, title: str, *, mission_type: str = "patrol", re
     if not title or reward < 0:
         raise ValueError("invalid mission")
     state = _load_campaign_clock()
-    mission = {"id": int(state.get("next_mission_id", 1)), "account": account, "title": title, "type": mission_type, "reward": reward, "status": "offered", "turn": _campaign_turn()}
+    mission_id = (
+        database.allocate_object_id(PERSISTENCE)
+        if PERSISTENCE is not None
+        else int(state.get("next_mission_id", 1))
+    )
+    mission = {"id": mission_id, "account": account, "title": title, "type": mission_type, "reward": reward, "status": "offered", "turn": _campaign_turn()}
     state["next_mission_id"] = mission["id"] + 1
     state.setdefault("missions", []).append(mission)
     _write_campaign_state(state)
@@ -1882,6 +1980,8 @@ def _character_ship_config_payload(
 ) -> bytes:
     """Build tGetCharacterShipConfigReq::tRep from installed starter defaults."""
     defaults = _character_ship_defaults(record, asset_root) if record else _starter_ship_defaults(race, asset_root)
+    if record is not None:
+        ship_id = int(record["ship"]["id"])
     tng_ship = _tng_ship_payload(
         _default_ship_core_payload(defaults), defaults["loadout_fields"]
     )
@@ -2008,6 +2108,7 @@ def _officers_to_review_payload(
             for item in (record or {}).get("ship", {}).get("officers", ())
             if isinstance(item, dict) and "id" in item
         ),
+        int((record or {}).get("database_id", CHARACTER_DATABASE_ID)),
     )
     return b"\x01" + struct.pack("<I", len(officers)) + b"".join(officers) + tng_ship + struct.pack(
         "<fI", economic_scalar, prestige
@@ -2076,23 +2177,38 @@ def _officer_item_payload(name: str, race: int, station: int) -> bytes:
     )
 
 
-def _officer_payload(database_id: int, name: str, race: int, station: int) -> bytes:
+def _officer_payload(
+    database_id: int, name: str, race: int, station: int,
+    character_id: int = CHARACTER_DATABASE_ID,
+) -> bytes:
     """Serialize tOfficer in its recovered database-field order."""
     return (
         struct.pack("<II", database_id, 0)
         + _officer_item_payload(name, race, station)
-        + struct.pack("<IIIII", 0, CHARACTER_DATABASE_ID, 0xFFFFFFFF, race, race)
+        + struct.pack("<IIIII", 0, character_id, 0xFFFFFFFF, race, race)
     )
 
 
-def _generated_officers(race: int, excluded_ids=()) -> tuple[bytes, ...]:
+def _generated_officers(
+    race: int, excluded_ids=(), character_id: int = CHARACTER_DATABASE_ID,
+) -> tuple[bytes, ...]:
     names = _officer_names(race)
     limit = min(_officer_review_limit(), len(names))
     excluded = {int(officer_id) for officer_id in excluded_ids}
+    candidate_ids = (
+        database.officer_review_catalog_ids(
+            PERSISTENCE, race=race, count=limit
+        )
+        if PERSISTENCE is not None
+        else tuple(1000 + index for index in range(limit))
+    )
     return tuple(
-        _officer_payload(1000 + index, names[index], race, OFFICER_STATIONS[index % 6])
+        _officer_payload(
+            candidate_ids[index], names[index], race,
+            OFFICER_STATIONS[index % 6], character_id
+        )
         for index in range(limit)
-        if 1000 + index not in excluded
+        if candidate_ids[index] not in excluded
     )
 
 
@@ -2229,6 +2345,25 @@ def _parse_get_auction_ships_request(
     return callback, character_id, scalar, modifiers
 
 
+def _shipyard_catalog_ids(race: int, count: int) -> tuple[tuple[int, int], ...]:
+    if PERSISTENCE is not None:
+        return database.shipyard_catalog_ids(PERSISTENCE, race=race, count=count)
+    return tuple(
+        (AUCTION_DATABASE_ID_BASE + index,
+         AUCTION_DATABASE_ID_BASE + 1000 + index)
+        for index in range(count)
+    )
+
+
+def _character_record_for_account(account: str) -> dict | None:
+    key = account.casefold()
+    return next(
+        (record for name, record in _load_characters().items()
+         if name.casefold() == key),
+        None,
+    )
+
+
 def _auction_ships_payload(
     race: int,
     asset_root: Path | None = None,
@@ -2238,15 +2373,21 @@ def _auction_ships_payload(
     """Build the client shipyard catalog from stock specs and kit economy rules."""
     bid_factor, turns_until_close, limit = _economy_ship_auction_settings()
     ships = _shipyard_defaults(race, asset_root)[:limit]
-    _settle_shipyard_bids(now=now)
     current_turn = _campaign_turn(now)
     state = _load_campaign_clock(now)
     auctions = state.get("auctions", {})
+    catalog_ids = _shipyard_catalog_ids(race, len(ships))
+    characters = _load_characters()
     entries = []
     for index, defaults in enumerate(ships):
-        auction_id = AUCTION_DATABASE_ID_BASE + index
-        ship_id = AUCTION_DATABASE_ID_BASE + 1000 + index
+        auction_id, ship_id = catalog_ids[index]
         saved = auctions.get(str(ship_id), {})
+        owner_name = str(saved.get("bid_owner", "")).casefold()
+        owner_record = next(
+            (record for account, record in characters.items()
+             if account.casefold() == owner_name),
+            None,
+        )
         entries.append(
             # The stock database routine indexes this map by GetItemID(), not
             # by the tAuctionItem database object's own ID. The client uses
@@ -2260,7 +2401,7 @@ def _auction_ships_payload(
                 turns_until_close=turns_until_close,
                 current_turn=current_turn,
                 current_bid=saved.get("current_bid"),
-                bid_owner_id=CHARACTER_DATABASE_ID if saved.get("bid_owner") else 0,
+                bid_owner_id=int(owner_record["database_id"]) if owner_record else 0,
                 turn_bid_made=int(saved.get("turn_bid_made", 0)),
                 bid_maximum=int(saved.get("bid_maximum", 0)),
                 escrow=int(saved.get("escrow", 0)),
@@ -2319,8 +2460,13 @@ def _place_shipyard_bid(
 ) -> tuple[bytes, int]:
     """Persist one proxy-style maximum bid and return updated item/result."""
     ships = _shipyard_defaults(race)
-    index = ship_id - (AUCTION_DATABASE_ID_BASE + 1000)
-    if index < 0 or index >= len(ships):
+    catalog_ids = _shipyard_catalog_ids(race, len(ships))
+    index = next(
+        (index for index, (_auction_id, item_id) in enumerate(catalog_ids)
+         if item_id == ship_id),
+        -1,
+    )
+    if index < 0:
         raise ValueError("unknown Shipyard item ID")
     defaults = ships[index]
     bid_factor, turns_until_close, _limit = _economy_ship_auction_settings()
@@ -2342,6 +2488,7 @@ def _place_shipyard_bid(
     else:
         displaced_maximum = prior_maximum if prior_owner and prior_owner != account else 0
         saved.update(
+            auction_id=catalog_ids[index][0],
             current_bid=(
                 minimum
                 if not prior_owner
@@ -2359,13 +2506,16 @@ def _place_shipyard_bid(
         result = 2
     item = _auction_item_payload(
         defaults,
-        auction_id=AUCTION_DATABASE_ID_BASE + index,
+        auction_id=catalog_ids[index][0],
         ship_id=ship_id,
         bid_factor=bid_factor,
         turns_until_close=turns_until_close,
         current_turn=current_turn,
         current_bid=saved.get("current_bid", current),
-        bid_owner_id=CHARACTER_DATABASE_ID if saved.get("bid_owner") else 0,
+        bid_owner_id=int(owner_record["database_id"])
+        if (owner_record := _character_record_for_account(
+            str(saved.get("bid_owner", ""))
+        )) is not None else 0,
         turn_bid_made=int(saved.get("turn_bid_made", 0)),
         bid_maximum=int(saved.get("bid_maximum", 0)),
         escrow=int(saved.get("escrow", 0)),
@@ -2388,27 +2538,50 @@ def _settle_shipyard_bids(*, now: float | None = None) -> tuple[dict, ...]:
         owner = str(bid.get("bid_owner", ""))
         if not owner or current_turn < int(bid.get("turn_bid_made", 0)) + turns_until_close:
             continue
-        record = characters.get(owner)
+        record = next(
+            (item for name, item in characters.items()
+             if name.casefold() == owner.casefold()),
+            None,
+        )
         if record is None:
             del auctions[ship_id_text]
             continue
         ship_id = int(ship_id_text)
         catalog = _shipyard_defaults(int(record["race"]))
-        index = ship_id - (AUCTION_DATABASE_ID_BASE + 1000)
-        if not 0 <= index < len(catalog):
+        catalog_ids = _shipyard_catalog_ids(int(record["race"]), len(catalog))
+        index = next(
+            (index for index, (_auction_id, item_id) in enumerate(catalog_ids)
+             if item_id == ship_id),
+            -1,
+        )
+        if index < 0:
             del auctions[ship_id_text]
             continue
         defaults = _shipyard_award_defaults(catalog[index])
         price = int(bid.get("current_bid", defaults["hull_cost"]))
-        record["prestige"] = max(0, int(record.get("prestige", 0)) - price)
+        previous_ship = dict(record.get("ship") or {})
+        trade_in_value = _ship_trade_in_value(record)
+        net_cost = price - trade_in_value
+        if net_cost < 0 and not _can_benefit_from_downgrade():
+            net_cost = 0
+        record["prestige"] = max(
+            0, int(record.get("prestige", 0)) - net_cost
+        )
+        if net_cost < 0:
+            record["lifetime_prestige"] = max(
+                0, int(record.get("lifetime_prestige", 0)) + net_cost
+            )
         record["ship"] = {
-            "id": SHIP_DATABASE_ID,
+            # A Shipyard award replaces the vessel, not its persistent database
+            # identity.  Reusing the prototype ID here breaks every account whose
+            # SQL ship row was allocated a different ID.
+            "id": int(previous_ship.get("id", SHIP_DATABASE_ID)),
             "owner_id": int(record.get("database_id", CHARACTER_DATABASE_ID)),
             "class_name": defaults["ui_name"],
             "loadout_name": defaults["sub_name"],
             "name": str(record.get("ship", {}).get("name", "USS Venture")),
             "class_type": _ship_class_id(defaults["class_code"]),
-            "bpv": int(defaults["hull_cost"]),
+            "bpv": _ship_total_bpv(defaults),
             "damage": 1.0,
             "flags": 0,
             "turn_created": current_turn,
@@ -2421,25 +2594,98 @@ def _settle_shipyard_bids(*, now: float | None = None) -> tuple[dict, ...]:
                 "loadout_name": defaults["sub_name"],
                 "items": list(defaults["items"]),
             },
-            "officers": [],
+            # Officers transfer with the player to the replacement ship.  Emptying
+            # this list also violates the six-station roster invariant on the next
+            # SQL save.
+            "officers": list(previous_ship.get("officers", ())),
         }
-        characters[owner] = _normalize_character_record(record)
+        characters[owner] = _write_character_record(owner, record)
         settlement = {
+            "id": database.allocate_object_id(PERSISTENCE)
+            if PERSISTENCE is not None else len(settlements) + 1,
             "account": owner,
             "ship_id": ship_id,
             "class_name": defaults["ui_name"],
             "price": price,
+            "trade_in_value": trade_in_value,
+            "net_cost": net_cost,
             "turn": current_turn,
         }
         settlements.append(settlement)
         completed.append(settlement)
         del auctions[ship_id_text]
     if completed:
-        CHARACTER_STORE_PATH.write_text(
-            json.dumps(characters, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
         _write_campaign_state(state)
     return tuple(completed)
+
+
+def _record_after_auction_settlement(
+    account: str,
+    current_record: dict | None,
+    settlements: tuple[dict, ...],
+) -> tuple[dict | None, bool]:
+    """Reload a connected winner after settlement replaced its persisted ship."""
+    account_key = account.casefold()
+    won = any(
+        str(settlement.get("account", "")).casefold() == account_key
+        for settlement in settlements
+    )
+    if not won:
+        return current_record, False
+    refreshed = _character_record_for_account(account)
+    return (refreshed if refreshed is not None else current_record), refreshed is not None
+
+
+def _ship_system_costs(asset_root: Path | None = None) -> dict[str, int]:
+    """Load stock non-officer system costs from the released server kit."""
+    root = asset_root or SERVER_ASSET_ROOT
+    settings = root / "CommonSettings"
+    costs: dict[str, int] = {}
+    for path in settings.glob("*.gf"):
+        for section, values in parse_gf(path).items():
+            if isinstance(values, dict) and "Cost" in values:
+                costs[section.rsplit("\\", 1)[-1].casefold()] = int(
+                    float(values["Cost"])
+                )
+    return costs
+
+
+def _ship_total_bpv(defaults: dict, asset_root: Path | None = None) -> int:
+    """Match tTNGShip::GetTotalBPVNoOfficers for a persisted loadout."""
+    costs = _ship_system_costs(asset_root)
+    total = int(defaults["hull_cost"])
+    for item in defaults.get("items", ()):
+        if not item or str(item).startswith("OFFICER:"):
+            continue
+        name = str(item).rsplit(":", 1)[0].casefold()
+        if name not in costs:
+            raise ValueError(f"missing server-kit cost for ship item {name!r}")
+        total += costs[name]
+    return total
+
+
+def _ship_trade_in_value(record: dict, asset_root: Path | None = None) -> int:
+    """Calculate the undamaged ship trade-in used by stock auction settlement."""
+    root = asset_root or SERVER_ASSET_ROOT
+    defaults = _character_ship_defaults(record, root)
+    economy = parse_gf(root / "ServerProfiles" / "Economy.gf")
+    difficulty_rate = float(economy.get("Cost/Difficulty", {}).get("0", 0.5))
+    trade_rate = float(
+        economy.get("Cost/Ship/SupplyDock", {}).get("TradeIn", 1.0)
+    )
+    class_rate = float(
+        economy.get("Cost/Ship/ClassType", {}).get(defaults["class_code"], 1.0)
+    )
+    return int(_ship_total_bpv(defaults, root) * difficulty_rate * trade_rate * class_rate)
+
+
+def _can_benefit_from_downgrade(asset_root: Path | None = None) -> bool:
+    root = asset_root or SERVER_ASSET_ROOT
+    economy = parse_gf(root / "ServerProfiles" / "Economy.gf")
+    value = economy.get("Auction/Ship", {}).get(
+        "CanBenefitFromDowngradingShip", 1
+    )
+    return bool(int(value))
 
 
 def _parse_ids(value: str, prefix: str) -> tuple[int, ...]:
@@ -2593,7 +2839,7 @@ def _stored_character_payload(account: str, record: dict) -> bytes:
         account=account,
         character_name=str(record["character_name"]),
         race=int(record["race"]),
-        database_id=1,
+        database_id=int(record.get("database_id", CHARACTER_DATABASE_ID)),
         rank=0,
         current_position=tuple(record["position"]),
         homeworld=tuple(record["homeworld"]),
@@ -2811,6 +3057,63 @@ class SFC3Client:
         self._log("info", "60 s post-factory listen complete")
 
 
+ACTIVE_GAME_CLIENTS: set["DynamicSecurityClient"] = set()
+
+
+class CampaignTurnCoordinator:
+    """Run one retail-ordered campaign clock for every connected client."""
+
+    async def run(self) -> None:
+        while True:
+            remaining_ms = _milliseconds_until_next_turn()
+            await asyncio.sleep(max(0.05, remaining_ms / 1000.0))
+            await self.process_turn(_campaign_turn())
+
+    async def process_turn(self, turn: int) -> tuple[dict, ...]:
+        """Process one turn using the retail ClockRelayS phase ordering."""
+        clients = tuple(
+            client for client in ACTIVE_GAME_CLIENTS
+            if not client.writer.is_closing()
+        )
+
+        # ClockRelayS::AnnounceTurn sends tTurnAnnouncement before dispatching
+        # the turn to internal services. Deliver to published named relays;
+        # registration RPC return addresses are not turn subscribers.
+        live_clients = []
+        for client in clients:
+            try:
+                if TURN_ANNOUNCEMENT_MODE != "off":
+                    await client._announce_campaign_turn(turn)
+                if TURN_ANNOUNCEMENT_MODE == "full":
+                    await client._synchronize_campaign_turn()
+                live_clients.append(client)
+            except (ConnectionError, OSError) as exc:
+                ACTIVE_GAME_CLIENTS.discard(client)
+                client._log("warning", "turn announcement failed: %s", exc)
+
+        try:
+            settlements = _settle_shipyard_bids()
+        except Exception:
+            log.exception("[clock] campaign turn=%d settlement processing failed", turn)
+            settlements = ()
+        if settlements:
+            for client in live_clients:
+                try:
+                    await client._apply_turn_settlements(settlements)
+                except (ConnectionError, OSError) as exc:
+                    ACTIVE_GAME_CLIENTS.discard(client)
+                    client._log("warning", "turn settlement notification failed: %s", exc)
+
+        log.info(
+            "[clock] completed campaign turn=%d clients=%d settlements=%d announcements=%s",
+            turn,
+            len(live_clients),
+            len(settlements),
+            TURN_ANNOUNCEMENT_MODE,
+        )
+        return settlements
+
+
 class DynamicSecurityClient:
     """Minimal live-capture-compatible security service for the dynamic game port."""
 
@@ -2839,8 +3142,24 @@ class DynamicSecurityClient:
         self.viewport_relay_address = None
         self.client_relays: dict[bytes, tuple[int, int]] = {}
         self.notify_subscriptions: list[tuple[int, int, bytes, int]] = []
-        self.clock_subscribers: set[tuple[int, int, int]] = set()
-        self.clock_task: asyncio.Task | None = None
+        self.clock_subscribers: dict[tuple[int, int, int], tuple[bytes, int]] = {}
+
+    def _character_id(self) -> int | None:
+        if self.current_record is None:
+            return None
+        return int(self.current_record["database_id"])
+
+    def _ship_id(self) -> int | None:
+        if self.current_record is None:
+            return None
+        return int(self.current_record["ship"]["id"])
+
+    def _matches_character_id(self, value: int) -> bool:
+        character_id = self._character_id()
+        return character_id is not None and value == character_id
+
+    def _matches_owned_ship(self, character_id: int, ship_id: int) -> bool:
+        return self._matches_character_id(character_id) and ship_id == self._ship_id()
 
     def _log(self, level, msg, *args, **kwargs):
         getattr(log, level)(
@@ -2851,7 +3170,7 @@ class DynamicSecurityClient:
 
     async def run(self):
         self._log("info", "CONNECT sw_id=0x%08x", self.sw_id)
-        self.clock_task = asyncio.create_task(self._clock_loop())
+        ACTIVE_GAME_CLIENTS.add(self)
         try:
             await self._handle()
         except asyncio.IncompleteReadError:
@@ -2861,31 +3180,78 @@ class DynamicSecurityClient:
         except Exception as exc:
             self._log("error", "error: %s", exc, exc_info=True)
         finally:
-            if self.clock_task is not None:
-                self.clock_task.cancel()
+            ACTIVE_GAME_CLIENTS.discard(self)
             self.writer.close()
             try:
                 await self.writer.wait_closed()
             except (ConnectionError, OSError):
                 pass
 
-    async def _clock_loop(self):
-        """Deliver the retail clock relay's asynchronous turn-break updates."""
-        while True:
-            remaining_ms = _milliseconds_until_next_turn()
-            await asyncio.sleep(max(0.05, remaining_ms / 1000.0))
-            if not self.clock_subscribers:
-                continue
-            payload = _clock_snapshot_payload()
-            for callback in tuple(self.clock_subscribers):
-                self.writer.write(_nswitch_frame(*callback, payload))
-            await self.writer.drain()
-            self._log(
-                "info",
-                "-> campaign turn break turn=%d subscribers=%d",
-                _campaign_turn(),
-                len(self.clock_subscribers),
+    async def _announce_campaign_turn(self, turn: int) -> None:
+        """Publish one scheduled turn to registrations due at this frequency."""
+        due = tuple(
+            self.client_relays[name]
+            for callback, (name, frequency) in self.clock_subscribers.items()
+            if name in self.client_relays and turn % frequency == 0
+            and (
+                TURN_ANNOUNCEMENT_MODE == "full"
+                or (
+                    TURN_ANNOUNCEMENT_MODE == "display"
+                    and name.endswith(b"PlayerInfoPanel")
+                )
+                or (
+                    TURN_ANNOUNCEMENT_MODE == "viewport"
+                    and name.endswith(b"MetaViewPortHandlerNameC")
+                )
             )
+        )
+        if not due:
+            return
+        payload = _clock_turn_break_payload_for_turn(turn)
+        payload_fields = struct.unpack("<IIIIIB", payload)
+        for callback in due:
+            # Retail resolves tUniqueNameInfo::GetAddress from the registered
+            # name, then calls SendData(address, 1, ...). The registration RPC
+            # return address belongs to a different, temporary reply handler.
+            self.writer.write(_nswitch_frame(callback[0], callback[1], 1, payload))
+        await self.writer.drain()
+        self._log(
+            "info",
+            "-> campaign turn announcement turn=%d year=%d turns_per_year=%d "
+            "milliseconds_per_turn=%d base_year=%d normal=%d subscribers=%d "
+            "destinations=%s",
+            *payload_fields,
+            len(due),
+            [callback[:2] for callback in due],
+        )
+
+    async def _apply_turn_settlements(self, settlements: tuple[dict, ...]) -> None:
+        """Refresh and notify a connected auction winner after clock publication."""
+        if self.current_character is None:
+            return
+        self.current_record, refreshed = _record_after_auction_settlement(
+            self.current_character[0], self.current_record, settlements
+        )
+        if not refreshed or self.current_record is None:
+            return
+        await self._send_notification(0, 5, int(self.current_record["database_id"]))
+        await self._send_notification(0, 7, int(self.current_record["database_id"]))
+        self._log(
+            "info",
+            "-> turn settlement refreshed account=%s ship=%s prestige=%d",
+            self.current_character[0],
+            self.current_record["ship"]["class_name"],
+            int(self.current_record.get("prestige", 0)),
+        )
+
+    async def _synchronize_campaign_turn(self) -> None:
+        """Trigger the retail viewport refresh that follows a turn announcement.
+
+        Notify event 0/15 is registered by MetaViewPortHandlerNameC.  In the
+        retail trace it causes the client to request authoritative character
+        fleet data on CharacterRelay channel 26, which this server services.
+        """
+        await self._send_notification(0, 15, 0)
 
     async def _send_notification(self, category: int, event: int, extra_id: int):
         """Deliver a retail tNotifyEvent to every matching client callback."""
@@ -3031,6 +3397,10 @@ class DynamicSecurityClient:
             len(client_address),
         )
 
+        # GameSpy account identity and the SQL uniqueness constraint are both
+        # case-insensitive. Keep the game session on that same canonical key so
+        # a differently-capitalized login cannot appear to be a new character.
+        account = account.casefold()
         stored_character = _load_characters().get(account)
         if (
             stored_character is not None
@@ -3101,7 +3471,7 @@ class DynamicSecurityClient:
                                 relay_address[1],
                                 4,
                                 _meta_map_move_payload(
-                                    CHARACTER_DATABASE_ID,
+                                    int(self.current_record["database_id"]),
                                     position,
                                     0,
                                     0,
@@ -3174,13 +3544,20 @@ class DynamicSecurityClient:
                     continue
                 self._log("warning", "unknown relay request name_len=%d", len(relay_name))
             if (sw, obj, ch) == (0, 4, 2):
-                callback = _parse_callback(payload)
-                self.clock_subscribers.add(callback)
+                callback, registration_name, frequency = (
+                    _parse_clock_registration_request(payload)
+                )
+                self.clock_subscribers[callback] = (registration_name, frequency)
                 self.writer.write(_nswitch_frame(
                     callback[0], callback[1], callback[2], _clock_snapshot_payload()
                 ))
                 await self.writer.drain()
-                self._log("info", "-> initial campaign clock snapshot")
+                self._log(
+                    "info",
+                    "-> initial campaign clock snapshot registration=%r frequency=%d",
+                    registration_name,
+                    frequency,
+                )
                 continue
             if (sw, obj, ch) == (0, 40, 46):
                 callback = _parse_callback(payload)
@@ -3213,7 +3590,7 @@ class DynamicSecurityClient:
                 if len(payload) != 16:
                     raise ValueError("invalid supply-dock request length")
                 character_id = struct.unpack_from("<I", payload, 12)[0]
-                if character_id != CHARACTER_DATABASE_ID or self.current_character is None:
+                if not self._matches_character_id(character_id) or self.current_character is None:
                     response = b"\x00"
                 else:
                     try:
@@ -3236,7 +3613,7 @@ class DynamicSecurityClient:
                     _callback, character_id, ship_name, desired = _parse_update_stores_request(payload)
                     if (
                         self.current_character is not None
-                        and character_id == CHARACTER_DATABASE_ID
+                        and self._matches_character_id(character_id)
                         and ship_name == str(self.current_record["ship"]["name"])
                     ):
                         defaults = _character_ship_defaults(self.current_record)
@@ -3268,9 +3645,9 @@ class DynamicSecurityClient:
                     # Retail UpdateStores announces both mutations. These
                     # callbacks make the client refresh its prestige and ship
                     # state and finish the Supply Dock screen transition.
-                    await self._send_notification(0, 7, CHARACTER_DATABASE_ID)
+                    await self._send_notification(0, 7, int(self.current_record["database_id"]))
                     await self._send_notification(
-                        1, 0, int(self.current_record["ship"].get("database_id", 2))
+                        1, 0, int(self.current_record["ship"]["id"])
                     )
                 self._log("info", "-> Supply Dock update result=%d", response[0])
                 continue
@@ -3278,7 +3655,7 @@ class DynamicSecurityClient:
                 callback, character_id, _scalar, _modifiers = (
                     _parse_get_auction_ships_request(payload)
                 )
-                if character_id != CHARACTER_DATABASE_ID or self.current_character is None:
+                if not self._matches_character_id(character_id) or self.current_character is None:
                     response = struct.pack("<I", 0)
                 else:
                     try:
@@ -3310,7 +3687,7 @@ class DynamicSecurityClient:
                     scalar,
                 )
                 if (
-                    bidder_id != CHARACTER_DATABASE_ID
+                    not self._matches_character_id(bidder_id)
                     or self.current_character is None
                 ):
                     response = struct.pack("<I", 0)
@@ -3318,8 +3695,15 @@ class DynamicSecurityClient:
                     try:
                         bid_factor, _turns, _limit = _economy_ship_auction_settings()
                         defaults = _shipyard_defaults(self.current_character[3])
-                        index = ship_id - (AUCTION_DATABASE_ID_BASE + 1000)
-                        if not 0 <= index < len(defaults):
+                        catalog_ids = _shipyard_catalog_ids(
+                            self.current_character[3], len(defaults)
+                        )
+                        index = next(
+                            (index for index, (_auction_id, item_id)
+                             in enumerate(catalog_ids) if item_id == ship_id),
+                            -1,
+                        )
+                        if index < 0:
                             raise ValueError("unknown Shipyard item ID")
                         state = _load_campaign_clock()
                         saved = state.get("auctions", {}).get(str(ship_id), {})
@@ -3369,7 +3753,7 @@ class DynamicSecurityClient:
                     raise ValueError("invalid friendly-base request length")
                 character_id = struct.unpack_from("<I", payload, 12)[0]
                 at_friendly_base = False
-                if character_id == CHARACTER_DATABASE_ID and self.current_record is not None:
+                if self._matches_character_id(character_id) and self.current_record is not None:
                     at_friendly_base = _at_friendly_base_or_planet(
                         tuple(self.current_record["position"]),
                         int(self.current_record["race"]),
@@ -3384,7 +3768,7 @@ class DynamicSecurityClient:
                 callback, character_id, _for_update = (
                     _parse_character_ship_config_request(payload)
                 )
-                if character_id != CHARACTER_DATABASE_ID or self.current_character is None:
+                if not self._matches_character_id(character_id) or self.current_character is None:
                     response = b"\x00"
                 else:
                     try:
@@ -3402,7 +3786,7 @@ class DynamicSecurityClient:
                 continue
             if (sw, obj, ch) == (0, 6, 27):
                 callback, character_id = _parse_officers_to_review_request(payload)
-                if character_id != CHARACTER_DATABASE_ID or self.current_character is None:
+                if not self._matches_character_id(character_id) or self.current_character is None:
                     response = b"\x00"
                 else:
                     try:
@@ -3422,7 +3806,7 @@ class DynamicSecurityClient:
                 callback, character_id = _parse_free_officers_request(payload)
                 # tFreeOfficersInReviewReq::tRep is a single success byte.
                 response = b"\x01" if (
-                    character_id == CHARACTER_DATABASE_ID
+                    self._matches_character_id(character_id)
                     and self.current_character is not None
                 ) else b"\x00"
                 self.writer.write(_nswitch_frame(*callback, response))
@@ -3436,7 +3820,7 @@ class DynamicSecurityClient:
                 character_id = struct.unpack_from("<I", payload, 12)[0]
                 response = _character_prestige_payload(
                     self.current_record
-                    if character_id == CHARACTER_DATABASE_ID else None
+                    if self._matches_character_id(character_id) else None
                 )
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
@@ -3445,13 +3829,13 @@ class DynamicSecurityClient:
             if (sw, obj, ch) == (0, 6, 39):
                 callback, character_id, assignments = _parse_purchase_officers_request(payload)
                 response = b"\x00\x00"
-                if character_id == CHARACTER_DATABASE_ID and self.current_character is not None:
+                if self._matches_character_id(character_id) and self.current_character is not None:
                     try:
                         self.current_record = _purchase_officers(
                             self.current_character[0], assignments
                         )
                         response = b"\x01\x01"
-                    except (OSError, RuntimeError, ValueError) as exc:
+                    except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
                         self._log("warning", "Officer purchase rejected: %s", exc)
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
@@ -3461,8 +3845,7 @@ class DynamicSecurityClient:
                 callback, character_id, ship_id, config = _parse_purchase_config_request(payload)
                 response = b"\x00\x00"
                 if (
-                    character_id == CHARACTER_DATABASE_ID
-                    and ship_id == SHIP_DATABASE_ID
+                    self._matches_owned_ship(character_id, ship_id)
                     and self.current_character is not None
                 ):
                     try:
@@ -3498,7 +3881,7 @@ class DynamicSecurityClient:
             if (sw, obj, ch) == (0, 24, 10):
                 callback, character_id, match_mode = _parse_mission_match_request(payload)
                 response = b"\x00"
-                if character_id == CHARACTER_DATABASE_ID and self.current_character is not None:
+                if self._matches_character_id(character_id) and self.current_character is not None:
                     state = _load_campaign_clock()
                     active = next(
                         (
@@ -3523,7 +3906,7 @@ class DynamicSecurityClient:
                 callback, character_id = _parse_verify_mission_request(payload)
                 # eCanChooseMissionResponses value zero is the successful/default enum.
                 response = struct.pack("<IB", 1, 0) if (
-                    character_id == CHARACTER_DATABASE_ID and self.current_character is not None
+                    self._matches_character_id(character_id) and self.current_character is not None
                 ) else struct.pack("<I", 0)
                 self.writer.write(_nswitch_frame(*callback, response))
                 await self.writer.drain()
@@ -3532,7 +3915,7 @@ class DynamicSecurityClient:
             if (sw, obj, ch) == (0, 24, 12):
                 callback, character_id, battle = _parse_choose_mission_request(payload)
                 response = b"\x00"
-                if character_id == CHARACTER_DATABASE_ID and self.current_character is not None:
+                if self._matches_character_id(character_id) and self.current_character is not None:
                     state = _load_campaign_clock()
                     offered = next(
                         (
@@ -3558,17 +3941,22 @@ class DynamicSecurityClient:
                 current = tuple(self.current_record["position"])
                 distance = _hex_distance(current, destination)
                 accepted = (
-                    _character_id == CHARACTER_DATABASE_ID
+                    self._matches_character_id(_character_id)
                     and self.viewport_relay_address is not None
                     and 0 <= destination[0] < CAMPAIGN_MAP_WIDTH
                     and 0 <= destination[1] < CAMPAIGN_MAP_HEIGHT
                     and distance > 0
                 )
                 if accepted:
-                    self.current_record["position"] = list(destination)
-                    self.current_record["destination"] = [-1, -1]
-                    self.current_record = _write_character_record(
-                        self.current_character[0], self.current_record
+                    def move_character(record: dict) -> None:
+                        record["position"] = list(destination)
+                        record["destination"] = [-1, -1]
+
+                    # Reload inside the mutation path so another live session's
+                    # facility purchase cannot be overwritten by this session's
+                    # older cached character snapshot.
+                    self.current_record = _update_character(
+                        self.current_character[0], move_character
                     )
                 self.writer.write(_nswitch_frame(
                     callback[0], callback[1], callback[2],
@@ -3621,7 +4009,13 @@ class DynamicSecurityClient:
                     callback[0],
                     callback[1],
                     callback[2],
-                    _character_position_payload(race, position, destination),
+                    _character_position_payload(
+                        race,
+                        position,
+                        destination,
+                        int(self.current_record["database_id"])
+                        if self.current_record is not None else CHARACTER_DATABASE_ID,
+                    ),
                 ))
                 await self.writer.drain()
                 self._log("info", "-> persisted character position")
@@ -3662,12 +4056,25 @@ class DynamicSecurityClient:
                     create_address,
                     _language,
                 ) = _parse_create_client_character(payload)
+                create_account = create_account.casefold()
+                if race not in STARTING_SHIPS:
+                    raise ValueError("unsupported playable race")
+                # Persist first. Sending a success reply before SQL accepted the
+                # character left the client hanging when a name/account conflict
+                # or invalid starter definition was discovered afterward.
+                created_record = _save_character(
+                    create_account,
+                    character_name,
+                    create_address,
+                    race,
+                    self.verification_id,
+                )
                 self.writer.write(_nswitch_frame(
                     return_address[0],
                     return_address[1],
                     return_address[2],
                     _character_created_payload(
-                        create_account, character_name, create_address, race
+                        create_account, character_name, create_address, race, created_record
                     ),
                 ))
                 await self.writer.drain()
@@ -3677,13 +4084,7 @@ class DynamicSecurityClient:
                     create_address,
                     race,
                 )
-                self.current_record = _save_character(
-                    create_account,
-                    character_name,
-                    create_address,
-                    race,
-                    self.verification_id,
-                )
+                self.current_record = created_record
                 self._log(
                     "info",
                     "-> character created race=%d name_len=%d (private values not logged)",
@@ -3773,8 +4174,13 @@ class MasterDirectoryClient:
             self.writer.write(f"\\basic\\\\secure\\{challenge}".encode("ascii"))
             await self.writer.drain()
 
+            game_names = tuple(name.encode("ascii") for name in COMPATIBLE_GAME_NAMES)
+            list_requests = tuple(
+                b"\\list\\cmp\\gamename\\" + name + b"\\final\\"
+                for name in game_names
+            )
             request = b""
-            while b"\\list\\cmp\\gamename\\sfc3\\final\\" not in request:
+            while not any(marker in request for marker in list_requests):
                 chunk = await asyncio.wait_for(self.reader.read(4096), timeout=15.0)
                 if not chunk:
                     return
@@ -3782,17 +4188,20 @@ class MasterDirectoryClient:
                 if len(request) > 8192:
                     raise ValueError("directory request exceeds limit")
 
-            if b"\\gamename\\sfc3\\" not in request or b"\\enctype\\2\\" not in request:
+            game_markers = tuple(b"\\gamename\\" + name + b"\\" for name in game_names)
+            if not any(marker in request for marker in game_markers) or b"\\enctype\\2\\" not in request:
                 raise ValueError("unsupported directory request")
 
-            response = compact_server_list(ADVERTISE_HOST, STATUS_PORT)
+            # The V1 directory advertises SFC3's game port. The retail client
+            # derives the adjacent Query & Reporting/status port itself.
+            response = compact_server_list(ADVERTISE_HOST, GAME_PORT)
             self.writer.write(response)
             await self.writer.drain()
             log.info(
                 "[directory:%d] advertised %s:%d (%d encoded bytes)",
                 DIRECTORY_PORT,
                 ADVERTISE_HOST,
-                STATUS_PORT,
+                GAME_PORT,
                 len(response),
             )
         except (asyncio.IncompleteReadError, ConnectionError):
@@ -3875,6 +4284,9 @@ async def main():
         ADVERTISE_HOST,
         STATUS_PORT,
     )
+    turn_task = asyncio.create_task(
+        CampaignTurnCoordinator().run(), name="campaign-turn-coordinator"
+    )
     servers = relay_servers + game_servers + directory_servers
     async with contextlib.AsyncExitStack() as stack:
         for listening_server in servers:
@@ -3882,6 +4294,9 @@ async def main():
         try:
             await asyncio.gather(*(server.serve_forever() for server in servers))
         finally:
+            turn_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await turn_task
             for transport in status_transports:
                 transport.close()
             persistence.close()

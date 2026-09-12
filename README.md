@@ -1,5 +1,11 @@
 # SFC3 Dynaverse Server Revival
 
+[![Project status](https://img.shields.io/badge/status-active_development-orange)](docs/project-status.md)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![Platform](https://img.shields.io/badge/platform-Windows_11-0078D4?logo=windows11&logoColor=white)](#requirements)
+[![Last commit](https://img.shields.io/github/last-commit/Revan67/SFC3Dynaverse)](https://github.com/Revan67/SFC3Dynaverse/commits/main/)
+[![Open issues](https://img.shields.io/github/issues/Revan67/SFC3Dynaverse)](https://github.com/Revan67/SFC3Dynaverse/issues)
+
 A clean-room Python replacement for the retired Star Trek: Starfleet Command III
 Dynaverse and GameSpy services. The goal is to let an unmodified retail client
 host and join persistent private campaigns without the original online services
@@ -236,5 +242,12 @@ databases, and extracted archives are local research inputs and are ignored.
 
 This is a clean-room interoperability project under 17 U.S.C. § 1201(f). It is
 not affiliated with or endorsed by Taldren, Activision, GameSpy, GOG, or their
-successors. Users must supply a legitimately owned game client and the publicly
-released server-kit inputs themselves.
+successors. Users must supply a legitimately owned game client and assets.
+
+## License
+
+This project is licensed under the **GNU General Public License v3.0** (see [LICENSE](LICENSE.MD)).
+
+This project is an independent reimplementation of server-side functionality.
+No original game assets or proprietary code are included. You must supply
+your own original game files.

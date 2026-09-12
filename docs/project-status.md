@@ -1,7 +1,10 @@
 # Project Status
 
-Reviewed 2026-09-10 after retail-client validation of the SQLite cutover and
-the complete non-combat facility loop.
+Reviewed 2026-09-11 after retail-client clock validation through turns
+1049, 1050, and 1051. The stardate and progress bar advanced with successful
+character refreshes and no observed crash or disconnect. This closes the idle
+clock test; auction and officer activity across these corrected boundaries
+still has separate regression coverage to complete.
 
 Evidence labels used in project documentation:
 
@@ -32,6 +35,10 @@ Evidence labels used in project documentation:
 
 - Two-player auctions: outbid notification, loser refund/accounting,
   simultaneous bids, disconnect/restart, and same-turn settlements.
+- Same-template Shipyard bidding needs retail/server-kit validation. Rebuying
+  the current hull/loadout can presently turn the trade-in spread into
+  repeatable prestige; do not finalize the rule without checking original
+  behavior.
 - Concurrent players and cross-player notifications.
 - Systematic failure paths for insufficient prestige, full capacity, invalid or
   stale requests, timeouts, interrupted transactions, and reconnects.
